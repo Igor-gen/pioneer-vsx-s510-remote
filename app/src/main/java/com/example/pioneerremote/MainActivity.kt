@@ -1,14 +1,36 @@
+// ============================================================================
+// Pioneer VSX-S510 Remote — verzia 4
+// - Tmavý dizajn podľa náhľadu (karty, zaoblené tlačidlá, cyan/orange akcent)
+// - Posuvník hlasitosti: posiela VU/VD až po pustení palca, presný počet krokov
+// - 🔍 vyhľadanie receivera: sken podsiete telefónu (port 8102 + overenie ?V)
+// - MUTE ako prepínač (sleduje MUT0/MUT1 spätnú väzbu)
+// - Zvýraznenie aktívneho vstupu / režimu / rádia
+// - Screen 2: internetové rádio (UPnP push), Screen 3: DLNA + album fronta
+// ----------------------------------------------------------------------------
+// BUILD: GitHub Actions — pozri dokument "Pioneer Remote – kompletný GitHub projekt".
+// Poznámka: AndroidManifest.xml musí mať theme @style/Theme.AppCompat.NoActionBar.
+// ============================================================================
+
 package com.example.pioneerremote
 
-import android.app.AlertDialog
+import android.content.res.ColorStateList
+import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
 import android.net.wifi.WifiManager
 import android.os.Bundle
 import android.text.InputType
 import android.view.Gravity
 import android.view.ViewGroup
-import android.widget.*
+import android.widget.Button
+import android.widget.EditText
+import android.widget.FrameLayout
+import android.widget.GridLayout
+import android.widget.LinearLayout
+import android.widget.ScrollView
+import android.widget.SeekBar
+import android.widget.TextView
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
-import androidx.core.content.ContextCompat
 import androidx.recyclerview.widget.RecyclerView
 import androidx.viewpager2.widget.ViewPager2
 import kotlinx.coroutines.*
@@ -18,32 +40,66 @@ import java.io.OutputStreamWriter
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.HttpURLConnection
+import java.net.Inet4Address
 import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.MulticastSocket
+import java.net.NetworkInterface
 import java.net.Socket
 import java.net.URL
+import java.util.Collections
 import java.util.concurrent.atomic.AtomicReference
+import kotlin.math.abs
 
 class MainActivity : AppCompatActivity() {
 
+    // ===== konfiguracia =====
     private var host: String = "192.168.1.80"
     private val port: Int = 8102
     private val volMax = 160
 
+    // ===== farby (tmavy dizajn ako v nahlide) =====
+    private val C_BG = 0xFF0B1220.toInt()
+    private val C_CARD = 0xFF1E293B.toInt()
+    private val C_CARD2 = 0xFF16202F.toInt()
+    private val C_BTN = 0xFF1E293B.toInt()
+    private val C_STROKE = 0xFF334155.toInt()
+    private val C_CYAN = 0xFF22D3EE.toInt()
+    private val C_CYAN_D = 0xFF155E75.toInt()
+    private val C_ORANGE = 0xFFF97316.toInt()
+    private val C_RED = 0xFFDC2626.toInt()
+    private val C_GREEN = 0xFF34D399.toInt()
+    private val C_WHITE = 0xFFF8FAFC.toInt()
+    private val C_SLATE = 0xFF94A3B8.toInt()
+    private val C_DIM = 0xFF64748B.toInt()
+    private val C_ON_ACCENT = 0xFF06121F.toInt()
+
+    // ===== stav =====
     private var scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val socketRef = AtomicReference<Socket?>(null)
     private var outWriter: OutputStreamWriter? = null
     private var currentVol = 0
+    private var isMuted = false
+    private var isOn = false
+    private var activeInput: String? = null
+    private var activeMode: String? = null
+    private var activeRadio: String? = null
+    private var seekJob: Job? = null
     private var multicastLock: WifiManager.MulticastLock? = null
 
+    // ===== UI =====
+    private lateinit var ipEdit: EditText
     private lateinit var statusText: TextView
-    private lateinit var volumeText: TextView
-    private lateinit var inputText: TextView
-    private lateinit var modeText: TextView
-    private lateinit var radioText: TextView
+    private lateinit var volumeBig: TextView
+    private lateinit var infoLine: TextView
+    private lateinit var radioLine: TextView
+    private lateinit var connLine: TextView
     private lateinit var volSlider: SeekBar
-    private var sliderFromUser = true
+    private lateinit var powerBtn: Button
+    private lateinit var muteBtn: Button
+    private val inputButtons = mutableMapOf<String, Button>()
+    private val modeButtons = mutableMapOf<String, Button>()
+    private val radioButtons = mutableMapOf<String, Button>()
 
     private val inputs = linkedMapOf(
         "BD" to "25FN", "DVD" to "04FN", "SAT/CBL" to "05FN",
@@ -83,6 +139,7 @@ class MainActivity : AppCompatActivity() {
         "Radio Paradise" to "https://stream.radioparadise.com/mp3-192"
     )
 
+    // ===== DLNA =====
     private data class MediaEntry(
         val id: String, val title: String,
         val isContainer: Boolean, val url: String?)
@@ -102,12 +159,17 @@ class MainActivity : AppCompatActivity() {
     private lateinit var mediaStatusText: TextView
     private lateinit var mediaList: LinearLayout
 
+    // =====================================================================
+    // ZIVOTNY CYKLUS
+    // =====================================================================
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        val prefs = getSharedPreferences("pioneer", MODE_PRIVATE)
-        host = prefs.getString("host", host) ?: host
-        mediaServerDesc = prefs.getString("dlnaServer", null)
-        mediaServerName = prefs.getString("dlnaName", "") ?: ""
+        window.statusBarColor = C_BG
+        val p = prefs()
+        host = p.getString("host", host) ?: host
+        mediaServerDesc = p.getString("dlnaServer", null)
+        mediaServerName = p.getString("dlnaName", "") ?: ""
         buildUI()
         connect()
         val wifi = applicationContext.getSystemService(WIFI_SERVICE) as WifiManager
@@ -117,76 +179,217 @@ class MainActivity : AppCompatActivity() {
         if (mediaServerDesc != null) initMediaServer(mediaServerDesc!!)
     }
 
-    private fun buildUI() {
-        val pad = (16 * resources.displayMetrics.density).toInt()
-        val root = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(pad, 0, pad, 0)
-        }
+    override fun onDestroy() {
+        super.onDestroy()
+        scope.coroutineContext.cancelChildren()
+        runCatching { socketRef.get()?.close() }
+        multicastLock?.release()
+    }
 
-        val top = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        val ipEdit = EditText(this).apply {
-            setText(host); hint = "IP adresa receivera"
-            inputType = InputType.TYPE_CLASS_PHONE
-            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+    private fun prefs() = getSharedPreferences("pioneer", MODE_PRIVATE)
+
+    private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+    // =====================================================================
+    // STYLOVE POMOCNIKY
+    // =====================================================================
+
+    private fun roundedBg(color: Int, radiusDp: Int, strokeColor: Int? = null): GradientDrawable {
+        val d = GradientDrawable()
+        d.setColor(color)
+        d.cornerRadius = dp(radiusDp).toFloat()
+        if (strokeColor != null) d.setStroke(dp(1), strokeColor)
+        return d
+    }
+
+    private fun flatBtn(label: String, onClick: () -> Unit): Button {
+        val b = Button(this)
+        b.text = label
+        b.textSize = 12f
+        b.maxLines = 2
+        b.setTextColor(C_WHITE)
+        b.transformationMethod = null
+        b.background = roundedBg(C_BTN, 12, C_STROKE)
+        b.setPadding(dp(2), dp(8), dp(2), dp(8))
+        b.setOnClickListener { onClick() }
+        return b
+    }
+
+    private fun pillBtn(label: String, bg: Int, fg: Int, onClick: (Button) -> Unit): Button {
+        val b = Button(this)
+        b.text = label
+        b.textSize = 13f
+        b.setTextColor(fg)
+        b.transformationMethod = null
+        b.background = roundedBg(bg, 10)
+        b.setPadding(dp(12), 0, dp(12), 0)
+        b.minimumWidth = 0
+        b.minimumHeight = 0
+        b.setOnClickListener { onClick(b) }
+        return b
+    }
+
+    private fun highlightBtn(b: Button, active: Boolean, accent: Int = C_CYAN) {
+        b.background = roundedBg(if (active) accent else C_BTN, 12, if (active) accent else C_STROKE)
+        b.setTextColor(if (active) C_ON_ACCENT else C_WHITE)
+        b.typeface = if (active) Typeface.DEFAULT_BOLD else Typeface.DEFAULT
+    }
+
+    private fun rowOf(buttons: List<Button>): LinearLayout {
+        val r = LinearLayout(this)
+        r.orientation = LinearLayout.HORIZONTAL
+        buttons.forEach {
+            r.addView(it, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         }
-        top.addView(ipEdit)
-        top.addView(Button(this).apply {
-            text = "Pripoj"
-            setOnClickListener {
-                host = ipEdit.text.toString().trim()
-                getSharedPreferences("pioneer", MODE_PRIVATE)
-                    .edit().putString("host", host).apply()
-                connect()
-            }
-        })
+        return r
+    }
+
+    private fun makeGrid(buttons: List<Button>): GridLayout {
+        val g = GridLayout(this)
+        g.columnCount = 3
+        g.useDefaultMargins = true
+        buttons.forEach { b ->
+            val lp = GridLayout.LayoutParams()
+            lp.columnSpec = GridLayout.spec(GridLayout.UNDEFINED, 1f)
+            lp.width = 0
+            g.addView(b, lp)
+        }
+        return g
+    }
+
+    private fun sectionLabel(t: String): TextView {
+        val tv = TextView(this)
+        tv.text = t
+        tv.textSize = 13f
+        tv.typeface = Typeface.DEFAULT_BOLD
+        tv.setTextColor(C_SLATE)
+        tv.setPadding(0, dp(14), 0, dp(6))
+        return tv
+    }
+
+    private fun hint(t: String): TextView {
+        val tv = TextView(this)
+        tv.text = t
+        tv.textSize = 10f
+        tv.setTextColor(C_DIM)
+        tv.gravity = Gravity.CENTER
+        tv.setPadding(0, dp(16), 0, dp(8))
+        return tv
+    }
+
+    // =====================================================================
+    // VYTVORENIE UI
+    // =====================================================================
+
+    private fun buildUI() {
+        val pad = dp(14)
+        val root = LinearLayout(this)
+        root.orientation = LinearLayout.VERTICAL
+        root.setBackgroundColor(C_BG)
+        root.setPadding(pad, dp(10), pad, 0)
+
+        val title = TextView(this)
+        title.text = "Pioneer Remote"
+        title.textSize = 20f
+        title.typeface = Typeface.DEFAULT_BOLD
+        title.setTextColor(C_WHITE)
+        title.gravity = Gravity.CENTER
+        root.addView(title)
+        val sub = TextView(this)
+        sub.text = "VSX-S510"
+        sub.textSize = 11f
+        sub.setTextColor(C_CYAN)
+        sub.gravity = Gravity.CENTER
+        sub.setPadding(0, 0, 0, dp(8))
+        root.addView(sub)
+
+        // riadok: IP + hladanie + pripojenie
+        val top = LinearLayout(this)
+        top.orientation = LinearLayout.HORIZONTAL
+        ipEdit = EditText(this)
+        ipEdit.setText(host)
+        ipEdit.hint = "IP adresa receivera"
+        ipEdit.inputType = InputType.TYPE_CLASS_PHONE
+        ipEdit.setTextColor(C_WHITE)
+        ipEdit.setHintTextColor(C_DIM)
+        ipEdit.textSize = 13f
+        ipEdit.background = roundedBg(C_CARD2, 10, C_STROKE)
+        ipEdit.setPadding(dp(10), dp(8), dp(10), dp(8))
+        top.addView(ipEdit, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        val scanBtn = pillBtn("🔍", C_BTN, C_WHITE) { discoverReceivers() }
+        top.addView(scanBtn, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        val connBtn = pillBtn("Pripoj", C_CYAN, C_ON_ACCENT) { connectPressed() }
+        top.addView(connBtn, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
         root.addView(top)
 
-        statusText = TextView(this).apply { text = "Odpojene"; textSize = 12f }
-        root.addView(statusText)
+        // stavova karta
+        val card = LinearLayout(this)
+        card.orientation = LinearLayout.VERTICAL
+        card.setPadding(dp(12), dp(10), dp(12), dp(10))
+        card.background = roundedBg(C_CARD, 18, C_CYAN_D)
+        volumeBig = TextView(this)
+        volumeBig.text = "🔊  —"
+        volumeBig.textSize = 22f
+        volumeBig.typeface = Typeface.DEFAULT_BOLD
+        volumeBig.setTextColor(C_WHITE)
+        volumeBig.gravity = Gravity.CENTER
+        infoLine = TextView(this)
+        infoLine.text = "Vstup: —   ·   Režim: —"
+        infoLine.textSize = 13f
+        infoLine.setTextColor(C_SLATE)
+        infoLine.gravity = Gravity.CENTER
+        radioLine = TextView(this)
+        radioLine.text = "Rádio: —"
+        radioLine.textSize = 13f
+        radioLine.setTextColor(C_DIM)
+        radioLine.gravity = Gravity.CENTER
+        connLine = TextView(this)
+        connLine.text = "○  Odpojené"
+        connLine.textSize = 11f
+        connLine.setTextColor(C_RED)
+        connLine.gravity = Gravity.CENTER
+        statusText = TextView(this)
+        statusText.text = ""
+        statusText.textSize = 11f
+        statusText.setTextColor(C_DIM)
+        statusText.gravity = Gravity.CENTER
+        card.addView(volumeBig)
+        card.addView(infoLine)
+        card.addView(radioLine)
+        card.addView(connLine)
+        card.addView(statusText)
+        val cardLp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT)
+        cardLp.topMargin = dp(8)
+        root.addView(card, cardLp)
 
-        val card = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(pad, pad, pad, pad)
-            background = ContextCompat.getDrawable(
-                this@MainActivity, android.R.drawable.dialog_holo_light_frame)
+        // tabs
+        val tabDefs = listOf("🎚 OVLÁDANIE", "📻 RÁDIO", "💽 MÉDIÁ")
+        val tabBtns = tabDefs.map { t -> pillBtn(t, C_BTN, C_SLATE) { } }
+        val tabs = LinearLayout(this)
+        tabs.orientation = LinearLayout.HORIZONTAL
+        tabBtns.forEachIndexed { i, b ->
+            tabs.addView(b, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         }
-        volumeText = TextView(this).apply {
-            text = "Hlasitost: -"; textSize = 22f; gravity = Gravity.CENTER }
-        inputText = TextView(this).apply {
-            text = "Vstup: -"; textSize = 16f; gravity = Gravity.CENTER }
-        modeText = TextView(this).apply {
-            text = "Rezim: -"; textSize = 16f; gravity = Gravity.CENTER }
-        radioText = TextView(this).apply {
-            text = "Rádio: -"; textSize = 16f; gravity = Gravity.CENTER }
-        card.addView(volumeText); card.addView(inputText)
-        card.addView(modeText); card.addView(radioText)
-        root.addView(card)
+        val tabsLp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT)
+        tabsLp.topMargin = dp(8)
+        root.addView(tabs, tabsLp)
 
-        val tabs = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            setPadding(0, pad, 0, pad / 2)
-        }
-        val tab1 = tabButton("🎚 Ovládanie", true)
-        val tab2 = tabButton("📻 Rádio", false)
-        val tab3 = tabButton("💽 Médiá", false)
-        listOf(tab1, tab2, tab3).forEach {
-            tabs.addView(it, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        }
-        root.addView(tabs)
-
-        val pager = ViewPager2(this).apply {
-            layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
-        }
-        val screens = listOf(
-            buildScreenHome(pad), buildScreenRadio(pad), buildScreenMedia(pad))
+        // swipe screeny
+        val pager = ViewPager2(this)
+        pager.layoutParams = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
+        val screens = listOf(buildScreenHome(), buildScreenRadio(), buildScreenMedia())
         pager.adapter = object : RecyclerView.Adapter<RecyclerView.ViewHolder>() {
             override fun getItemCount() = screens.size
             override fun onCreateViewHolder(parent: ViewGroup, viewType: Int) =
                 object : RecyclerView.ViewHolder(FrameLayout(this@MainActivity).apply {
                     layoutParams = ViewGroup.LayoutParams(
-                        ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT)
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.MATCH_PARENT)
                 }) {}
             override fun onBindViewHolder(holder: RecyclerView.ViewHolder, position: Int) {
                 val frame = holder.itemView as FrameLayout
@@ -196,173 +399,361 @@ class MainActivity : AppCompatActivity() {
         }
         pager.registerOnPageChangeCallback(object : ViewPager2.OnPageChangeCallback() {
             override fun onPageSelected(position: Int) {
-                listOf(tab1, tab2, tab3).forEachIndexed { i, btn ->
-                    styleTab(btn, i == position)
-                }
+                tabBtns.forEachIndexed { i, b -> styleTab(b, i == position) }
             }
         })
-        tab1.setOnClickListener { pager.currentItem = 0 }
-        tab2.setOnClickListener { pager.currentItem = 1 }
-        tab3.setOnClickListener { pager.currentItem = 2 }
+        tabBtns.forEachIndexed { i, b ->
+            b.setOnClickListener { pager.currentItem = i }
+        }
+        styleTab(tabBtns[0], true)
         root.addView(pager)
         setContentView(root)
     }
 
-    private fun tabButton(label: String, active: Boolean): Button =
-        Button(this).apply { text = label; styleTab(this, active) }
-
     private fun styleTab(btn: Button, active: Boolean) {
-        btn.setBackgroundColor(
-            ContextCompat.getColor(this,
-                if (active) android.R.color.holo_orange_dark else android.R.color.transparent))
+        btn.background = roundedBg(
+            if (active) C_ORANGE else C_BTN, 10, if (active) C_ORANGE else C_STROKE)
+        btn.setTextColor(if (active) C_ON_ACCENT else C_SLATE)
+        btn.typeface = if (active) Typeface.DEFAULT_BOLD else Typeface.DEFAULT
     }
 
-    private fun buildScreenHome(pad: Int): ScrollView = ScrollView(this).apply {
-        addView(LinearLayout(this@MainActivity).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(0, 0, 0, pad)
-        }.also { page ->
-            page.addView(row(listOf(
-                b("⏻ ZAP", "PO"), b("⏻ VYP", "PF"),
-                b("🔇 MUTE", "MO"), b("🔊 UNMUTE", "MF")
-            )))
-            page.addView(row(listOf(
-                b("VOL −", "VD"), b("VOL +", "VU"), b("VSTUP ▶", "FU")
-            )))
+    private fun connectPressed() {
+        host = ipEdit.text.toString().trim()
+        prefs().edit().putString("host", host).apply()
+        connect()
+    }
 
-            page.addView(section("Hlasitost (rychly posun)"))
-            volSlider = SeekBar(this@MainActivity).apply {
-                max = volMax; progress = 0
-                setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-                    override fun onProgressChanged(s: SeekBar?, p: Int, fromUser: Boolean) {
-                        if (fromUser) targetVolume(p)
+    // =====================================================================
+    // SCREEN 1 — OVLADANIE
+    // =====================================================================
+
+    private fun buildScreenHome(): ScrollView {
+        val page = LinearLayout(this)
+        page.orientation = LinearLayout.VERTICAL
+        page.setPadding(0, dp(6), 0, dp(8))
+        val sv = ScrollView(this)
+        sv.addView(page, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+
+        powerBtn = flatBtn("⏻ ZAP") { send("PO"); sendSilent("?P") }
+        val vypBtn = flatBtn("⏻ VYP") { send("PF"); sendSilent("?P") }
+        muteBtn = flatBtn("🔇 MUTE") { toggleMute() }
+        page.addView(rowOf(listOf(powerBtn, vypBtn, muteBtn)))
+        page.addView(rowOf(listOf(
+            flatBtn("VOL −") { send("VD"); sendSilent("?V") },
+            flatBtn("VOL +") { send("VU"); sendSilent("?V") },
+            flatBtn("VSTUP ▶") { send("FU"); sendSilent("?F") }
+        )))
+
+        // posuvnik hlasitosti — posiela AZ po pusteni palca
+        val sc = LinearLayout(this)
+        sc.orientation = LinearLayout.HORIZONTAL
+        sc.gravity = Gravity.CENTER_VERTICAL
+        sc.setPadding(dp(12), dp(4), dp(12), dp(4))
+        sc.background = roundedBg(C_CARD2, 14)
+        val lblMin = TextView(this)
+        lblMin.text = "−80"; lblMin.textSize = 12f; lblMin.setTextColor(C_DIM)
+        val lblMax = TextView(this)
+        lblMax.text = "+80"; lblMax.textSize = 12f; lblMax.setTextColor(C_DIM)
+        volSlider = SeekBar(this)
+        volSlider.max = volMax
+        volSlider.progressTintList = ColorStateList.valueOf(C_CYAN)
+        volSlider.thumbTintList = ColorStateList.valueOf(C_CYAN)
+        volSlider.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(s: SeekBar?, p: Int, fromUser: Boolean) {
+                if (fromUser) volumeBig.text = volText(p)
+            }
+            override fun onStartTrackingTouch(s: SeekBar?) {}
+            override fun onStopTrackingTouch(s: SeekBar?) { seekVolume(s?.progress ?: 0) }
+        })
+        sc.addView(lblMin, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        sc.addView(volSlider, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        sc.addView(lblMax, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        val scLp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT)
+        scLp.topMargin = dp(10)
+        page.addView(sc, scLp)
+
+        page.addView(sectionLabel("VÝBER VSTUPU"))
+        val ib = mutableListOf<Button>()
+        inputs.forEach { (name, code) ->
+            val b = flatBtn(name) {
+                send(code); sendSilent("?F")
+                activeInput = name
+                updateInfoLine(); styleInputButtons()
+            }
+            inputButtons[name] = b
+            ib.add(b)
+        }
+        page.addView(makeGrid(ib))
+
+        page.addView(sectionLabel("PRIESTOROVÝ REŽIM"))
+        val mb = mutableListOf<Button>()
+        modes.forEach { (name, code) ->
+            val b = flatBtn(name) {
+                send(code)
+                activeMode = name
+                updateInfoLine(); styleModeButtons()
+            }
+            modeButtons[name] = b
+            mb.add(b)
+        }
+        page.addView(makeGrid(mb))
+        page.addView(hint("← swipe na rádio →"))
+        return sv
+    }
+
+    // =====================================================================
+    // SCREEN 2 — RADIO
+    // =====================================================================
+
+    private fun buildScreenRadio(): ScrollView {
+        val page = LinearLayout(this)
+        page.orientation = LinearLayout.VERTICAL
+        page.setPadding(0, dp(6), 0, dp(8))
+        val sv = ScrollView(this)
+        sv.addView(page, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+
+        page.addView(sectionLabel("INTERNETOVÉ RÁDIO (UPnP)"))
+        val rb = mutableListOf<Button>()
+        radios.forEach { (name, url) ->
+            val b = flatBtn(name) {
+                activeRadio = name
+                styleRadioButtons()
+                playRadio(name, url)
+            }
+            radioButtons[name] = b
+            rb.add(b)
+        }
+        page.addView(makeGrid(rb))
+
+        val stopB = flatBtn("⏹ ZASTAVIŤ RÁDIO") {
+            activeRadio = null
+            styleRadioButtons()
+            stopRadio()
+        }
+        stopB.background = roundedBg(C_RED, 12, C_RED)
+        stopB.setTextColor(C_WHITE)
+        val stopLp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT)
+        stopLp.topMargin = dp(10)
+        page.addView(stopB, stopLp)
+
+        page.addView(sectionLabel("PÔVODNÉ NETRADIO RECEIVERA"))
+        val netB = flatBtn("NETRADIO (vstup 38FN)") {
+            send("38FN"); sendSilent("?F")
+            activeRadio = "NETRADIO"
+            styleRadioButtons()
+        }
+        val netLp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT)
+        page.addView(netB, netLp)
+        page.addView(hint("← swipe na ovládanie →"))
+        return sv
+    }
+
+    // =====================================================================
+    // SCREEN 3 — MEDIA (DLNA)
+    // =====================================================================
+
+    private fun buildScreenMedia(): ScrollView {
+        val page = LinearLayout(this)
+        page.orientation = LinearLayout.VERTICAL
+        page.setPadding(0, dp(6), 0, dp(8))
+        val sv = ScrollView(this)
+        sv.addView(page, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+
+        val srvBtn = flatBtn("🔍 SERVERY") { scanMediaServers() }
+        val backBtn = flatBtn("⟨ SPÄŤ") { browseBack() }
+        val albumBtn = flatBtn("▶ ALBUM") { playCurrentFolder() }
+        page.addView(rowOf(listOf(srvBtn, backBtn, albumBtn)))
+
+        mediaServerText = TextView(this)
+        mediaServerText.text = if (mediaServerName.isNotEmpty())
+            "Server: $mediaServerName" else "Server: nevybraný — klikni 🔍 SERVERY"
+        mediaServerText.textSize = 12f
+        mediaServerText.setTextColor(C_SLATE)
+        mediaServerText.setPadding(0, dp(8), 0, 0)
+        page.addView(mediaServerText)
+
+        mediaPathText = TextView(this)
+        mediaPathText.text = "📚 /"
+        mediaPathText.textSize = 12f
+        mediaPathText.setTextColor(C_SLATE)
+        page.addView(mediaPathText)
+
+        mediaStatusText = TextView(this)
+        mediaStatusText.text = ""
+        mediaStatusText.textSize = 13f
+        mediaStatusText.setTextColor(C_CYAN)
+        mediaStatusText.setPadding(0, dp(8), 0, dp(8))
+        page.addView(mediaStatusText)
+
+        mediaList = LinearLayout(this)
+        mediaList.orientation = LinearLayout.VERTICAL
+        page.addView(mediaList)
+        page.addView(hint("← swipe na rádio →"))
+        return sv
+    }
+
+    // =====================================================================
+    // AKTUALIZACIE ZOBRAZENIA
+    // =====================================================================
+
+    private fun volText(v: Int): String {
+        val dB = v - 80
+        return "🔊  $v   (" + (if (dB >= 0) "+" else "") + dB + " dB)"
+    }
+
+    private fun updateVolumeCard() {
+        volumeBig.text = if (isMuted) "🔇  MUTE" else volText(currentVol)
+    }
+
+    private fun updateInfoLine() {
+        val i = activeInput ?: "—"
+        val m = activeMode ?: "—"
+        infoLine.text = "Vstup: $i   ·   Režim: $m"
+    }
+
+    private fun updateMuteButton() {
+        muteBtn.text = if (isMuted) "🔊 ODMUTOVAŤ" else "🔇 MUTE"
+        highlightBtn(muteBtn, isMuted, C_RED)
+    }
+
+    private fun updatePowerButton() {
+        highlightBtn(powerBtn, isOn, C_GREEN)
+    }
+
+    private fun styleInputButtons() {
+        inputButtons.forEach { (name, b) -> highlightBtn(b, name == activeInput) }
+    }
+
+    private fun styleModeButtons() {
+        modeButtons.forEach { (name, b) -> highlightBtn(b, name == activeMode) }
+    }
+
+    private fun styleRadioButtons() {
+        radioButtons.forEach { (name, b) -> highlightBtn(b, name == activeRadio) }
+        radioLine.text = "Rádio: " + (activeRadio ?: "—")
+    }
+
+    // =====================================================================
+    // HLASITOST — posuvnik posiela az po pusteni, s pevnym poctom krokov
+    // =====================================================================
+
+    private fun seekVolume(target: Int) {
+        seekJob?.cancel()
+        volSlider.isEnabled = false
+        seekJob = scope.launch(Dispatchers.IO) {
+            try {
+                val diff = target - currentVol
+                if (diff != 0) {
+                    val cmd = if (diff > 0) "VU" else "VD"
+                    repeat(minOf(abs(diff), 100)) {
+                        outWriter?.let {
+                            it.write(cmd + "\r\n")
+                            it.flush()
+                        }
+                        delay(90)
                     }
-                    override fun onStartTrackingTouch(s: SeekBar?) {}
-                    override fun onStopTrackingTouch(s: SeekBar?) {}
-                })
-            }
-            page.addView(volSlider)
-
-            page.addView(section("Výber vstupu"))
-            page.addView(grid(inputs.map { (name, code) ->
-                name to { send(code); send("?F") }
-            }))
-
-            page.addView(section("Priestorový režim (Listening Mode)"))
-            page.addView(grid(modes.map { (name, code) ->
-                name to { send(code) }
-            }))
-        })
-    }
-
-    private fun buildScreenRadio(pad: Int): ScrollView = ScrollView(this).apply {
-        addView(LinearLayout(this@MainActivity).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(0, 0, 0, pad)
-        }.also { page ->
-            page.addView(section("Internetové rádio (streamy z igor-stream)"))
-            page.addView(grid(radios.map { (name, url) ->
-                name to { playRadio(name, url) }
-            }))
-            page.addView(Button(this@MainActivity).apply {
-                text = "⏹ Zastaviť rádio"
-                setOnClickListener { stopRadio() }
-            })
-            page.addView(section("Pôvodné NETRADIO receivera"))
-            page.addView(Button(this@MainActivity).apply {
-                text = "NETRADIO (38FN)"
-                setOnClickListener { send("38FN") }
-            })
-        })
-    }
-
-    private fun buildScreenMedia(pad: Int): ScrollView = ScrollView(this).apply {
-        addView(LinearLayout(this@MainActivity).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(0, 0, 0, pad)
-        }.also { page ->
-            val srvRow = LinearLayout(this@MainActivity).apply {
-                orientation = LinearLayout.HORIZONTAL
-            }
-            srvRow.addView(Button(this@MainActivity).apply {
-                text = "🔍 Servery"
-                setOnClickListener { scanMediaServers() }
-            }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-            srvRow.addView(Button(this@MainActivity).apply {
-                text = "⟨ Späť"
-                setOnClickListener { browseBack() }
-            }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-            srvRow.addView(Button(this@MainActivity).apply {
-                text = "▶ Album"
-                setOnClickListener { playCurrentFolder() }
-            }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-            page.addView(srvRow)
-
-            mediaServerText = TextView(this@MainActivity).apply {
-                text = if (mediaServerName.isNotEmpty())
-                    "Server: $mediaServerName" else "Server: nevybraný — klikni 🔍 Servery"
-                textSize = 13f; setPadding(0, pad / 2, 0, 0)
-            }
-            page.addView(mediaServerText)
-
-            mediaPathText = TextView(this@MainActivity).apply {
-                text = "📚 /"; textSize = 13f
-            }
-            page.addView(mediaPathText)
-
-            mediaStatusText = TextView(this@MainActivity).apply {
-                text = ""; textSize = 14f; setPadding(0, pad / 2, 0, pad / 2)
-            }
-            page.addView(mediaStatusText)
-
-            mediaList = LinearLayout(this@MainActivity).apply {
-                orientation = LinearLayout.VERTICAL
-            }
-            page.addView(mediaList)
-        })
-    }
-
-    private fun section(title: String): TextView =
-        TextView(this).apply {
-            text = title; textSize = 16f
-            setPadding(0, (12 * resources.displayMetrics.density).toInt(), 0, 0)
-        }
-
-    private fun row(buttons: List<Button>): LinearLayout =
-        LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            buttons.forEach {
-                addView(it, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                }
+                sendSilent("?V")
+            } finally {
+                ui { volSlider.isEnabled = true }
             }
         }
+    }
 
-    private fun b(label: String, cmd: String): Button =
-        Button(this).apply {
-            text = label
-            setOnClickListener {
-                send(cmd)
-                if (cmd.startsWith("V")) send("?V")
+    private fun toggleMute() {
+        send(if (isMuted) "MF" else "MO")
+        sendSilent("?M")
+    }
+
+    // =====================================================================
+    // VYHLADANIE RECEIVERA V SITI TELEFONU
+    // =====================================================================
+
+    private fun phoneIp(): String? = try {
+        val nets = NetworkInterface.getNetworkInterfaces() ?: return null
+        for (n in nets) {
+            if (n.isLoopback || !n.isUp) continue
+            for (a in n.inetAddresses) {
+                if (a is Inet4Address && !a.isLoopbackAddress) return a.hostAddress
             }
         }
+        null
+    } catch (_: Exception) { null }
 
-    private fun grid(items: List<Pair<String, () -> Unit>>): GridLayout =
-        GridLayout(this).apply {
-            columnCount = 3; useDefaultMargins = true
-            items.forEach { (name, action) ->
-                addView(Button(this@MainActivity).apply {
-                    text = name
-                    setOnClickListener { action() }
-                    layoutParams = GridLayout.LayoutParams().apply {
-                        columnSpec = GridLayout.spec(GridLayout.UNDEFINED, 1f)
+    private fun probe(ip: String): Boolean = try {
+        Socket().use { s ->
+            s.soTimeout = 1200
+            s.connect(InetSocketAddress(ip, port), 400)
+            val w = OutputStreamWriter(s.getOutputStream(), Charsets.US_ASCII)
+            w.write("?V\r\n")
+            w.flush()
+            val r = BufferedReader(InputStreamReader(s.getInputStream(), Charsets.US_ASCII))
+            val line = r.readLine() ?: return false
+            line.startsWith("VOL") || line.startsWith("PWR") || line.startsWith("FN") ||
+                line.startsWith("MUT") || line.startsWith("LM")
+        }
+    } catch (_: Exception) { false }
+
+    private fun discoverReceivers() {
+        statusText.text = "🔍 Skenujem sieť (port $port)…"
+        scope.launch(Dispatchers.IO) {
+            val myIp = phoneIp()
+            if (myIp == null) {
+                ui { statusText.text = "Nepodarilo sa zistiť IP telefónu — si pripojený na Wi-Fi?" }
+                return@launch
+            }
+            val prefix = myIp.substringBeforeLast(".")
+            val found = Collections.synchronizedList(mutableListOf<String>())
+            withTimeoutOrNull(25000) {
+                coroutineScope {
+                    (1..254).forEach { i ->
+                        launch {
+                            val ip = "$prefix.$i"
+                            if (probe(ip)) found.add(ip)
+                        }
                     }
-                })
+                }
+            }
+            val sorted = found.toList().sorted()
+            ui {
+                statusText.text = if (sorted.isEmpty())
+                    "V sieti $prefix.0/24 som nenašiel receiver. Je zapnutý Network Standby?"
+                else ""
+                pickReceiver(sorted)
             }
         }
+    }
+
+    private fun pickReceiver(found: List<String>) {
+        if (found.isEmpty()) return
+        AlertDialog.Builder(this)
+            .setTitle(if (found.size > 1) "Nájdené prijímače" else "Nájdený prijímač")
+            .setItems(found.toTypedArray()) { _, i ->
+                host = found[i]
+                ipEdit.setText(host)
+                prefs().edit().putString("host", host).apply()
+                connect()
+            }
+            .setNegativeButton("Zrušiť", null)
+            .show()
+    }
+
+    // =====================================================================
+    // RADIO (UPnP push)
+    // =====================================================================
 
     private fun playRadio(name: String, url: String) {
         ui {
-            radioText.text = "Rádio: spúšťam $name ..."
-            statusText.text = "Rádio: hľadám receiver cez UPnP..."
+            radioLine.text = "Rádio: spúšťam $name…"
+            statusText.text = "Hľadám receiver cez UPnP…"
         }
         scope.launch(Dispatchers.IO) {
             try {
@@ -373,8 +764,8 @@ class MainActivity : AppCompatActivity() {
                 soapSetUri(control, url)
                 soapPlay(control)
                 ui {
-                    radioText.text = "Rádio: $name ▶"
-                    statusText.text = "Rádio prehráva na receiveri: $name"
+                    radioLine.text = "Rádio: $name ▶"
+                    statusText.text = "Rádio prehráva na receiveri."
                 }
             } catch (e: Exception) {
                 ui { statusText.text = "Rádio chyba: " + e.message }
@@ -387,10 +778,14 @@ class MainActivity : AppCompatActivity() {
             try {
                 val control = ensureAvtControl() ?: return@launch
                 soapStop(control)
-                ui { radioText.text = "Rádio: stop" }
+                ui { radioLine.text = "Rádio: stop" }
             } catch (_: Exception) { }
         }
     }
+
+    // =====================================================================
+    // DLNA SERVERY
+    // =====================================================================
 
     private fun scanMediaServers() {
         ui { mediaStatusText.text = "Hľadám DLNA servery…" }
@@ -414,7 +809,7 @@ class MainActivity : AppCompatActivity() {
                     .setItems(names.map { it.second }.toTypedArray()) { _, i ->
                         mediaServerDesc = names[i].first
                         mediaServerName = names[i].second
-                        getSharedPreferences("pioneer", MODE_PRIVATE).edit()
+                        prefs().edit()
                             .putString("dlnaServer", mediaServerDesc)
                             .putString("dlnaName", mediaServerName)
                             .apply()
@@ -499,22 +894,23 @@ class MainActivity : AppCompatActivity() {
     private fun renderMediaList(entries: List<MediaEntry>) {
         mediaList.removeAllViews()
         entries.forEach { e ->
-            val btn = Button(this).apply {
-                text = (if (e.isContainer) "📁 " else "🎵 ") + e.title
-                gravity = Gravity.LEFT or Gravity.CENTER_VERTICAL
-                setOnClickListener {
-                    if (e.isContainer) {
-                        browseFolder(e.id, e.title)
-                    } else {
-                        playQueue(listOf(e), 0)
-                    }
+            val btn = flatBtn((if (e.isContainer) "📁 " else "🎵 ") + e.title) {
+                if (e.isContainer) {
+                    browseFolder(e.id, e.title)
+                } else {
+                    playQueue(listOf(e), 0)
                 }
             }
+            btn.gravity = Gravity.LEFT or Gravity.CENTER_VERTICAL
+            if (!e.isContainer) btn.background = roundedBg(C_CARD2, 12, C_STROKE)
             mediaList.addView(btn, LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
         }
         if (entries.isEmpty()) {
-            mediaList.addView(TextView(this).apply { text = "(prázdne)" })
+            val t = TextView(this)
+            t.text = "(prázdne)"
+            t.setTextColor(C_DIM)
+            mediaList.addView(t)
         }
     }
 
@@ -536,7 +932,7 @@ class MainActivity : AppCompatActivity() {
                 while (isActive && queueIdx < playQueue.size) {
                     val track = playQueue[queueIdx]
                     val control = ensureAvtControl() ?: run {
-                        ui { mediaStatusText.text = "UPnP: receiver nedostupny." }
+                        ui { mediaStatusText.text = "UPnP: receiver nedostupný." }
                         return@launch
                     }
                     ui {
@@ -572,6 +968,10 @@ class MainActivity : AppCompatActivity() {
             } catch (_: Exception) { }
         }
     }
+
+    // =====================================================================
+    // UPnP NIZKOUREOVNOVE
+    // =====================================================================
 
     private fun ssdpFindAll(st: String, timeoutMs: Int = 4000): List<String> {
         val result = linkedSetOf<String>()
@@ -690,30 +1090,9 @@ class MainActivity : AppCompatActivity() {
             "</u:Stop></s:Body></s:Envelope>")
     }
 
-    private fun targetVolume(target: Int) {
-        sliderFromUser = false
-        volSlider.isEnabled = false
-        scope.launch(Dispatchers.IO) {
-            try {
-                var guard = 0
-                while (isActive && guard < 200) {
-                    val diff = target - currentVol
-                    if (diff == 0) break
-                    outWriter?.let {
-                        it.write(if (diff > 0) "VU\r\n" else "VD\r\n"); it.flush()
-                    }
-                    delay(120)
-                    sendSilent("?V")
-                    guard++
-                }
-            } finally {
-                ui {
-                    volSlider.isEnabled = true
-                    sliderFromUser = true
-                }
-            }
-        }
-    }
+    // =====================================================================
+    // PRIPOJENIE A SPRAVA PRIKAZOV
+    // =====================================================================
 
     private fun connect() {
         scope.coroutineContext.cancelChildren()
@@ -726,13 +1105,19 @@ class MainActivity : AppCompatActivity() {
                 sock.keepAlive = true
                 outWriter = OutputStreamWriter(sock.getOutputStream(), Charsets.US_ASCII)
                 socketRef.set(sock)
-                ui { statusText.text = "Pripojene: " + host + ":" + port }
-                sendSilent("?P"); sendSilent("?V"); sendSilent("?F")
+                ui {
+                    connLine.text = "●  Pripojené: " + host + ":" + port
+                    connLine.setTextColor(C_GREEN)
+                    statusText.text = ""
+                }
+                sendSilent("?P"); sendSilent("?V"); sendSilent("?F"); sendSilent("?M")
                 listen(sock)
             } catch (e: Exception) {
                 ui {
-                    statusText.text = "Nepodarilo sa pripojit (" + e.message +
-                        "). Skontroluj IP, port a Wi-Fi."
+                    connLine.text = "○  Odpojené"
+                    connLine.setTextColor(C_RED)
+                    statusText.text = "Nepodarilo sa pripojiť (" + (e.message ?: "?") +
+                        "). Skús tlačidlo 🔍 vyhľadať receiver."
                 }
             }
         }
@@ -748,7 +1133,10 @@ class MainActivity : AppCompatActivity() {
                     handleResponse(line.trim())
                 }
             } catch (_: Exception) {
-                ui { statusText.text = "Spojenie prerusene" }
+                ui {
+                    connLine.text = "○  Odpojené"
+                    connLine.setTextColor(C_RED)
+                }
             }
         }
     }
@@ -757,24 +1145,33 @@ class MainActivity : AppCompatActivity() {
         ui {
             when {
                 line.startsWith("VOL") -> {
-                    val v = line.substring(3).toIntOrNull() ?: return@ui
+                    val v = line.substring(3).trim().toIntOrNull() ?: return@ui
                     currentVol = v
-                    val dB = v - 80
-                    volumeText.text = "Hlasitost: " + v +
-                        "  (cca " + (if (dB >= 0) "+" else "") + dB + " dB)"
-                    if (sliderFromUser) volSlider.progress = v.coerceIn(0, volMax)
+                    updateVolumeCard()
+                    volSlider.progress = v.coerceIn(0, volMax)
+                }
+                line.startsWith("MUT") -> {
+                    isMuted = line.startsWith("MUT0")
+                    updateVolumeCard()
+                    updateMuteButton()
                 }
                 line.startsWith("FN") && line.length == 4 -> {
                     val code = line.substring(2) + "FN"
-                    inputText.text = "Vstup: " +
-                        (inputs.entries.firstOrNull { it.value == code }?.key ?: line)
+                    activeInput = inputs.entries.firstOrNull { it.value == code }?.key
+                        ?: (if (code == "38FN") "NETRADIO" else code)
+                    updateInfoLine()
+                    styleInputButtons()
                 }
-                line.startsWith("LM") && line.length == 5 ->
-                    modeText.text = "Rezim: " + line.substring(2) + " (kod LM)"
-                line == "PWR0" -> statusText.text = "Receiver: ZAPNUTY"
-                line == "PWR2" -> statusText.text = "Receiver: STANDBY"
-                line == "MUT0" -> volumeText.text = "MUTE"
-                line == "MUT1" -> sendSilent("?V")
+                line.startsWith("LM") -> {
+                    val m = modes.entries.firstOrNull { line.contains(it.value) }
+                    if (m != null) {
+                        activeMode = m.key
+                        updateInfoLine()
+                        styleModeButtons()
+                    }
+                }
+                line == "PWR0" -> { isOn = true; updatePowerButton() }
+                line == "PWR2" -> { isOn = false; updatePowerButton() }
             }
         }
     }
@@ -792,11 +1189,4 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun ui(block: () -> Unit) = runOnUiThread { block() }
-
-    override fun onDestroy() {
-        super.onDestroy()
-        scope.coroutineContext.cancelChildren()
-        runCatching { socketRef.get()?.close() }
-        multicastLock?.release()
-    }
 }
