@@ -1,6 +1,6 @@
 // ============================================================================
 // Pioneer VSX-S510 Remote — verzia 4 
-// - Tmavý dizajn podľa náhľadu (karty, zaoblené tlačidlá, cyan/orange akcent)
+// - Tmavý dizajn ppodľa náhľadu (karty, zaoblené tlačidlá, cyan/orange akcent)
 // - Posuvník hlasitosti: posiela VU/VD až po pustení palca, presný počet krokov
 // - 🔍 vyhľadanie receivera: sken podsiete telefónu (port 8102 + overenie ?V)
 // - MUTE ako prepínač (sleduje MUT0/MUT1 spätnú väzbu)
