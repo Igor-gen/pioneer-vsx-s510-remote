@@ -172,6 +172,7 @@ class MainActivity : AppCompatActivity() {
         mediaServerName = p.getString("dlnaName", "") ?: ""
         buildUI()
         connect()
+        testStreams()
         val wifi = applicationContext.getSystemService(WIFI_SERVICE) as WifiManager
         multicastLock = wifi.createMulticastLock("pioneerSSDP").apply {
             setReferenceCounted(false); acquire()
@@ -767,6 +768,53 @@ class MainActivity : AppCompatActivity() {
     // =====================================================================
     // RADIO (UPnP push)
     // =====================================================================
+
+    // =====================================================================
+    // TEST DOSTUPNOSTI STREAMOV
+    // zelená = dostupný (128 kbps+), oranžová = dostupný, nižšia kvalita,
+    // červená = nedostupný
+    // =====================================================================
+
+    private fun testStreams() {
+        scope.launch(Dispatchers.IO) {
+            radios.forEach { (name, url) ->
+                launch {
+                    val s = checkStream(url)
+                    ui { markStream(name, s) }
+                }
+            }
+        }
+    }
+
+    private fun checkStream(url: String): Int {
+        for (method in listOf("HEAD", "GET")) {
+            try {
+                val conn = URL(url).openConnection() as HttpURLConnection
+                conn.requestMethod = method
+                conn.connectTimeout = 4000
+                conn.readTimeout = 4000
+                conn.instanceFollowRedirects = true
+                val code = conn.responseCode
+                if (code in 200..299) {
+                    val br = conn.getHeaderField("icy-br")?.trim()?.toIntOrNull()
+                    runCatching { conn.inputStream?.close() }
+                    return if (br != null && br in 1 until 128) 1 else 2
+                }
+                conn.disconnect()
+            } catch (_: Exception) {
+            }
+        }
+        return 0
+    }
+
+    private fun markStream(name: String, status: Int) {
+        val dot = when (status) {
+            2 -> "🟢 "
+            1 -> "🟠 "
+            else -> "🔴 "
+        }
+        radioButtons[name]?.text = dot + name
+    }
 
     private fun playRadio(name: String, url: String) {
         ui {
