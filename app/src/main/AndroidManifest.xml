@@ -9,7 +9,7 @@
     <application
         android:label="Pioneer Remote"
         android:usesCleartextTraffic="true"
-        android:theme="@style/Theme.AppCompat.Light">
+        android:theme="@style/Theme.AppCompat.NoActionBar">
         <activity android:name=".MainActivity" android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
