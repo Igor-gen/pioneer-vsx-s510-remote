@@ -1,6 +1,6 @@
 // ============================================================================
-// Pioneer VSX-S510 Remote — verzia 4 
-// - Tmavý dizajn ppodľa náhľadu (karty, zaoblené tlačidlá, cyan/orange akcent)
+// Pioneer VSX-S510 Remote — verzia 4
+// - Tmavý dizajn podľa náhľadu (karty, zaoblené tlačidlá, cyan/orange akcent)
 // - Posuvník hlasitosti: posiela VU/VD až po pustení palca, presný počet krokov
 // - 🔍 vyhľadanie receivera: sken podsiete telefónu (port 8102 + overenie ?V)
 // - MUTE ako prepínač (sleduje MUT0/MUT1 spätnú väzbu)
@@ -677,30 +677,34 @@ class MainActivity : AppCompatActivity() {
     // VYHLADANIE RECEIVERA V SITI TELEFONU
     // =====================================================================
 
-    private fun phoneIp(): String? = try {
-        val nets = NetworkInterface.getNetworkInterfaces() ?: return null
-        for (n in nets) {
-            if (n.isLoopback || !n.isUp) continue
-            for (a in n.inetAddresses) {
-                if (a is Inet4Address && !a.isLoopbackAddress) return a.hostAddress
+    private fun phoneIp(): String? {
+        return try {
+            val nets = NetworkInterface.getNetworkInterfaces() ?: return null
+            for (n in nets) {
+                if (n.isLoopback || !n.isUp) continue
+                for (a in n.inetAddresses) {
+                    if (a is Inet4Address && !a.isLoopbackAddress) return a.hostAddress
+                }
             }
-        }
-        null
-    } catch (_: Exception) { null }
+            null
+        } catch (_: Exception) { null }
+    }
 
-    private fun probe(ip: String): Boolean = try {
-        Socket().use { s ->
-            s.soTimeout = 1200
-            s.connect(InetSocketAddress(ip, port), 400)
-            val w = OutputStreamWriter(s.getOutputStream(), Charsets.US_ASCII)
-            w.write("?V\r\n")
-            w.flush()
-            val r = BufferedReader(InputStreamReader(s.getInputStream(), Charsets.US_ASCII))
-            val line = r.readLine() ?: return false
-            line.startsWith("VOL") || line.startsWith("PWR") || line.startsWith("FN") ||
-                line.startsWith("MUT") || line.startsWith("LM")
-        }
-    } catch (_: Exception) { false }
+    private fun probe(ip: String): Boolean {
+        return try {
+            Socket().use { s ->
+                s.soTimeout = 1200
+                s.connect(InetSocketAddress(ip, port), 400)
+                val w = OutputStreamWriter(s.getOutputStream(), Charsets.US_ASCII)
+                w.write("?V\r\n")
+                w.flush()
+                val r = BufferedReader(InputStreamReader(s.getInputStream(), Charsets.US_ASCII))
+                val line = r.readLine() ?: return false
+                line.startsWith("VOL") || line.startsWith("PWR") || line.startsWith("FN") ||
+                    line.startsWith("MUT") || line.startsWith("LM")
+            }
+        } catch (_: Exception) { false }
+    }
 
     private fun discoverReceivers() {
         statusText.text = "🔍 Skenujem sieť (port $port)…"
