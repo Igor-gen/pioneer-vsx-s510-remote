@@ -349,7 +349,7 @@ class MainActivity : AppCompatActivity() {
         GridLayout(this).apply {
             columnCount = 3; useDefaultMargins = true
             items.forEach { (name, action) ->
-                addView(Button(this).apply {
+                addView(Button(this@MainActivity).apply {
                     text = name
                     setOnClickListener { action() }
                     layoutParams = GridLayout.LayoutParams().apply {
