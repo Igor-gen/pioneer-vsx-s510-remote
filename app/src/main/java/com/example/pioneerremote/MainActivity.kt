@@ -102,9 +102,9 @@ class MainActivity : AppCompatActivity() {
     private val radioButtons = mutableMapOf<String, Button>()
 
     private val inputs = linkedMapOf(
-        "BD" to "25FN", "DVD" to "04FN", "SAT/CBL" to "05FN",
-        "DVR/BDR" to "15FN", "VIDEO 1" to "10FN", "VIDEO 2" to "14FN",
-        "CD" to "01FN", "TUNER" to "02FN", "IPOD/USB" to "17FN",
+        "BD" to "25FN", "CD" to "01FN", "DVR/BDR" to "15FN",
+        "DVD" to "04FN", "IPOD/USB" to "17FN", "SAT/CBL" to "05FN",
+        "TUNER" to "02FN", "VIDEO 1" to "10FN", "VIDEO 2" to "14FN",
         "HDMI 1" to "19FN", "HDMI 2" to "20FN", "HDMI 3" to "21FN",
         "HDMI 4" to "22FN", "HDMI 5" to "23FN", "HDMI 6" to "24FN"
     )
@@ -219,6 +219,8 @@ class MainActivity : AppCompatActivity() {
         val b = Button(this)
         b.text = label
         b.textSize = 13f
+        b.maxLines = 1
+        b.gravity = Gravity.CENTER
         b.setTextColor(fg)
         b.transformationMethod = null
         b.background = roundedBg(bg, 10)
@@ -287,6 +289,12 @@ class MainActivity : AppCompatActivity() {
         root.orientation = LinearLayout.VERTICAL
         root.setBackgroundColor(C_BG)
         root.setPadding(pad, dp(10), pad, 0)
+
+        // ZAP / VYP uplne hore, kazde na polovicu sirky
+        powerBtn = flatBtn("⏻ ZAP") { send("PO"); sendSilent("?P") }
+        val vypBtn = flatBtn("⏻ VYP") { send("PF"); sendSilent("?P") }
+        powerBtn.textSize = 14f; vypBtn.textSize = 14f
+        root.addView(rowOf(listOf(powerBtn, vypBtn)))
 
         val title = TextView(this)
         title.text = "Pioneer Remote"
@@ -406,6 +414,22 @@ class MainActivity : AppCompatActivity() {
             b.setOnClickListener { pager.currentItem = i }
         }
         styleTab(tabBtns[0], true)
+
+        // MUTE / VSTUP pod prepinacmi screenov, kazde na polovicu sirky
+        muteBtn = flatBtn("🔇 MUTE") { toggleMute() }
+        val vstupBtn = flatBtn("VSTUP ▶") { send("FU"); sendSilent("?F") }
+        muteBtn.textSize = 14f; vstupBtn.textSize = 14f
+        val muteLp = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+        muteLp.topMargin = dp(8)
+        root.addView(rowOf(listOf(muteBtn, vstupBtn)), muteLp)
+
+        // VOL − / VOL + pod nimi
+        val volMinus = flatBtn("VOL −") { send("VD"); sendSilent("?V") }
+        val volPlus = flatBtn("VOL +") { send("VU"); sendSilent("?V") }
+        volMinus.textSize = 14f; volPlus.textSize = 14f
+        root.addView(rowOf(listOf(volMinus, volPlus)))
+
         root.addView(pager)
         setContentView(root)
     }
@@ -434,16 +458,6 @@ class MainActivity : AppCompatActivity() {
         val sv = ScrollView(this)
         sv.addView(page, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
-
-        powerBtn = flatBtn("⏻ ZAP") { send("PO"); sendSilent("?P") }
-        val vypBtn = flatBtn("⏻ VYP") { send("PF"); sendSilent("?P") }
-        muteBtn = flatBtn("🔇 MUTE") { toggleMute() }
-        page.addView(rowOf(listOf(powerBtn, vypBtn, muteBtn)))
-        page.addView(rowOf(listOf(
-            flatBtn("VOL −") { send("VD"); sendSilent("?V") },
-            flatBtn("VOL +") { send("VU"); sendSilent("?V") },
-            flatBtn("VSTUP ▶") { send("FU"); sendSilent("?F") }
-        )))
 
         // posuvnik hlasitosti — posiela AZ po pusteni palca
         val sc = LinearLayout(this)
@@ -478,7 +492,7 @@ class MainActivity : AppCompatActivity() {
 
         page.addView(sectionLabel("VÝBER VSTUPU"))
         val ib = mutableListOf<Button>()
-        inputs.forEach { (name, code) ->
+        inputs.filterKeys { !it.startsWith("HDMI") }.forEach { (name, code) ->
             val b = flatBtn(name) {
                 send(code); sendSilent("?F")
                 activeInput = name
