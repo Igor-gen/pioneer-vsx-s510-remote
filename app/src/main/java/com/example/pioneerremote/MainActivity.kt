@@ -50,6 +50,7 @@ import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.MulticastSocket
 import java.net.NetworkInterface
+import java.net.ServerSocket
 import java.net.Socket
 import java.net.URL
 import java.util.Collections
@@ -160,6 +161,19 @@ class MainActivity : AppCompatActivity() {
         val id: String, val title: String,
         val isContainer: Boolean, val url: String?)
 
+    // ===== LOKALNA HTTP PROXY PRE LIVE STREAMY =====
+    private var proxyServer: ServerSocket? = null
+    private var proxyPort: Int = 0
+    @Volatile private var proxyTargetUrl: String = ""
+    @Volatile private var proxyTargetMime: String = "audio/mpeg"
+
+    // ===== STAV DISPLEJA A SIETOVEHO ZOZNAMU RECEIVERA (FAVORITES / NETRADIO) =====
+    private lateinit var flDisplayText: TextView
+    private lateinit var nwTitleText: TextView
+    private lateinit var nwListLayout: LinearLayout
+    private val nwItems = mutableMapOf<Int, Pair<String, String>>() // line (1..8) -> (type, text)
+    private var nwTotalItems: Int = 0
+
     private var mediaServerDesc: String? = null
     private var mediaServerName: String = ""
     private var cdsControlUrl: String? = null
@@ -200,6 +214,7 @@ class MainActivity : AppCompatActivity() {
         super.onDestroy()
         scope.coroutineContext.cancelChildren()
         runCatching { socketRef.get()?.close() }
+        runCatching { proxyServer?.close() }
         multicastLock?.release()
     }
 
@@ -410,7 +425,16 @@ class MainActivity : AppCompatActivity() {
         statusText.textSize = 11f
         statusText.setTextColor(C_DIM)
         statusText.gravity = Gravity.CENTER
+        flDisplayText = TextView(this)
+        flDisplayText.text = "📟 Displej: —"
+        flDisplayText.textSize = 13f
+        flDisplayText.typeface = Typeface.MONOSPACE
+        flDisplayText.setTextColor(C_CYAN)
+        flDisplayText.gravity = Gravity.CENTER
+        flDisplayText.setPadding(dp(6), dp(2), dp(6), dp(2))
+
         card.addView(volumeBig)
+        card.addView(flDisplayText)
         card.addView(infoLine)
         card.addView(radioLine)
         card.addView(connLine)
@@ -614,32 +638,59 @@ class MainActivity : AppCompatActivity() {
         stopLp.topMargin = dp(10)
         page.addView(stopB, stopLp)
 
-        page.addView(sectionLabel("INTERNÉ RÁDIO RECEIVERA (vTuner / Favorites)"))
+        page.addView(sectionLabel("INTERNÉ RÁDIO A ZOZNAM FAVORITES V RECEIVERI"))
         val netB = flatBtn("NETRADIO (38FN)") {
-            send("38FN"); sendSilent("?F")
-            activeRadio = "NETRADIO"
-            styleRadioButtons()
+            openReceiverNetworkInput("38FN", "NETRADIO")
         }
         val favB = flatBtn("FAVORITES (45FN)") {
-            send("45FN"); sendSilent("?F")
-            activeRadio = "FAVORITES"
-            styleRadioButtons()
+            openReceiverNetworkInput("45FN", "FAVORITES")
         }
         val mSrvB = flatBtn("MEDIA SRV (44FN)") {
-            send("44FN"); sendSilent("?F")
-            activeRadio = "MEDIA SRV"
-            styleRadioButtons()
+            openReceiverNetworkInput("44FN", "MEDIA SRV")
         }
         page.addView(rowOf(listOf(netB, favB, mSrvB)))
 
-        val nwUp = flatBtn("▲ HORE") { send("00NW") }
-        val nwDown = flatBtn("▼ DOLE") { send("01NW") }
-        val nwEnt = flatBtn("⏎ VYBRAŤ") { send("13NW") }
-        val nwRet = flatBtn("↩ SPÄŤ") { send("14NW") }
+        // Tlačidlo na vyžiadanie zoznamu položiek z receivera + stránkovanie
+        val refreshListBtn = flatBtn("🔄 NAČÍTAŤ ZOZNAM") { requestReceiverList() }
+        refreshListBtn.background = roundedBg(C_CYAN_D, 12, C_CYAN)
+        val pgUpBtn = flatBtn("⏫ STRANA −") { send("04NW"); requestReceiverListDelayed(400) }
+        val pgDnBtn = flatBtn("⏬ STRANA +") { send("05NW"); requestReceiverListDelayed(400) }
+        page.addView(rowOf(listOf(refreshListBtn, pgUpBtn, pgDnBtn)))
+
+        val nwUp = flatBtn("▲ HORE") { send("00NW"); requestReceiverListDelayed(350) }
+        val nwDown = flatBtn("▼ DOLE") { send("01NW"); requestReceiverListDelayed(350) }
+        val nwEnt = flatBtn("⏎ VYBRAŤ") { send("13NW"); requestReceiverListDelayed(600) }
+        val nwRet = flatBtn("↩ SPÄŤ") { send("14NW"); requestReceiverListDelayed(600) }
         val nwPlay = flatBtn("▶ PLAY") { send("10NW") }
         val nwStop = flatBtn("⏹ STOP") { send("20NW") }
         page.addView(rowOf(listOf(nwUp, nwDown, nwEnt)))
         page.addView(rowOf(listOf(nwRet, nwPlay, nwStop)))
+
+        // Riadok s aktuálnym názvom obrazovky z receivera
+        nwTitleText = TextView(this)
+        nwTitleText.text = "📋 Zoznam na receiveri (klikni FAVORITES alebo 🔄 NAČÍTAŤ ZOZNAM):"
+        nwTitleText.textSize = 12f
+        nwTitleText.setTextColor(C_CYAN)
+        nwTitleText.setPadding(0, dp(8), 0, dp(4))
+        page.addView(nwTitleText)
+
+        // Dynamický zoznam položiek načítaných priamo z receivera (GEP01..GEP08)
+        nwListLayout = LinearLayout(this)
+        nwListLayout.orientation = LinearLayout.VERTICAL
+        page.addView(nwListLayout)
+        renderReceiverList()
+
+        // Rýchle tlačidlá pre priamy výber pozície 1..8 na aktuálnej strane
+        page.addView(sectionLabel("PRIAMA VOĽBA RIADKU NA OBRAZOVKE (1–8)"))
+        val directBtns = (1..8).map { idx ->
+            val cmd = String.format("%02dGHP", idx)
+            flatBtn("Položka $idx") {
+                send(cmd)
+                requestReceiverListDelayed(700)
+            }
+        }
+        page.addView(rowOf(directBtns.subList(0, 4)))
+        page.addView(rowOf(directBtns.subList(4, 8)))
 
         page.addView(hint("← swipe na ovládanie / médiá →"))
         return sv
@@ -909,21 +960,203 @@ class MainActivity : AppCompatActivity() {
         radioButtons[name]?.text = dot + name
     }
 
+    // ===== OVLADANIE INTERNEHO ZOZNAMU RECEIVERA (FAVORITES / NETRADIO / MEDIA SRV) =====
+
+    private fun openReceiverNetworkInput(fnCode: String, label: String) {
+        activeRadio = label
+        styleRadioButtons()
+        nwItems.clear()
+        renderReceiverList()
+        nwTitleText.text = "⏳ Prepínam na $label a načítavam zoznam z receivera…"
+        scope.launch(Dispatchers.IO) {
+            if (!isOn) {
+                sendSilent("PO")
+                delay(2500)
+            }
+            sendSilent(fnCode)
+            sendSilent("?F")
+            delay(1200)
+            sendSilent("?GAP")
+            sendSilent("?GAH")
+            sendSilent("?FL")
+            delay(1200)
+            sendSilent("?GAP")
+        }
+    }
+
+    private fun requestReceiverList() {
+        nwTitleText.text = "🔄 Načítavam zoznam položiek z receivera…"
+        sendSilent("?GAP")
+        sendSilent("?GAH")
+        sendSilent("?FL")
+    }
+
+    private fun requestReceiverListDelayed(ms: Long) {
+        scope.launch(Dispatchers.IO) {
+            delay(ms)
+            sendSilent("?GAP")
+            sendSilent("?GAH")
+            sendSilent("?FL")
+        }
+    }
+
+    private fun renderReceiverList() {
+        if (!::nwListLayout.isInitialized) return
+        nwListLayout.removeAllViews()
+        if (nwItems.isEmpty()) {
+            val emptyTv = TextView(this)
+            emptyTv.text = "(Zatiaľ žiadne položky — klikni na FAVORITES (45FN) alebo 🔄 NAČÍTAŤ ZOZNAM)"
+            emptyTv.textSize = 11f
+            emptyTv.setTextColor(C_DIM)
+            emptyTv.setPadding(dp(4), dp(4), dp(4), dp(8))
+            nwListLayout.addView(emptyTv)
+            return
+        }
+        for (idx in 1..8) {
+            val entry = nwItems[idx] ?: continue
+            val itemType = entry.first
+            val itemTitle = entry.second
+            if (itemTitle.isBlank()) continue
+            val icon = when (itemType) {
+                "00" -> "📁 "
+                "01" -> "📻 "
+                else -> "▶ "
+            }
+            val cmd = String.format("%02dGHP", idx)
+            val b = flatBtn("$idx. $icon$itemTitle") {
+                activeRadio = itemTitle
+                radioLine.text = "Rádio: $itemTitle ▶"
+                statusText.text = "Vyberám položku $idx: $itemTitle ($cmd)"
+                send(cmd)
+                requestReceiverListDelayed(800)
+            }
+            b.gravity = Gravity.START or Gravity.CENTER_VERTICAL
+            b.setPadding(dp(12), dp(8), dp(12), dp(8))
+            b.background = roundedBg(C_CARD2, 10, C_CYAN_D)
+            val lp = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+            lp.topMargin = dp(3)
+            nwListLayout.addView(b, lp)
+        }
+    }
+
+    private fun decodeFlHex(hexStr: String): String {
+        val sb = StringBuilder()
+        var i = 0
+        while (i + 1 < hexStr.length) {
+            val code = hexStr.substring(i, i + 2).toIntOrNull(16) ?: 32
+            if (code in 32..126) sb.append(code.toChar())
+            else if (code > 127) sb.append('·')
+            i += 2
+        }
+        return sb.toString().trim()
+    }
+
+    // ===== LOKALNA DLNA HTTP PROXY V TELEFONE =====
+
+    private fun ensureStreamProxy(): Int {
+        proxyServer?.let { if (!it.isClosed) return proxyPort }
+        val srv = ServerSocket(0)
+        proxyServer = srv
+        proxyPort = srv.localPort
+        scope.launch(Dispatchers.IO) {
+            while (isActive && !srv.isClosed) {
+                val client = try { srv.accept() } catch (_: Exception) { break }
+                launch(Dispatchers.IO) { handleProxyClient(client) }
+            }
+        }
+        return proxyPort
+    }
+
+    private fun handleProxyClient(client: Socket) {
+        try {
+            client.soTimeout = 10000
+            val reader = BufferedReader(InputStreamReader(client.getInputStream(), Charsets.US_ASCII))
+            val reqLine = reader.readLine() ?: run { client.close(); return }
+            val isHead = reqLine.startsWith("HEAD", ignoreCase = true)
+            while (true) {
+                val h = reader.readLine() ?: break
+                if (h.isEmpty()) break
+            }
+
+            val target = proxyTargetUrl
+            val mime = proxyTargetMime
+            val dlnaPn = if (mime == "audio/aac") "AAC_ISO" else "MP3"
+            val out = client.getOutputStream()
+
+            val headers = "HTTP/1.1 200 OK\r\n" +
+                "Content-Type: $mime\r\n" +
+                "Content-Length: 2000000000\r\n" +
+                "Accept-Ranges: none\r\n" +
+                "Cache-Control: no-cache\r\n" +
+                "Connection: close\r\n" +
+                "transferMode.dlna.org: Streaming\r\n" +
+                "contentFeatures.dlna.org: DLNA.ORG_PN=$dlnaPn;DLNA.ORG_OP=00;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000\r\n\r\n"
+
+            out.write(headers.toByteArray(Charsets.US_ASCII))
+            out.flush()
+
+            if (isHead || target.isEmpty()) {
+                client.close()
+                return
+            }
+
+            var currentUrl = target
+            var upstream: HttpURLConnection? = null
+            repeat(5) {
+                val c = URL(currentUrl).openConnection() as HttpURLConnection
+                c.instanceFollowRedirects = true
+                c.connectTimeout = 5000
+                c.readTimeout = 10000
+                c.setRequestProperty("User-Agent", "VLC/3.0.18 LibVLC/3.0.18")
+                c.setRequestProperty("Icy-MetaData", "0")
+                val code = c.responseCode
+                if (code in 300..399) {
+                    val loc = c.getHeaderField("Location")
+                    c.disconnect()
+                    if (!loc.isNullOrBlank()) {
+                        currentUrl = loc
+                        return@repeat
+                    }
+                }
+                upstream = c
+                return@repeat
+            }
+
+            upstream?.inputStream?.use { input ->
+                val buf = ByteArray(8192)
+                while (true) {
+                    val n = input.read(buf)
+                    if (n <= 0) break
+                    out.write(buf, 0, n)
+                    out.flush()
+                }
+            }
+            upstream?.disconnect()
+        } catch (_: Exception) {
+        } finally {
+            runCatching { client.close() }
+        }
+    }
+
     private fun resolveFinalUrl(urlStr: String): String {
         var current = urlStr
-        repeat(3) {
+        repeat(4) {
             try {
                 val conn = URL(current).openConnection() as HttpURLConnection
                 conn.instanceFollowRedirects = false
                 conn.requestMethod = "GET"
                 conn.connectTimeout = 2500
                 conn.readTimeout = 2500
+                conn.setRequestProperty("Icy-MetaData", "0")
                 val code = conn.responseCode
                 if (code in 300..399) {
                     val loc = conn.getHeaderField("Location")
                     conn.disconnect()
                     if (!loc.isNullOrBlank()) {
-                        current = loc.replaceFirst(Regex("^https://", RegexOption.IGNORE_CASE), "http://")
+                        current = loc
                         return@repeat
                     }
                 }
@@ -937,11 +1170,19 @@ class MainActivity : AppCompatActivity() {
         return current
     }
 
+    private fun extractUpnpError(xml: String?): String? {
+        if (xml == null) return "bez odpovede"
+        if (!xml.contains("UPnPError", ignoreCase = true) && !xml.contains("Fault", ignoreCase = true)) return null
+        val code = Regex("(?is)<errorCode>(.*?)</errorCode>").find(xml)?.groupValues?.get(1)
+        val desc = Regex("(?is)<errorDescription>(.*?)</errorDescription>").find(xml)?.groupValues?.get(1)
+        return if (code != null) "$code (${desc ?: "UPnP Fault"})" else "SOAP Fault"
+    }
+
     private fun playRadioWithFallback(name: String, urls: List<String>) {
         queueJob?.cancel()
         ui {
             radioLine.text = "Rádio: spúšťam $name…"
-            statusText.text = "Hľadám fungujúci stream (od najvyššieho bitrate)…"
+            statusText.text = "Spúšťam lokálnu DLNA proxy a pripravujem receiver…"
         }
         scope.launch(Dispatchers.IO) {
             try {
@@ -950,10 +1191,9 @@ class MainActivity : AppCompatActivity() {
                     delay(2500)
                 }
 
-                if (activeInput == null || activeInput == "NETRADIO" ||
-                    (activeInput != "MEDIA SRV" && activeInput != "44FN" && activeInput != "47FN" && activeInput != "DMR")) {
-                    sendSilent("44FN")
-                    delay(1200)
+                if (activeInput == "NETRADIO" || activeInput == "38FN") {
+                    sendSilent("47FN")
+                    delay(900)
                 }
 
                 val control = ensureAvtControl() ?: run {
@@ -961,37 +1201,76 @@ class MainActivity : AppCompatActivity() {
                     return@launch
                 }
 
+                val myIp = phoneIp()
+                val pPort = ensureStreamProxy()
+
                 var success = false
-                var workingUrl = ""
+                var workingDesc = ""
+                var lastErr = ""
 
-                for (url in urls) {
-                    val resolved = resolveFinalUrl(url)
-                        .replaceFirst(Regex("^https://", RegexOption.IGNORE_CASE), "http://")
+                for (rawUrl in urls) {
+                    if (checkStream(rawUrl) == 0) continue
 
-                    runCatching { soapStop(control) }
-                    delay(250)
+                    val resolved = resolveFinalUrl(rawUrl)
+                    val lower = resolved.lowercase()
+                    val isAac = lower.endsWith(".aac") || lower.contains("aac") || lower.endsWith("mellow-320")
+                    val mime = if (isAac) "audio/aac" else "audio/mpeg"
+                    val ext = if (isAac) "aac" else "mp3"
 
-                    val setResp = soapSetUri(control, resolved, name, isBroadcast = true)
-                    if (setResp == null || setResp.contains("UPnPError")) continue
+                    proxyTargetUrl = resolved
+                    proxyTargetMime = mime
 
-                    delay(250)
-                    val playResp = soapPlay(control)
-                    if (playResp != null && !playResp.contains("UPnPError")) {
-                        success = true
-                        workingUrl = resolved
-                        break
+                    val candidates = mutableListOf<Pair<String, String>>()
+                    if (myIp != null && pPort > 0) {
+                        candidates.add("http://$myIp:$pPort/live.$ext" to "Proxy")
                     }
+                    candidates.add(resolved.replaceFirst(Regex("^https://", RegexOption.IGNORE_CASE), "http://") to "Direct")
+
+                    for ((candUrl, modeLabel) in candidates) {
+                        for (metaMode in listOf(0, 1, 2)) {
+                            runCatching { soapStop(control) }
+                            delay(200)
+
+                            val setResp = soapSetUriMode(control, candUrl, name, mime, metaMode)
+                            val setErr = extractUpnpError(setResp)
+                            if (setErr != null) {
+                                lastErr = "SetURI [$modeLabel/m$metaMode]: $setErr"
+                                continue
+                            }
+
+                            delay(250)
+                            val playResp = soapPlay(control)
+                            val playErr = extractUpnpError(playResp)
+                            if (playErr == null) {
+                                delay(1200)
+                                val st = transportState(control)
+                                if (st == "PLAYING" || st == "TRANSITIONING" || st.isEmpty()) {
+                                    success = true
+                                    workingDesc = "$modeLabel ($candUrl)"
+                                    break
+                                } else {
+                                    lastErr = "Stav po Play [$modeLabel/m$metaMode]: $st"
+                                }
+                            } else {
+                                lastErr = "Play [$modeLabel/m$metaMode]: $playErr"
+                            }
+                        }
+                        if (success) break
+                    }
+                    if (success) break
                 }
 
                 if (!success) {
-                    ui { statusText.text = "Všetky streamy pre $name zlyhali." }
+                    ui {
+                        statusText.text = "Zlyhalo ($name) — posledná odpoveď receivera: $lastErr"
+                    }
                     return@launch
                 }
 
                 sendSilent("?F")
                 ui {
                     radioLine.text = "Rádio: $name ▶"
-                    statusText.text = "Hrá: $name ($workingUrl)"
+                    statusText.text = "Hrá: $name [$workingDesc]"
                 }
             } catch (e: Exception) {
                 ui { statusText.text = "Rádio chyba: " + (e.message ?: "neznáma") }
@@ -1328,6 +1607,47 @@ class MainActivity : AppCompatActivity() {
             .find(resp)?.groupValues?.get(1) ?: ""
     }
 
+    private fun soapSetUriMode(controlUrl: String, streamUrl: String,
+                               title: String, mime: String, metaMode: Int): String? {
+        val escUrl = streamUrl.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        val escTitle = title.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+        val escDidl = if (metaMode == 2) {
+            ""
+        } else {
+            val dlnaPn = if (mime == "audio/aac") "AAC_ISO" else "MP3"
+            val upnpClass = if (metaMode == 0)
+                "object.item.audioItem.musicTrack"
+            else
+                "object.item.audioItem.audioBroadcast"
+            val dlnaOp = if (metaMode == 0) "01" else "00"
+            val dlnaFlags = "01700000000000000000000000000000"
+
+            val didl = "<DIDL-Lite xmlns=\"urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/\" " +
+                "xmlns:dc=\"http://purl.org/dc/elements/1.1/\" " +
+                "xmlns:upnp=\"urn:schemas-upnp-org:metadata-1-0/upnp/\">" +
+                "<item id=\"0\" parentID=\"-1\" restricted=\"1\">" +
+                "<dc:title>$escTitle</dc:title>" +
+                "<upnp:class>$upnpClass</upnp:class>" +
+                "<res size=\"2000000000\" protocolInfo=\"http-get:*:$mime:DLNA.ORG_PN=$dlnaPn;DLNA.ORG_OP=$dlnaOp;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=$dlnaFlags\">$escUrl</res>" +
+                "</item></DIDL-Lite>"
+
+            didl.replace("&", "&amp;")
+                .replace("<", "&lt;")
+                .replace(">", "&gt;")
+                .replace("\"", "&quot;")
+        }
+
+        return soap(controlUrl, "SetAVTransportURI",
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n" +
+            "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" " +
+            "s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">" +
+            "<s:Body><u:SetAVTransportURI xmlns:u=\"urn:schemas-upnp-org:service:AVTransport:1\">" +
+            "<InstanceID>0</InstanceID><CurrentURI>" + escUrl + "</CurrentURI>" +
+            "<CurrentURIMetaData>" + escDidl + "</CurrentURIMetaData>" +
+            "</u:SetAVTransportURI></s:Body></s:Envelope>")
+    }
+
     private fun soapSetUri(controlUrl: String, streamUrl: String,
                            title: String = "Internet Radio",
                            isBroadcast: Boolean = true): String? {
@@ -1416,7 +1736,7 @@ class MainActivity : AppCompatActivity() {
                     connLine.setTextColor(C_GREEN)
                     statusText.text = ""
                 }
-                sendSilent("?P"); sendSilent("?V"); sendSilent("?F"); sendSilent("?M")
+                sendSilent("?P"); sendSilent("?V"); sendSilent("?F"); sendSilent("?M"); sendSilent("?FL"); sendSilent("?GAP")
                 listen(sock)
             } catch (e: Exception) {
                 ui {
@@ -1482,6 +1802,46 @@ class MainActivity : AppCompatActivity() {
                 }
                 line == "PWR0" -> { isOn = true; updatePowerButton() }
                 line == "PWR2" || line == "PWR1" -> { isOn = false; updatePowerButton() }
+                line.startsWith("FL") && line.length >= 6 -> {
+                    // Predný displej receivera v HEX (napr. FL0220464156...)
+                    val txt = decodeFlHex(line.substring(4))
+                    if (txt.isNotEmpty()) {
+                        flDisplayText.text = "📟 $txt"
+                    }
+                }
+                line.startsWith("GBH") || line.startsWith("GBP") -> {
+                    // Max počet položiek na obrazovke (napr. GBH08)
+                    val maxLine = line.substring(3).trim().toIntOrNull() ?: 0
+                    if (maxLine == 0) nwItems.clear()
+                }
+                line.startsWith("GDH") || line.startsWith("GDP") -> {
+                    // Rozsah a celkový počet položiek v zozname (napr. GDH000010000800015)
+                    if (line.length >= 18) {
+                        nwTotalItems = line.substring(13, 18).toIntOrNull() ?: 0
+                        nwTitleText.text = "📋 Položky v zozname receivera (celkom: $nwTotalItems):"
+                    }
+                }
+                line.startsWith("GCH") || line.startsWith("GCP") -> {
+                    // Názov obrazovky v sieťovom menu
+                    val screenName = line.substringAfter("\"", "").substringBeforeLast("\"", "")
+                    if (screenName.isNotEmpty()) {
+                        nwTitleText.text = "📋 $screenName" + (if (nwTotalItems > 0) " ($nwTotalItems)" else "")
+                    }
+                }
+                line.startsWith("GEH") || line.startsWith("GEP") -> {
+                    // Riadok zoznamu (napr. GEP01001"Rádio Slovensko" alebo GEH010"Rádio Slovensko")
+                    val idx = line.substring(3, 5).toIntOrNull()
+                    val title = line.substringAfter("\"", "").substringBeforeLast("\"", "")
+                    val typeCode = if (line.length >= 8) line.substring(6, 8) else "01"
+                    if (idx != null) {
+                        if (title.isNotEmpty()) {
+                            nwItems[idx] = typeCode to title
+                        } else {
+                            nwItems.remove(idx)
+                        }
+                        renderReceiverList()
+                    }
+                }
             }
         }
     }
