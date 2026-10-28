@@ -1,12 +1,14 @@
 // ============================================================================
-// Pioneer VSX-S510 Remote — verzia 11
+// Pioneer VSX-S510 Remote — verzia 12
 // - Opravený vstup SAT/CBL (06FN) + pridaný vstup TV (05FN)
 // - Hlavička s okrúhlym prepínačom ON/OFF napravo
 // - Screen 2 (RÁDIO):
-//     * Odstránené všetky priame streamy, proxy, +FAV a navigačné tlačidlá
-//     * Priame zobrazenie zoznamu Favorites ako tlačidiel (s automatickým uložením do pamäte)
-//     * Opravené prepínanie medzi predvoľbami Favorites v ľubovoľnom poradí
-//       (automatický návrat z Play obrazovky do zoznamu pred výberom ďalšej predvoľby)
+//     * Ochrana tlačidiel predvolieb Favorites pred prepísaním údajmi o skladbe/bitrate:
+//       - Rozlíšenie podľa GEP/GEH Data Type kódu (00..04 = položka zoznamu vs. 20..30 = metadáta prehrávania)
+//       - Zápis do tlačidiel Favorites len počas synchronizácie zoznamu (isSyncingFavorites)
+//     * Spoľahlivé okamžité prepínanie predvolieb Favorites v ľubovoľnom poradí:
+//       - Ak už hrá stanica (Play obrazovka), vykoná sa tvrdý reštart vstupu Favorites
+//         (prepnutie 38FN -> 45FN + návrat 14NW), počká sa na načítanie zoznamu a ihneď spustí novú predvoľbu (xxGHP)
 //     * Spodný informačný displej s detailom prehrávanej stanice/skladby, bitrate a časom
 // - Screen 3 (MÉDIÁ): DLNA prehliadač + album fronta (nezmenené)
 // ============================================================================
@@ -131,12 +133,15 @@ class MainActivity : AppCompatActivity() {
     private lateinit var nowPlayingMeta: TextView
     private lateinit var nowPlayingFl: TextView
 
-    // Uložený zoznam Favorites staníc (index 1..N -> názov stanice), aby tlačidlá nikdy nezmizli počas prehrávania
+    // Uzamknutý zoznam Favorites staníc (index 1..8 -> názov stanice),
+    // chránený pred prepísaním metadátami prehrávanej skladby
     private val favStations = linkedMapOf<Int, String>()
-    // Dočasné riadky prijaté z obrazovky receivera (1..8)
-    private val screenLines = mutableMapOf<Int, Pair<String, String>>()
+    // Metadáta z obrazovky prehrávania (riadok 1..8 -> Pair(typeCode, text))
+    private val playMetaLines = mutableMapOf<Int, Pair<String, String>>()
+    @Volatile private var isSyncingFavorites: Boolean = false
+    @Volatile private var isPlayingFavorite: Boolean = false
     @Volatile private var nwScreenType: String = ""
-    @Volatile private var nwScreenName: String = ""
+    @Volatile private var listScreenReady: Boolean = false
     private var playTimeText: String = ""
 
     // ===== DLNA =====
@@ -198,7 +203,11 @@ class MainActivity : AppCompatActivity() {
             favStations.clear()
             for (i in 0 until arr.length()) {
                 val obj = arr.getJSONObject(i)
-                favStations[obj.getInt("idx")] = obj.getString("name")
+                val idx = obj.getInt("idx")
+                val name = obj.getString("name")
+                if (!looksLikeMetadata(name)) {
+                    favStations[idx] = name
+                }
             }
         }
     }
@@ -214,6 +223,16 @@ class MainActivity : AppCompatActivity() {
             }
             prefs().edit().putString("favStationsJson", arr.toString()).apply()
         }
+    }
+
+    // Filter, ktorý zabráni, aby sa bitrate, formát alebo čas uložil ako názov predvoľby
+    private fun looksLikeMetadata(text: String): Boolean {
+        val t = text.trim()
+        if (t.isEmpty()) return true
+        if (Regex("(?i).*\\b(kbps|khz|mp3|aac|wma|flac|wav|pcm|buffer)\\b.*").matches(t)) return true
+        if (Regex("^\\d{1,2}:\\d{2}(:\\d{2})?$").matches(t)) return true
+        if (Regex("^\\d+\\s*%$").matches(t)) return true
+        return false
     }
 
     // =====================================================================
@@ -474,7 +493,6 @@ class MainActivity : AppCompatActivity() {
             override fun onPageSelected(position: Int) {
                 tabBtns.forEachIndexed { i, b -> styleTab(b, i == position) }
                 if (position == 1) {
-                    // Pri prechode na kartu RÁDIO automaticky načítame Favorites, ak ešte nie sú načítané
                     ensureFavoritesLoaded()
                 }
             }
@@ -563,6 +581,7 @@ class MainActivity : AppCompatActivity() {
         val ib = mutableListOf<Button>()
         inputs.forEach { (name, code) ->
             val b = flatBtn(name) {
+                if (code != "45FN") isPlayingFavorite = false
                 send(code); sendSilent("?F")
                 activeInput = name
                 updateInfoLine(); styleInputButtons()
@@ -600,7 +619,6 @@ class MainActivity : AppCompatActivity() {
         sv.addView(page, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
 
-        // Riadok nadpisu Favorites + malá ikonka na obnovenie zoznamu z receivera
         val hdrRow = LinearLayout(this)
         hdrRow.orientation = LinearLayout.HORIZONTAL
         hdrRow.gravity = Gravity.CENTER_VERTICAL
@@ -613,8 +631,8 @@ class MainActivity : AppCompatActivity() {
         lbl.setTextColor(C_SLATE)
         hdrRow.addView(lbl, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
 
-        val syncBtn = pillBtn("🔄 Načítať z receivera", C_CARD2, C_CYAN) {
-            syncFavoritesFromReceiver()
+        val syncBtn = pillBtn("🔄 Obnoviť zoznam", C_CARD2, C_CYAN) {
+            syncFavoritesFromReceiver(forceClear = true)
         }
         hdrRow.addView(syncBtn, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
@@ -673,10 +691,8 @@ class MainActivity : AppCompatActivity() {
         favGridContainer.removeAllViews()
         favButtons.clear()
 
-        // Ak ešte nemáme načítané názvy zo siete, zobrazíme 8 predvolieb (Predvoľba 1..8),
-        // ktoré hneď fungujú na priame spustenie a zároveň načítajú skutočné názvy
         val entriesToRender = if (favStations.isNotEmpty()) {
-            favStations.entries.map { it.key to it.value }
+            favStations.entries.sortedBy { it.key }.map { it.key to it.value }
         } else {
             (1..8).map { it to "Predvoľba $it" }
         }
@@ -701,88 +717,139 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun ensureFavoritesLoaded() {
-        if (favStations.isEmpty() || activeInput != "FAVORITES") {
-            syncFavoritesFromReceiver()
+        if (favStations.isEmpty()) {
+            syncFavoritesFromReceiver(forceClear = false)
         } else {
             sendSilent("?GAP")
             sendSilent("?FL")
         }
     }
 
-    private fun syncFavoritesFromReceiver() {
-        favSwitchJob?.cancel()
-        statusText.text = "🔄 Načítavam zoznam Favorites z receivera…"
-        favSwitchJob = scope.launch(Dispatchers.IO) {
-            if (!isOn) {
-                sendSilent("PO")
-                delay(2500)
+    // Vynúti návrat receivera do koreňového zoznamu Favorites (List Screen) a načíta názvy staníc
+    private suspend fun forceReturnToFavoritesList() {
+        listScreenReady = false
+        if (activeInput != "FAVORITES" && activeInput != "45FN") {
+            sendSilent("45FN")
+            sendSilent("?F")
+            // Čakáme na načítanie zoznamu Favorites (max 2.2 s)
+            repeat(11) {
+                delay(200)
+                if (listScreenReady) return
             }
-            if (activeInput != "FAVORITES" && activeInput != "45FN") {
-                sendSilent("45FN")
-                sendSilent("?F")
-                delay(1400)
-            } else {
-                // Ak už sme vo Favorites, ale receiver práve hrá stanicu (je na Play obrazovke),
-                // pošleme 20NW (Stop) + 14NW (Return), aby sa vrátil do koreňového zoznamu Favorites
-                if (nwScreenType == "04" || nwScreenType == "05") {
-                    sendSilent("20NW")
-                    delay(350)
-                    sendSilent("14NW")
-                    delay(600)
-                }
+            return
+        }
+
+        // Ak už sme vo FAVORITES a práve hrá stanica (alebo je receiver na Play obrazovke),
+        // samotné 14NW/20NW na VSX-S510 často nestačí, pretože zoznam Favorites ostane zamknutý v streame.
+        // Najprv skúsime Stop (20NW) + Return (14NW):
+        sendSilent("20NW")
+        delay(250)
+        sendSilent("14NW")
+        delay(350)
+        sendSilent("?GAP")
+        delay(350)
+
+        if (!listScreenReady) {
+            // Tvrdý reštart zoznamu Favorites: krátko prepneme na 38FN (NetRadio) a hneď späť na 45FN (Favorites).
+            // Týmto receiver na 100 % opustí prehrávaný stream a otvorí čistý zoznam Favorites od položky 1!
+            sendSilent("38FN")
+            delay(450)
+            sendSilent("45FN")
+            sendSilent("?F")
+            repeat(10) {
+                delay(200)
+                if (listScreenReady) break
             }
-            sendSilent("?GAP")
-            sendSilent("?GAH")
-            sendSilent("?FL")
-            delay(900)
-            sendSilent("?GAP")
-            ui { statusText.text = "" }
         }
     }
 
-    // Kľúčová oprava: spoľahlivé prepnutie na ľubovoľnú predvoľbu Favorites v ľubovoľnom poradí,
-    // aj keď už iná predvoľba práve hrá!
+    private fun syncFavoritesFromReceiver(forceClear: Boolean) {
+        favSwitchJob?.cancel()
+        if (forceClear) {
+            favStations.clear()
+            saveCachedFavorites()
+            renderFavoriteButtons()
+        }
+        statusText.text = "🔄 Načítavam zoznam Favorites z receivera…"
+        favSwitchJob = scope.launch(Dispatchers.IO) {
+            try {
+                isSyncingFavorites = true
+                isPlayingFavorite = false
+                if (!isOn) {
+                    sendSilent("PO")
+                    delay(2500)
+                }
+                forceReturnToFavoritesList()
+                sendSilent("?GAP")
+                sendSilent("?GAH")
+                sendSilent("?FL")
+                delay(900)
+                sendSilent("?GAP")
+            } finally {
+                delay(400)
+                isSyncingFavorites = false
+                ui { statusText.text = "" }
+            }
+        }
+    }
+
+    // Spoľahlivé prepnutie na ľubovoľnú predvoľbu Favorites v ľubovoľnom poradí:
     private fun selectFavoritePreset(index: Int, name: String) {
         favSwitchJob?.cancel()
         activeFavIndex = index
         styleFavButtons()
-        radioLine.text = "Stanica: $name ▶"
-        nowPlayingTitle.text = "📻 $index. $name"
+        val displayTitle = favStations[index] ?: name
+        radioLine.text = "Stanica: $displayTitle ▶"
+        nowPlayingTitle.text = "📻 $index. $displayTitle"
         nowPlayingSub.text = "Prepínam na predvoľbu $index…"
+        nowPlayingMeta.text = "Čakám na spustenie streamu…"
 
         favSwitchJob = scope.launch(Dispatchers.IO) {
+            isSyncingFavorites = false
             if (!isOn) {
                 sendSilent("PO")
                 delay(2500)
             }
 
-            if (activeInput != "FAVORITES" && activeInput != "45FN") {
-                // Receiver je na inom vstupe -> prepneme na Favorites (45FN) a počkáme na zoznam
-                sendSilent("45FN")
-                sendSilent("?F")
-                delay(1500)
-            } else {
-                // Receiver už je vo FAVORITES.
-                // Keď hrá predchádzajúca predvoľba, receiver je v "Play Screen" (typ obrazovky 04),
-                // kde ignoruje príkaz xxGHP!
-                // Preto najprv zastavíme stream (20NW) a vrátime sa o úroveň späť do zoznamu Favorites (14NW).
-                sendSilent("20NW")
-                delay(350)
-                sendSilent("14NW")
-                delay(650)
+            // Ak ešte nemáme načítané názvy staníc, povolíme ich uloženie počas prechodu cez zoznam
+            if (favStations.isEmpty()) {
+                isSyncingFavorites = true
             }
 
-            // Overíme stav obrazovky a odošleme priamu voľbu položky v zozname
+            // 1. Zabezpečíme, že receiver je v koreňovom zozname Favorites (nie v Play obrazovke predchádzajúcej stanice)
+            if (activeInput != "FAVORITES" && activeInput != "45FN") {
+                listScreenReady = false
+                sendSilent("45FN")
+                sendSilent("?F")
+                repeat(10) {
+                    delay(200)
+                    if (listScreenReady) break
+                }
+                delay(300)
+            } else if (isPlayingFavorite || nwScreenType == "04" || nwScreenType == "05") {
+                forceReturnToFavoritesList()
+                delay(250)
+            }
+
+            // Uzamkneme zoznam predvolieb, aby následné metadáta o skladbe neprepísali názvy tlačidiel!
+            isSyncingFavorites = false
+            isPlayingFavorite = true
+            playMetaLines.clear()
+
+            // 2. Odošleme priamu voľbu položky v zozname (napr. 01GHP, 02GHP...)
             val ghpCmd = String.format("%02dGHP", index)
             sendSilent(ghpCmd)
-            delay(500)
-            sendSilent("?GAP")
-            sendSilent("?FL")
+            delay(450)
+            // Pre istotu pošleme aj 10NW (Play), ak by receiver zostal stáť na vybranej položke
+            sendSilent("10NW")
 
-            // Počkáme, kým sa stream rozbehne, a vyžiadame si metadáta prehrávanej stanice
-            delay(1500)
+            // 3. Počkáme na nabehnutie streamu a vyžiadame si detail prehrávania pre spodný displej
+            delay(1400)
             sendSilent("?GAP")
             sendSilent("?GAH")
+            sendSilent("?FL")
+            delay(1500)
+            sendSilent("?GAP")
             sendSilent("?FL")
         }
     }
@@ -896,32 +963,38 @@ class MainActivity : AppCompatActivity() {
         return sb.toString().trim()
     }
 
-    private fun updateNowPlayingCardFromScreen() {
+    private fun updateNowPlayingCardFromMeta() {
         if (!::nowPlayingTitle.isInitialized) return
-        // Keď je receiver na Play obrazovke (typ 04/05) alebo posiela metadáta v riadkoch 1..6:
-        // Riadok 1 býva názov stanice/skladby, riadok 2 interpret/žáner, riadok 3/4 album alebo formát/bitrate
-        val l1 = screenLines[1]?.second.orEmpty()
-        val l2 = screenLines[2]?.second.orEmpty()
-        val l3 = screenLines[3]?.second.orEmpty()
-        val l4 = screenLines[4]?.second.orEmpty()
-        val l5 = screenLines[5]?.second.orEmpty()
+        val presetName = if (activeFavIndex > 0) favStations[activeFavIndex] else null
+        val l1 = playMetaLines[1]?.second.orEmpty()
+        val l2 = playMetaLines[2]?.second.orEmpty()
+        val l3 = playMetaLines[3]?.second.orEmpty()
+        val l4 = playMetaLines[4]?.second.orEmpty()
+        val l5 = playMetaLines[5]?.second.orEmpty()
+        val l6 = playMetaLines[6]?.second.orEmpty()
 
-        if (l1.isNotEmpty()) {
-            nowPlayingTitle.text = "📻 $l1"
-            radioLine.text = "Stanica: $l1 ▶"
+        val stationTitle = when {
+            !presetName.isNullOrBlank() -> "$activeFavIndex. $presetName"
+            l1.isNotBlank() -> l1
+            else -> "Prehrávanie z Favorites"
         }
-        val subParts = listOf(l2, l3).filter { it.isNotBlank() }
-        nowPlayingSub.text = if (subParts.isNotEmpty())
-            subParts.joinToString("  ·  ")
-        else
-            "Prehrávanie z Favorites"
+        nowPlayingTitle.text = "📻 $stationTitle"
+        radioLine.text = "Stanica: $stationTitle ▶"
 
-        val metaParts = listOf(l4, l5).filter { it.isNotBlank() }.toMutableList()
-        if (playTimeText.isNotBlank()) metaParts.add("Čas: $playTimeText")
-        nowPlayingMeta.text = if (metaParts.isNotEmpty())
-            metaParts.joinToString("   ·   ")
+        val trackParts = listOf(l1, l2, l3).filter {
+            it.isNotBlank() && !it.equals(presetName, ignoreCase = true)
+        }.distinct()
+        nowPlayingSub.text = if (trackParts.isNotEmpty())
+            trackParts.joinToString("  ·  ")
         else
-            "Formát / Bitrate: podľa vysielateľa"
+            "Skladba / Interpret: —"
+
+        val techParts = listOf(l4, l5, l6).filter { it.isNotBlank() }.distinct().toMutableList()
+        if (playTimeText.isNotBlank()) techParts.add("Čas: $playTimeText")
+        nowPlayingMeta.text = if (techParts.isNotEmpty())
+            techParts.joinToString("   ·   ")
+        else
+            "Formát / Bitrate: —"
     }
 
     // =====================================================================
@@ -1512,43 +1585,50 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
                 line.startsWith("GCH") || line.startsWith("GCP") -> {
-                    // Informácia o type obrazovky (napr. GCP01... = List screen, GCP04... = Play screen)
                     if (line.length >= 5) {
                         nwScreenType = line.substring(3, 5)
                     }
-                    nwScreenName = line.substringAfter("\"", "").substringBeforeLast("\"", "")
                     if (nwScreenType == "01" || nwScreenType == "02") {
-                        screenLines.clear()
+                        listScreenReady = true
+                        isPlayingFavorite = false
+                    } else if (nwScreenType == "04" || nwScreenType == "05") {
+                        isPlayingFavorite = true
                     }
                 }
+                line.startsWith("GDH") || line.startsWith("GDP") -> {
+                    listScreenReady = true
+                }
                 line.startsWith("GHH") || line.startsWith("GHP") || line.startsWith("GIH") || line.startsWith("GIP") -> {
-                    // Upcha/čas prehrávania zo sieťového modulu
                     val raw = line.substring(3).trim()
                     if (raw.length >= 4) {
                         playTimeText = raw
-                        updateNowPlayingCardFromScreen()
+                        updateNowPlayingCardFromMeta()
                     }
                 }
                 line.startsWith("GEH") || line.startsWith("GEP") -> {
+                    // Formát Pioneer: GEP + riadok(2 znaky: 01..08) + fokus(1 znak: 0/1) + dataType(2 znaky) + "Text"
+                    // DataType 00..04 = položka zoznamu (priečinok/stanica)
+                    // DataType 20..32 = metadáta prehrávania (skladba, interpret, album, žáner, bitrate, formát, čas)
                     val idx = line.substring(3, 5).toIntOrNull()
                     val title = line.substringAfter("\"", "").substringBeforeLast("\"", "")
                     val typeCode = if (line.length >= 8) line.substring(6, 8) else "01"
+                    val typeNum = typeCode.toIntOrNull() ?: 1
+
                     if (idx != null) {
-                        if (title.isNotEmpty()) {
-                            screenLines[idx] = typeCode to title
-                        } else {
-                            screenLines.remove(idx)
-                        }
+                        val isMetadataLine = typeNum >= 10 || isPlayingFavorite ||
+                            nwScreenType == "04" || nwScreenType == "05" || looksLikeMetadata(title)
 
-                        // Rozlíšime, či ide o zoznam staníc (List screen) alebo o detail prehrávania (Play screen):
-                        // Na Play obrazovke (04/05) posiela Pioneer v GEP01..GEP05 názov stanice, skladbu, žáner a bitrate.
-                        val isPlayScreen = nwScreenType == "04" || nwScreenType == "05" ||
-                            nwScreenName.contains("Play", ignoreCase = true)
-
-                        if (isPlayScreen) {
-                            updateNowPlayingCardFromScreen()
-                        } else if (activeInput == "FAVORITES" || nwScreenName.contains("Favorite", ignoreCase = true)) {
-                            // Sme v zozname Favorites -> uložíme si stanicu do trvalého zoznamu tlačidiel
+                        if (isMetadataLine) {
+                            // Ide o informácie o prehrávanej skladbe, bitrate alebo formáte -> patrí výhradne na dolný displej!
+                            if (title.isNotEmpty()) {
+                                playMetaLines[idx] = typeCode to title
+                            } else {
+                                playMetaLines.remove(idx)
+                            }
+                            updateNowPlayingCardFromMeta()
+                        } else if (isSyncingFavorites || favStations.size < 8) {
+                            // Ide o skutočnú položku zoznamu Favorites (typeCode 00..04) počas načítania zoznamu
+                            listScreenReady = true
                             if (title.isNotEmpty() && !title.startsWith("[")) {
                                 favStations[idx] = title
                                 saveCachedFavorites()
