@@ -732,7 +732,7 @@ class MainActivity : AppCompatActivity() {
             sendSilent("45FN")
             sendSilent("?F")
             // Čakáme na načítanie zoznamu Favorites (max 2.2 s)
-            repeat(11) {
+            for (step in 0 until 11) {
                 delay(200)
                 if (listScreenReady) return
             }
@@ -756,7 +756,7 @@ class MainActivity : AppCompatActivity() {
             delay(450)
             sendSilent("45FN")
             sendSilent("?F")
-            repeat(10) {
+            for (step in 0 until 10) {
                 delay(200)
                 if (listScreenReady) break
             }
@@ -821,7 +821,7 @@ class MainActivity : AppCompatActivity() {
                 listScreenReady = false
                 sendSilent("45FN")
                 sendSilent("?F")
-                repeat(10) {
+                for (step in 0 until 10) {
                     delay(200)
                     if (listScreenReady) break
                 }
