@@ -1,14 +1,20 @@
 // ============================================================================
-// Pioneer VSX-S510 Remote — verzia 4
+// Pioneer VSX-S510 Remote — verzia 6 (FAV tlačidlo + Rozšírené rádiá s fallbackmi)
 // - Tmavý dizajn podľa náhľadu (karty, zaoblené tlačidlá, cyan/orange akcent)
-// - Posuvník hlasitosti: posiela VU/VD až po pustení palca, presný počet krokov
+// - Posuvník hlasitosti: posiela VU/VD až po pustení palca, zrýchlená odozva (50 ms)
 // - 🔍 vyhľadanie receivera: sken podsiete telefónu (port 8102 + overenie ?V)
 // - MUTE ako prepínač (sleduje MUT0/MUT1 spätnú väzbu)
 // - Zvýraznenie aktívneho vstupu / režimu / rádia
-// - Screen 2: internetové rádio (UPnP push), Screen 3: DLNA + album fronta
+// - Screen 2:
+//     * Rozšírený zoznam slovenských a českých rádií s HTTP streammi a fallbackmi na nižší bitrate
+//     * Tlačidlo ⭐ +FAV (pridanie/odstránenie aktuálnej skladby/stanice do interného priečinka Favorites - 30NW)
+//     * Doplnené DIDL-Lite metadáta a automatické prepínanie na MEDIA SERVER / DMR
+//     * Priame TCP ovládanie pre vTuner NETRADIO (38FN) a FAVORITES (45FN)
+// - Screen 3: DLNA prehliadač + album fronta s DIDL-Lite metadátami
 // ----------------------------------------------------------------------------
-// BUILD: GitHub Actions — pozri dokument "Pioneer Remote – kompletný GitHub projekt".
-// Poznámka: AndroidManifest.xml musí mať theme @style/Theme.AppCompat.NoActionBar.
+// BUILD: GitHub Actions — Android Studio / Gradle.
+// Poznámka: AndroidManifest.xml musí mať theme @style/Theme.AppCompat.NoActionBar
+// a povolené usesCleartextTraffic="true" v <application> pre HTTP komunikáciu!
 // ============================================================================
 
 package com.example.pioneerremote
@@ -38,7 +44,6 @@ import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.io.OutputStreamWriter
 import java.net.DatagramPacket
-import java.net.DatagramSocket
 import java.net.HttpURLConnection
 import java.net.Inet4Address
 import java.net.InetAddress
@@ -58,7 +63,7 @@ class MainActivity : AppCompatActivity() {
     private val port: Int = 8102
     private val volMax = 160
 
-    // ===== farby (tmavy dizajn ako v nahlide) =====
+    // ===== farby (tmavy dizajn ako v nahlade) =====
     private val C_BG = 0xFF0B1220.toInt()
     private val C_CARD = 0xFF1E293B.toInt()
     private val C_CARD2 = 0xFF16202F.toInt()
@@ -105,6 +110,7 @@ class MainActivity : AppCompatActivity() {
         "BD" to "25FN", "CD" to "01FN", "DVR/BDR" to "15FN",
         "DVD" to "04FN", "IPOD/USB" to "17FN", "SAT/CBL" to "05FN",
         "TUNER" to "02FN", "VIDEO 1" to "10FN", "VIDEO 2" to "14FN",
+        "MEDIA SRV" to "44FN", "NETRADIO" to "38FN", "FAVORITES" to "45FN",
         "HDMI 1" to "19FN", "HDMI 2" to "20FN", "HDMI 3" to "21FN",
         "HDMI 4" to "22FN", "HDMI 5" to "23FN", "HDMI 6" to "24FN"
     )
@@ -118,25 +124,28 @@ class MainActivity : AppCompatActivity() {
         "PLII MUSIC" to "0017SR"
     )
 
+    // Rozšírený zoznam SK a CZ rádií s podporou viacerých alternatívnych URL (priorita vysoký bitrate -> fallback na nižší)
     private val radios = linkedMapOf(
-        "Rádio Slovensko" to "https://icecast.stv.livebox.sk/slovensko_128.mp3",
-        "Rádio_FM" to "https://icecast.stv.livebox.sk/fm_128.mp3",
-        "Rádio Devín" to "https://icecast.stv.livebox.sk/devin_256.mp3",
-        "Rádio Regina BA" to "https://icecast.stv.livebox.sk/regina_ba_128.mp3",
-        "Rádio Expres" to "https://stream.bauermedia.sk/expres-hi.mp3",
-        "Európa 2" to "https://stream.bauermedia.sk/europa2-hi.mp3",
-        "Rádio Melody" to "https://stream.bauermedia.sk/melody-hi.mp3",
-        "Rádio Rock" to "https://stream.bauermedia.sk/rock-hi.mp3",
-        "Fun Rádio" to "https://live.funradio.sk:8000/fun192.mp3",
-        "Rádio Jemné" to "https://stream.jemne.sk/jemne128.mp3",
-        "Rádio Vlna" to "https://stream.radiovlna.sk/vlna128.mp3",
-        "ČRo Radiožurnál" to "https://rozhlas.stream/radiozurnal_high.aac",
-        "ČRo Dvojka" to "https://rozhlas.stream/dvojka_high.aac",
-        "ČRo Vltava" to "https://rozhlas.stream/vltava_high.aac",
-        "ČRo Jazz" to "https://rozhlas.stream/jazz_high.aac",
-        "SomaFM Groove Salad" to "https://ice.somafm.com/groovesalad-128-mp3",
-        "SomaFM Lush" to "https://ice.somafm.com/lush-128-mp3",
-        "Radio Paradise" to "https://stream.radioparadise.com/mp3-192"
+        "Rádio Slovensko" to listOf("http://icecast.stv.livebox.sk/slovensko_256.mp3", "http://icecast.stv.livebox.sk/slovensko_128.mp3"),
+        "Rádio_FM" to listOf("http://icecast.stv.livebox.sk/fm_256.mp3", "http://icecast.stv.livebox.sk/fm_128.mp3"),
+        "Rádio Devín" to listOf("http://icecast.stv.livebox.sk/devin_256.mp3", "http://icecast.stv.livebox.sk/devin_128.mp3"),
+        "Rádio Regina BA" to listOf("http://icecast.stv.livebox.sk/regina_ba_256.mp3", "http://icecast.stv.livebox.sk/regina_ba_128.mp3"),
+        "Rádio Expres" to listOf("http://stream.bauermedia.sk/expres-hi.mp3", "http://stream.bauermedia.sk/expres.mp3"),
+        "Európa 2" to listOf("http://stream.bauermedia.sk/europa2-hi.mp3", "http://stream.bauermedia.sk/europa2.mp3"),
+        "Rádio Melody" to listOf("http://stream.bauermedia.sk/melody-hi.mp3", "http://stream.bauermedia.sk/melody.mp3"),
+        "Rádio Rock" to listOf("http://stream.bauermedia.sk/rock-hi.mp3", "http://stream.bauermedia.sk/rock.mp3"),
+        "Fun Rádio" to listOf("http://stream.funradio.sk:8000/fun192.mp3", "http://stream.funradio.sk:8000/fun128.mp3"),
+        "Rádio Vlna" to listOf("http://stream.radiovlna.sk/vlna128.mp3"),
+        "Rádio Jemné" to listOf("http://stream.jemne.sk/jemne128.mp3"),
+        "Rádio Lumen" to listOf("http://stream.lumen.sk:8000/lumen_128.mp3"),
+        "Best FM" to listOf("http://stream.bestfm.sk:8000/bestfm128.mp3"),
+        "ČRo Radiožurnál" to listOf("http://amp.cesnet.cz:8000/cro1.mp3", "http://rozhlas.stream/radiozurnal_high.aac"),
+        "ČRo Dvojka" to listOf("http://amp.cesnet.cz:8000/cro2.mp3"),
+        "ČRo Vltava" to listOf("http://amp.cesnet.cz:8000/cro3.mp3"),
+        "ČRo Jazz" to listOf("http://amp.cesnet.cz:8000/cro-jazz.mp3"),
+        "SomaFM Groove Salad" to listOf("http://ice1.somafm.com/groovesalad-128-mp3"),
+        "SomaFM Lush" to listOf("http://ice1.somafm.com/lush-128-mp3"),
+        "Radio Paradise" to listOf("http://stream.radioparadise.com/mp3-192", "http://stream.radioparadise.com/mp3-128")
     )
 
     // ===== DLNA =====
@@ -242,7 +251,221 @@ class MainActivity : AppCompatActivity() {
         val r = LinearLayout(this)
         r.orientation = LinearLayout.HORIZONTAL
         buttons.forEach {
-            r.addView(it, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            val lp = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            lp.setMargins(dp(2), dp(2), dp(2), dp(2))
+            r.addView(it, lp)
+        }
+        return r
+    }
+
+    private fun makeGrid(buttons: List<Button>): GridLayout {
+        val g = GridLayout(this)
+        g.columnCount = 3
+        g.useDefaultMargins = true
+        buttons.forEach { b ->
+            val lp = GridLayout.LayoutParams()
+            lp.columnSpec = GridLayout.spec(GridLayout.UNDEFINED, 1f)
+            lp.width = 0
+            g.addView(b, lp)
+        }
+        return g
+    }
+
+    private fun sectionLabel(t: String): TextView {
+        val tv = TextView(this)
+        tv.text = t
+        tv.textSize = 13f
+        tv.typeface = Typeface.DEFAULT_BOLD
+        tv.setTextColor(C_SLATE)
+        tv.setPadding(0, dp(14), 0, dp(6))
+        return tv
+    }
+
+    private fun hint(t: String): TextView {
+        val tv = TextView(this)
+        tv.text = t
+        tv.textSize = 10f
+        tv.setTextColor(C_DIM)
+        tv.gravity = Gravity.CENTER
+        tv.setPadding(0, dp(16), 0, dp(8))
+        return tv
+    }
+
+    // =====================================================================
+    // VYTVORENIE UI
+    // =====================================================================
+
+    private fun buildUI() {
+        val pad = dp(14)
+        val root = LinearLayout(this)
+        root.orientation = LinearLayout.VERTICAL
+        root.setBackgroundColor(C_BG)
+        root.setPadding(pad, dp(10), pad, 0)
+
+        // ZAP / VYP uplne hore, kazde na polovicu sirky
+        powerBtn = flatBtn("⏻ ZAP") { send("PO"); sendSilent("?P") }
+        val vypBtn = flatBtn("⏻ VYP") { send("PF"); sendSilent("?P") }
+        powerBtn.textSize = 14f; vypBtn.textSize = 14f
+        root.addView(rowOf(listOf(powerBtn, vypBtn)))
+
+        val title = TextView(this)
+        title.text = "Pioneer Remote"
+        title.textSize = 20f
+        title.typeface = Typeface.DEFAULT_BOLD
+        title.setTextColor(C_WHITE)
+        title.gravity = Gravity.CENTER
+        root.addView(title)
+        val sub = TextView(this)
+        sub.text = "VSX-S510"
+        sub.textSize = 11f
+        sub.setTextColor(C_CYAN)
+        sub.gravity = Gravity.CENTER
+        sub.setPadding(0, 0, 0, dp(8))
+        root.addView(sub)
+
+        // riadok: IP + hladanie + pripojenie
+        val top = LinearLayout(this)
+        top.orientation = LinearLayout.HORIZONTAL
+        ipEdit = EditText(this)
+        ipEdit.setText(host)
+        ipEdit.hint = "IP adresa receivera"
+        ipEdit.inputType = InputType.TYPE_CLASS_PHONE
+        ipEdit.setTextColor(C_WHITE)
+        ipEdit.setHintTextColor(C_DIM)
+        ipEdit.textSize = 13f
+        ipEdit.background = roundedBg(C_CARD2, 10, C_STROKE)
+        ipEdit.setPadding(dp(10), dp(8), dp(10), dp(8))
+        top.addView(ipEdit, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        val scanBtn = pillBtn("🔍", C_BTN, C_WHITE) { discoverReceivers() }
+        top.addView(scanBtn, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        val connBtn = pillBtn("Pripoj", C_CYAN, C_ON_ACCENT) { connectPressed() }
+        top.addView(connBtn, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        root.addView(top)
+
+        // stavova karta
+        val card = LinearLayout(this)
+        card.orientation = LinearLayout.VERTICAL
+        card.setPadding(dp(12), dp(10), dp(12), dp(10))
+        card.background = roundedBg(C_CARD, 18, C_CYAN_D)
+        volumeBig = TextView(this)
+        volumeBig.text = "🔊  —"
+        volumeBig.textSize = 22f
+        volumeBig.typeface = Typeface.DEFAULT_BOLD
+        volumeBig.setTextColor(C_WHITE)
+        volumeBig.gravity = Gravity.CENTER
+        infoLine = TextView(this)
+        infoLine.text = "Vstup: —   ·   Režim: —"
+        infoLine.textSize = 13f
+        infoLine.setTextColor(C_SLATE)
+        infoLine.gravity = Gravity.CENTER
+        radioLine = TextView(this)
+        radioLine.text = "Rádio: —"
+        radioLine.textSize = 13f
+        radioLine.setTextColor(C_DIM)
+        radioLine.gravity = Gravity.CENTER
+        connLine = TextView(this)
+        connLine.text = "○  Odpojené"
+        connLine.textSize = 11f
+        connLine.setTextColor(C_RED)
+        connLine.gravity = Gravity.CENTER
+        statusText = TextView(this)
+        statusText.text = ""
+        statusText.textSize = 11f
+        statusText.setTextColor(C_DIM)
+        statusText.gravity = Gravity.CENTER
+        card.addView(volumeBig)
+        card.addView(infoLine)
+        card.addView(radioLine)
+        card.addView(connLine)
+        card.addView(statusText)
+        val cardLp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT)
+        cardLp.topMargin = dp(8)
+        root.addView(card, cardLp)
+
+        // tabs
+        val tabDefs = listOf("🎚 OVLÁDANIE", "📻 RÁDIO", "💽 MÉDIÁ")
+        val tabBtns = tabDefs.map { t -> pillBtn(t, C_BTN, C_SLATE) { } }
+        val tabs = LinearLayout(this)
+        tabs.orientation = LinearLayout.HORIZONTAL
+        tabBtns.forEach { b ->
+            tabs.addView(b, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        }
+        val tabsLp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT)
+        tabsLp.topMargin = dp(8)
+        root.addView(tabs, tabsLp)
+
+        // swipe screeny
+        val pager = ViewPager2(this)
+        pager.layoutParams = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
+        val screens = listOf(buildScreenHome(), buildScreenRadio(), buildScreenMedia())
+        pager.adapter = object : RecyclerView.Adapter<RecyclerView.ViewHolder>() {
+            override fun getItemCount() = screens.size
+            override fun onCreateViewHolder(parent: ViewGroup, viewType: Int) =
+                object : RecyclerView.ViewHolder(FrameLayout(this@MainActivity).apply {
+                    layoutParams = ViewGroup.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.MATCH_PARENT)
+                }) {}
+            override fun onBindViewHolder(holder: RecyclerView.ViewHolder, position: Int) {
+                val frame = holder.itemView as FrameLayout
+                frame.removeAllViews()
+                frame.addView(screens[position])
+            }
+        }
+        pager.registerOnPageChangeCallback(object : ViewPager2.OnPageChangeCallback() {
+            override fun onPageSelected(position: Int) {
+                tabBtns.forEachIndexed { i, b -> styleTab(b, i == position) }
+            }
+        })
+        tabBtns.forEachIndexed { i, b ->
+            b.setOnClickListener { pager.currentItem = i }
+        }
+        styleTab(tabBtns[0], true)
+
+        // MUTE / VSTUP pod prepinacmi screenov, kazde na polovicu sirky
+        muteBtn = flatBtn("🔇 MUTE") { toggleMute() }
+        val vstupBtn = flatBtn("VSTUP ▶") { send("FU"); sendSilent("?F") }
+        muteBtn.textSize = 14f; vstupBtn.textSize = 14f
+        val muteLp = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+        muteLp.topMargin = dp(8)
+        root.addView(rowOf(listOf(muteBtn, vstupBtn)), muteLp)
+
+        // VOL − / VOL + pod nimi
+        val volMinus = flatBtn("VOL −") { send("VD"); sendSilent("?V") }
+        val volPlus = flatBtn("VOL +") { send("VU"); sendSilent("?V") }
+        volMinus.textSize = 14f; volPlus.textSize = 14f
+        root.addView(rowOf(listOf(volMinus, volPlus)))
+
+        root.addView(pager)
+        setContentView(root)
+    }
+
+    private fun styleTab(btn: Button, active: Boolean) {
+        btn.background = roundedBg(
+            if (active) C_ORANGE else C_BTN, 10, if (active) C_ORANGE else C_STROKE)
+        btn.setTextColor(if (active) C_ON_ACCENT else C_SLATE)
+        btn.typeface = if (active) Typeface.DEFAULT_BOLD else Typeface.DEFAULT
+    }
+
+    private fun connectPressed() {
+        host = ipEdit.text.toString().trim()
+        avtControlUrl = null // resetujeme staru UPnP adresu pri zmene IP
+        prefs().edit().putString("host", host).apply()
+        connect()
+    }
+
+    // =====================================================================
+    // SCREEN 1 — OVLADANIE
+    // =====================================================================
+
+    private fun buildScreenHome(): ScrollView {
+        val pag ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         }
         return r
     }
