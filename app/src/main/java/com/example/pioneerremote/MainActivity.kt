@@ -140,7 +140,7 @@ class MainActivity : AppCompatActivity() {
         "Rádio Lumen" to listOf("http://stream.lumen.sk:8000/lumen_128.mp3"),
         "Best FM" to listOf("http://stream.bestfm.sk:8000/bestfm128.mp3"),
         "ČRo Radiožurnál" to listOf("http://amp.cesnet.cz:8000/cro1.mp3", "http://rozhlas.stream/radiozurnal_high.aac"),
-        "ČRo Dvojka" to listOf("http://amp.cesnet.cz:8000/cro2.mp3"),,
+        "ČRo Dvojka" to listOf("http://amp.cesnet.cz:8000/cro2.mp3"),
         "ČRo Vltava" to listOf("http://amp.cesnet.cz:8000/cro3.mp3"),
         "ČRo Jazz" to listOf("http://amp.cesnet.cz:8000/cro-jazz.mp3"),
         "SomaFM Groove Salad" to listOf("http://ice1.somafm.com/groovesalad-128-mp3"),
@@ -1447,4 +1447,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+   
     private fun ui(block: () -> Unit) = runOnUiThread { block() }
+}
