@@ -124,7 +124,7 @@ class MainActivity : AppCompatActivity() {
         "PLII MUSIC" to "0017SR"
     )
 
-    // Rozšírený zoznam SK a CZ rádií s podporou viacerých alternatívnych URL (priorita vysoký bitrate -> fallback na nižší)
+    // Rozšírený zoznam SK, CZ a svetových Hi-Res rádií s podporou viacerých alternatívnych URL (priorita vysoký bitrate -> fallback na MP3/nižší)
     private val radios = linkedMapOf(
         "Rádio Slovensko" to listOf("http://icecast.stv.livebox.sk/slovensko_256.mp3", "http://icecast.stv.livebox.sk/slovensko_128.mp3"),
         "Rádio_FM" to listOf("http://icecast.stv.livebox.sk/fm_256.mp3", "http://icecast.stv.livebox.sk/fm_128.mp3"),
@@ -143,9 +143,16 @@ class MainActivity : AppCompatActivity() {
         "ČRo Dvojka" to listOf("http://amp.cesnet.cz:8000/cro2.mp3"),
         "ČRo Vltava" to listOf("http://amp.cesnet.cz:8000/cro3.mp3"),
         "ČRo Jazz" to listOf("http://amp.cesnet.cz:8000/cro-jazz.mp3"),
-        "SomaFM Groove Salad" to listOf("http://ice1.somafm.com/groovesalad-128-mp3"),
+        "Radio Paradise (Main)" to listOf("http://stream.radioparadise.com/aac-320", "http://stream.radioparadise.com/mp3-320", "http://stream.radioparadise.com/mp3-192"),
+        "Radio Paradise (Mellow)" to listOf("http://stream.radioparadise.com/mellow-320", "http://stream.radioparadise.com/mellow-192", "http://stream.radioparadise.com/mellow-128"),
+        "Hi On Line Radio" to listOf("http://nhk.hionline.eu:8000/stream", "http://mediaserv30.live-streams.nl:8086/live"),
+        "Party Vibe Radio" to listOf("http://stream.partyvibe.com:8000/partyvibe320.mp3"),
+        "SomaFM Groove Salad" to listOf("http://ice1.somafm.com/groovesalad-256-mp3", "http://ice1.somafm.com/groovesalad-128-mp3"),
+        "SomaFM DEF CON" to listOf("http://ice1.somafm.com/defcon-256-mp3", "http://ice1.somafm.com/defcon-128-mp3"),
         "SomaFM Lush" to listOf("http://ice1.somafm.com/lush-128-mp3"),
-        "Radio Paradise" to listOf("http://stream.radioparadise.com/mp3-192", "http://stream.radioparadise.com/mp3-128")
+        "Europe Radio Jazz" to listOf("http://stream.europaradiojazz.org:8000/stream"),
+        "Radiomonster.fm" to listOf("http://stream.radiomonster.fm/320.mp3", "http://stream.radiomonster.fm/192.mp3"),
+        "One World Radio" to listOf("http://playerservices.streamtheworld.com/api/livestream-redirect/OWR_WORLD_RADIO_NLAAC.aac", "http://playerservices.streamtheworld.com/api/livestream-redirect/OWR_INTERNATIONAL.mp3")
     )
 
     // ===== DLNA =====
@@ -1285,7 +1292,7 @@ class MainActivity : AppCompatActivity() {
 
         val lower = streamUrl.lowercase()
         val mime = when {
-            lower.endsWith(".aac") || lower.contains("aac") -> "audio/aac"
+            lower.endsWith(".aac") || lower.contains("aac") || lower.endsWith("mellow-320") -> "audio/aac"
             lower.endsWith(".flac") -> "audio/flac"
             lower.endsWith(".wav") -> "audio/wav"
             else -> "audio/mpeg"
@@ -1447,6 +1454,5 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-   
     private fun ui(block: () -> Unit) = runOnUiThread { block() }
 }
