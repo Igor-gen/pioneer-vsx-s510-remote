@@ -1028,10 +1028,10 @@ class MainActivity : AppCompatActivity() {
         val control = cdsControlUrl ?: return
         if (pushStack) browseStack.add(objectId to title)
         scope.launch(Dispatchers.IO) {
-            val body = "<?xml version="1.0" encoding="utf-8"?>\n" +
-                "<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" " +
-                "s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">" +
-                "<s:Body><u:Browse xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1">" +
+            val body = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n" +
+                "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" " +
+                "s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">" +
+                "<s:Body><u:Browse xmlns:u=\"urn:schemas-upnp-org:service:ContentDirectory:1\">" +
                 "<ObjectID>" + objectId + "</ObjectID>" +
                 "<BrowseFlag>BrowseDirectChildren</BrowseFlag>" +
                 "<Filter>*</Filter><StartingIndex>0</StartingIndex>" +
@@ -1053,14 +1053,14 @@ class MainActivity : AppCompatActivity() {
     private fun parseDidl(xml: String): List<MediaEntry> {
         val decoded = xml
             .replace("&lt;", "<").replace("&gt;", ">")
-            .replace("&quot;", """).replace("&amp;", "&")
-        val containers = Regex("(?is)<container[^>]*?id="([^"]+)"[^>]*>(.*?)</container>")
+            .replace("&quot;", "\"").replace("&amp;", "&")
+        val containers = Regex("(?is)<container[^>]*?id=\"([^\"]+)\"[^>]*>(.*?)</container>")
             .findAll(decoded).map { c ->
                 val title = Regex("(?i)<dc:title>(.*?)</dc:title>")
                     .find(c.groupValues[2])?.groupValues?.get(1) ?: "(priečinok)"
                 MediaEntry(c.groupValues[1], title.trim(), true, null)
             }.toList()
-        val items = Regex("(?is)<item[^>]*?id="([^"]+)"[^>]*>(.*?)</item>")
+        val items = Regex("(?is)<item[^>]*?id=\"([^\"]+)\"[^>]*>(.*?)</item>")
             .findAll(decoded).map { i ->
                 val title = Regex("(?i)<dc:title>(.*?)</dc:title>")
                     .find(i.groupValues[2])?.groupValues?.get(1) ?: "(skladba)"
@@ -1182,7 +1182,7 @@ class MainActivity : AppCompatActivity() {
                     val pkt = DatagramPacket(buf, buf.size)
                     try { sock.receive(pkt) } catch (_: Exception) { break }
                     val resp = String(pkt.data, 0, pkt.length, Charsets.US_ASCII)
-                    Regex("(?i)LOCATION:\s*(\S+)").find(resp)?.groupValues?.get(1)
+                    Regex("(?i)LOCATION:\\s*(\\S+)").find(resp)?.groupValues?.get(1)
                         ?.let { result.add(it) }
                 }
             }
@@ -1250,7 +1250,7 @@ class MainActivity : AppCompatActivity() {
         conn.doOutput = true
         conn.connectTimeout = 5000; conn.readTimeout = 8000
         conn.setRequestProperty("Content-Type", "text/xml; charset=\"utf-8\"")
-        conn.setRequestProperty("SOAPACTION", "\" + soapAction + "\"")
+        conn.setRequestProperty("SOAPACTION", "\"$soapAction\"")
         OutputStreamWriter(conn.outputStream, Charsets.UTF_8).use {
             it.write(body); it.flush()
         }
