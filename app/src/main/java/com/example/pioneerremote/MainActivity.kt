@@ -1,20 +1,14 @@
 // ============================================================================
-// Pioneer VSX-S510 Remote — verzia 6 (FAV tlačidlo + Rozšírené rádiá s fallbackmi)
-// - Tmavý dizajn podľa náhľadu (karty, zaoblené tlačidlá, cyan/orange akcent)
-// - Posuvník hlasitosti: posiela VU/VD až po pustení palca, zrýchlená odozva (50 ms)
-// - 🔍 vyhľadanie receivera: sken podsiete telefónu (port 8102 + overenie ?V)
-// - MUTE ako prepínač (sleduje MUT0/MUT1 spätnú väzbu)
-// - Zvýraznenie aktívneho vstupu / režimu / rádia
-// - Screen 2:
-//     * Rozšírený zoznam slovenských a českých rádií s HTTP streammi a fallbackmi na nižší bitrate
-//     * Tlačidlo ⭐ +FAV (pridanie/odstránenie aktuálnej skladby/stanice do interného priečinka Favorites - 30NW)
-//     * Doplnené DIDL-Lite metadáta a automatické prepínanie na MEDIA SERVER / DMR
-//     * Priame TCP ovládanie pre vTuner NETRADIO (38FN) a FAVORITES (45FN)
-// - Screen 3: DLNA prehliadač + album fronta s DIDL-Lite metadátami
-// ----------------------------------------------------------------------------
-// BUILD: GitHub Actions — Android Studio / Gradle.
-// Poznámka: AndroidManifest.xml musí mať theme @style/Theme.AppCompat.NoActionBar
-// a povolené usesCleartextTraffic="true" v <application> pre HTTP komunikáciu!
+// Pioneer VSX-S510 Remote — verzia 11
+// - Opravený vstup SAT/CBL (06FN) + pridaný vstup TV (05FN)
+// - Hlavička s okrúhlym prepínačom ON/OFF napravo
+// - Screen 2 (RÁDIO):
+//     * Odstránené všetky priame streamy, proxy, +FAV a navigačné tlačidlá
+//     * Priame zobrazenie zoznamu Favorites ako tlačidiel (s automatickým uložením do pamäte)
+//     * Opravené prepínanie medzi predvoľbami Favorites v ľubovoľnom poradí
+//       (automatický návrat z Play obrazovky do zoznamu pred výberom ďalšej predvoľby)
+//     * Spodný informačný displej s detailom prehrávanej stanice/skladby, bitrate a časom
+// - Screen 3 (MÉDIÁ): DLNA prehliadač + album fronta (nezmenené)
 // ============================================================================
 
 package com.example.pioneerremote
@@ -40,6 +34,8 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.recyclerview.widget.RecyclerView
 import androidx.viewpager2.widget.ViewPager2
 import kotlinx.coroutines.*
+import org.json.JSONArray
+import org.json.JSONObject
 import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.io.OutputStreamWriter
@@ -50,7 +46,6 @@ import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.MulticastSocket
 import java.net.NetworkInterface
-import java.net.ServerSocket
 import java.net.Socket
 import java.net.URL
 import java.util.Collections
@@ -89,8 +84,9 @@ class MainActivity : AppCompatActivity() {
     private var isOn = false
     private var activeInput: String? = null
     private var activeMode: String? = null
-    private var activeRadio: String? = null
+    private var activeFavIndex: Int = -1
     private var seekJob: Job? = null
+    private var favSwitchJob: Job? = null
     private var multicastLock: WifiManager.MulticastLock? = null
 
     // ===== UI =====
@@ -100,17 +96,20 @@ class MainActivity : AppCompatActivity() {
     private lateinit var infoLine: TextView
     private lateinit var radioLine: TextView
     private lateinit var connLine: TextView
+    private lateinit var flDisplayText: TextView
     private lateinit var volSlider: SeekBar
     private lateinit var powerBtn: Button
     private lateinit var muteBtn: Button
     private val inputButtons = mutableMapOf<String, Button>()
     private val modeButtons = mutableMapOf<String, Button>()
-    private val radioButtons = mutableMapOf<String, Button>()
+    private val favButtons = mutableMapOf<Int, Button>()
 
+    // Opravené kódy vstupov pre Pioneer VSX-S510:
+    // SAT/CBL = 06FN, TV = 05FN
     private val inputs = linkedMapOf(
         "BD" to "25FN", "CD" to "01FN", "DVR/BDR" to "15FN",
-        "DVD" to "04FN", "IPOD/USB" to "17FN", "SAT/CBL" to "05FN",
-        "TUNER" to "02FN", "VIDEO 1" to "10FN", "VIDEO 2" to "14FN",
+        "DVD" to "04FN", "IPOD/USB" to "17FN", "SAT/CBL" to "06FN",
+        "TV" to "05FN", "TUNER" to "02FN", "VIDEO" to "10FN",
         "MEDIA SRV" to "44FN", "NETRADIO" to "38FN", "FAVORITES" to "45FN",
         "HDMI 1" to "19FN", "HDMI 2" to "20FN", "HDMI 3" to "21FN",
         "HDMI 4" to "22FN", "HDMI 5" to "23FN", "HDMI 6" to "24FN"
@@ -125,54 +124,25 @@ class MainActivity : AppCompatActivity() {
         "PLII MUSIC" to "0017SR"
     )
 
-    // Rozšírený zoznam SK, CZ a svetových Hi-Res rádií s podporou viacerých alternatívnych URL (priorita vysoký bitrate -> fallback na MP3/nižší)
-    private val radios = linkedMapOf(
-        "Rádio Slovensko" to listOf("http://icecast.stv.livebox.sk/slovensko_256.mp3", "http://icecast.stv.livebox.sk/slovensko_128.mp3"),
-        "Rádio_FM" to listOf("http://icecast.stv.livebox.sk/fm_256.mp3", "http://icecast.stv.livebox.sk/fm_128.mp3"),
-        "Rádio Devín" to listOf("http://icecast.stv.livebox.sk/devin_256.mp3", "http://icecast.stv.livebox.sk/devin_128.mp3"),
-        "Rádio Regina BA" to listOf("http://icecast.stv.livebox.sk/regina_ba_256.mp3", "http://icecast.stv.livebox.sk/regina_ba_128.mp3"),
-        "Rádio Expres" to listOf("http://stream.bauermedia.sk/expres-hi.mp3", "http://stream.bauermedia.sk/expres.mp3"),
-        "Európa 2" to listOf("http://stream.bauermedia.sk/europa2-hi.mp3", "http://stream.bauermedia.sk/europa2.mp3"),
-        "Rádio Melody" to listOf("http://stream.bauermedia.sk/melody-hi.mp3", "http://stream.bauermedia.sk/melody.mp3"),
-        "Rádio Rock" to listOf("http://stream.bauermedia.sk/rock-hi.mp3", "http://stream.bauermedia.sk/rock.mp3"),
-        "Fun Rádio" to listOf("http://stream.funradio.sk:8000/fun192.mp3", "http://stream.funradio.sk:8000/fun128.mp3"),
-        "Rádio Vlna" to listOf("http://stream.radiovlna.sk/vlna128.mp3"),
-        "Rádio Jemné" to listOf("http://stream.jemne.sk/jemne128.mp3"),
-        "Rádio Lumen" to listOf("http://stream.lumen.sk:8000/lumen_128.mp3"),
-        "Best FM" to listOf("http://stream.bestfm.sk:8000/bestfm128.mp3"),
-        "ČRo Radiožurnál" to listOf("http://amp.cesnet.cz:8000/cro1.mp3", "http://rozhlas.stream/radiozurnal_high.aac"),
-        "ČRo Dvojka" to listOf("http://amp.cesnet.cz:8000/cro2.mp3"),
-        "ČRo Vltava" to listOf("http://amp.cesnet.cz:8000/cro3.mp3"),
-        "ČRo Jazz" to listOf("http://amp.cesnet.cz:8000/cro-jazz.mp3"),
-        "Radio Paradise (Main)" to listOf("http://stream.radioparadise.com/aac-320", "http://stream.radioparadise.com/mp3-320", "http://stream.radioparadise.com/mp3-192"),
-        "Radio Paradise (Mellow)" to listOf("http://stream.radioparadise.com/mellow-320", "http://stream.radioparadise.com/mellow-192", "http://stream.radioparadise.com/mellow-128"),
-        "Hi On Line Radio" to listOf("http://nhk.hionline.eu:8000/stream", "http://mediaserv30.live-streams.nl:8086/live"),
-        "Party Vibe Radio" to listOf("http://stream.partyvibe.com:8000/partyvibe320.mp3"),
-        "SomaFM Groove Salad" to listOf("http://ice1.somafm.com/groovesalad-256-mp3", "http://ice1.somafm.com/groovesalad-128-mp3"),
-        "SomaFM DEF CON" to listOf("http://ice1.somafm.com/defcon-256-mp3", "http://ice1.somafm.com/defcon-128-mp3"),
-        "SomaFM Lush" to listOf("http://ice1.somafm.com/lush-128-mp3"),
-        "Europe Radio Jazz" to listOf("http://stream.europaradiojazz.org:8000/stream"),
-        "Radiomonster.fm" to listOf("http://stream.radiomonster.fm/320.mp3", "http://stream.radiomonster.fm/192.mp3"),
-        "One World Radio" to listOf("http://playerservices.streamtheworld.com/api/livestream-redirect/OWR_WORLD_RADIO_NLAAC.aac", "http://playerservices.streamtheworld.com/api/livestream-redirect/OWR_INTERNATIONAL.mp3")
-    )
+    // ===== FAVORITES A DETAIL PREHRAVANIA NA KARTE RADIO =====
+    private lateinit var favGridContainer: LinearLayout
+    private lateinit var nowPlayingTitle: TextView
+    private lateinit var nowPlayingSub: TextView
+    private lateinit var nowPlayingMeta: TextView
+    private lateinit var nowPlayingFl: TextView
+
+    // Uložený zoznam Favorites staníc (index 1..N -> názov stanice), aby tlačidlá nikdy nezmizli počas prehrávania
+    private val favStations = linkedMapOf<Int, String>()
+    // Dočasné riadky prijaté z obrazovky receivera (1..8)
+    private val screenLines = mutableMapOf<Int, Pair<String, String>>()
+    @Volatile private var nwScreenType: String = ""
+    @Volatile private var nwScreenName: String = ""
+    private var playTimeText: String = ""
 
     // ===== DLNA =====
     private data class MediaEntry(
         val id: String, val title: String,
         val isContainer: Boolean, val url: String?)
-
-    // ===== LOKALNA HTTP PROXY PRE LIVE STREAMY =====
-    private var proxyServer: ServerSocket? = null
-    private var proxyPort: Int = 0
-    @Volatile private var proxyTargetUrl: String = ""
-    @Volatile private var proxyTargetMime: String = "audio/mpeg"
-
-    // ===== STAV DISPLEJA A SIETOVEHO ZOZNAMU RECEIVERA (FAVORITES / NETRADIO) =====
-    private lateinit var flDisplayText: TextView
-    private lateinit var nwTitleText: TextView
-    private lateinit var nwListLayout: LinearLayout
-    private val nwItems = mutableMapOf<Int, Pair<String, String>>() // line (1..8) -> (type, text)
-    private var nwTotalItems: Int = 0
 
     private var mediaServerDesc: String? = null
     private var mediaServerName: String = ""
@@ -200,9 +170,9 @@ class MainActivity : AppCompatActivity() {
         host = p.getString("host", host) ?: host
         mediaServerDesc = p.getString("dlnaServer", null)
         mediaServerName = p.getString("dlnaName", "") ?: ""
+        loadCachedFavorites()
         buildUI()
         connect()
-        testStreams()
         val wifi = applicationContext.getSystemService(WIFI_SERVICE) as WifiManager
         multicastLock = wifi.createMulticastLock("pioneerSSDP").apply {
             setReferenceCounted(false); acquire()
@@ -214,13 +184,37 @@ class MainActivity : AppCompatActivity() {
         super.onDestroy()
         scope.coroutineContext.cancelChildren()
         runCatching { socketRef.get()?.close() }
-        runCatching { proxyServer?.close() }
         multicastLock?.release()
     }
 
     private fun prefs() = getSharedPreferences("pioneer", MODE_PRIVATE)
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+    private fun loadCachedFavorites() {
+        val raw = prefs().getString("favStationsJson", null) ?: return
+        runCatching {
+            val arr = JSONArray(raw)
+            favStations.clear()
+            for (i in 0 until arr.length()) {
+                val obj = arr.getJSONObject(i)
+                favStations[obj.getInt("idx")] = obj.getString("name")
+            }
+        }
+    }
+
+    private fun saveCachedFavorites() {
+        runCatching {
+            val arr = JSONArray()
+            favStations.forEach { (idx, name) ->
+                val obj = JSONObject()
+                obj.put("idx", idx)
+                obj.put("name", name)
+                arr.put(obj)
+            }
+            prefs().edit().putString("favStationsJson", arr.toString()).apply()
+        }
+    }
 
     // =====================================================================
     // STYLOVE POMOCNIKY
@@ -242,7 +236,7 @@ class MainActivity : AppCompatActivity() {
         b.setTextColor(C_WHITE)
         b.transformationMethod = null
         b.background = roundedBg(C_BTN, 12, C_STROKE)
-        b.setPadding(dp(2), dp(8), dp(2), dp(8))
+        b.setPadding(dp(4), dp(8), dp(4), dp(8))
         b.setOnClickListener { onClick() }
         return b
     }
@@ -280,9 +274,9 @@ class MainActivity : AppCompatActivity() {
         return r
     }
 
-    private fun makeGrid(buttons: List<Button>): GridLayout {
+    private fun makeGrid(buttons: List<Button>, cols: Int = 3): GridLayout {
         val g = GridLayout(this)
-        g.columnCount = 3
+        g.columnCount = cols
         g.useDefaultMargins = true
         buttons.forEach { b ->
             val lp = GridLayout.LayoutParams()
@@ -299,7 +293,7 @@ class MainActivity : AppCompatActivity() {
         tv.textSize = 13f
         tv.typeface = Typeface.DEFAULT_BOLD
         tv.setTextColor(C_SLATE)
-        tv.setPadding(0, dp(14), 0, dp(6))
+        tv.setPadding(0, dp(12), 0, dp(6))
         return tv
     }
 
@@ -309,7 +303,7 @@ class MainActivity : AppCompatActivity() {
         tv.textSize = 10f
         tv.setTextColor(C_DIM)
         tv.gravity = Gravity.CENTER
-        tv.setPadding(0, dp(16), 0, dp(8))
+        tv.setPadding(0, dp(14), 0, dp(8))
         return tv
     }
 
@@ -411,7 +405,7 @@ class MainActivity : AppCompatActivity() {
         infoLine.setTextColor(C_SLATE)
         infoLine.gravity = Gravity.CENTER
         radioLine = TextView(this)
-        radioLine.text = "Rádio: —"
+        radioLine.text = "Stanica: —"
         radioLine.textSize = 13f
         radioLine.setTextColor(C_DIM)
         radioLine.gravity = Gravity.CENTER
@@ -479,6 +473,10 @@ class MainActivity : AppCompatActivity() {
         pager.registerOnPageChangeCallback(object : ViewPager2.OnPageChangeCallback() {
             override fun onPageSelected(position: Int) {
                 tabBtns.forEachIndexed { i, b -> styleTab(b, i == position) }
+                if (position == 1) {
+                    // Pri prechode na kartu RÁDIO automaticky načítame Favorites, ak ešte nie sú načítané
+                    ensureFavoritesLoaded()
+                }
             }
         })
         tabBtns.forEachIndexed { i, b ->
@@ -591,7 +589,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     // =====================================================================
-    // SCREEN 2 — RADIO (UPnP PUSH + FAV + VSTAVANE NETRADIO / FAVORITES)
+    // SCREEN 2 — RADIO (IBA ZOZNAM FAVORITES AKO TLACIDLA + DOLNY DISPLEJ)
     // =====================================================================
 
     private fun buildScreenRadio(): ScrollView {
@@ -602,98 +600,191 @@ class MainActivity : AppCompatActivity() {
         sv.addView(page, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
 
-        page.addView(sectionLabel("INTERNETOVÉ RÁDIO (UPnP / DLNA Push)"))
-        
-        val favAddBtn = flatBtn("⭐ +FAV (Uložiť do Favorites)") {
-            send("30NW")
-            statusText.text = "Uložené do Favorites (30NW)"
+        // Riadok nadpisu Favorites + malá ikonka na obnovenie zoznamu z receivera
+        val hdrRow = LinearLayout(this)
+        hdrRow.orientation = LinearLayout.HORIZONTAL
+        hdrRow.gravity = Gravity.CENTER_VERTICAL
+        hdrRow.setPadding(0, dp(6), 0, dp(6))
+
+        val lbl = TextView(this)
+        lbl.text = "OBĽÚBENÉ STANICE (FAVORITES)"
+        lbl.textSize = 13f
+        lbl.typeface = Typeface.DEFAULT_BOLD
+        lbl.setTextColor(C_SLATE)
+        hdrRow.addView(lbl, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+
+        val syncBtn = pillBtn("🔄 Načítať z receivera", C_CARD2, C_CYAN) {
+            syncFavoritesFromReceiver()
         }
-        favAddBtn.background = roundedBg(C_CYAN_D, 12, C_CYAN)
-        favAddBtn.setTextColor(C_WHITE)
-        val favLp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
-        favLp.bottomMargin = dp(6)
-        page.addView(favAddBtn, favLp)
+        hdrRow.addView(syncBtn, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        page.addView(hdrRow)
 
-        val rb = mutableListOf<Button>()
-        radios.forEach { (name, urls) ->
-            val b = flatBtn(name) {
-                activeRadio = name
-                styleRadioButtons()
-                playRadioWithFallback(name, urls)
-            }
-            radioButtons[name] = b
-            rb.add(b)
-        }
-        page.addView(makeGrid(rb))
+        // Kontajner pre tlačidlá predvolieb Favorites
+        favGridContainer = LinearLayout(this)
+        favGridContainer.orientation = LinearLayout.VERTICAL
+        page.addView(favGridContainer)
+        renderFavoriteButtons()
 
-        val stopB = flatBtn("⏹ ZASTAVIŤ STREAM") {
-            activeRadio = null
-            styleRadioButtons()
-            stopRadio()
-        }
-        stopB.background = roundedBg(C_RED, 12, C_RED)
-        stopB.setTextColor(C_WHITE)
-        val stopLp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT)
-        stopLp.topMargin = dp(10)
-        page.addView(stopB, stopLp)
+        // Spodný displej s detailom prehrávanej skladby / stanice, bitrate a ostatnými údajmi
+        page.addView(sectionLabel("DETAIL PREHRÁVANIA"))
+        val dispCard = LinearLayout(this)
+        dispCard.orientation = LinearLayout.VERTICAL
+        dispCard.setPadding(dp(14), dp(12), dp(14), dp(12))
+        dispCard.background = roundedBg(C_CARD2, 16, C_CYAN_D)
 
-        page.addView(sectionLabel("INTERNÉ RÁDIO A ZOZNAM FAVORITES V RECEIVERI"))
-        val netB = flatBtn("NETRADIO (38FN)") {
-            openReceiverNetworkInput("38FN", "NETRADIO")
-        }
-        val favB = flatBtn("FAVORITES (45FN)") {
-            openReceiverNetworkInput("45FN", "FAVORITES")
-        }
-        val mSrvB = flatBtn("MEDIA SRV (44FN)") {
-            openReceiverNetworkInput("44FN", "MEDIA SRV")
-        }
-        page.addView(rowOf(listOf(netB, favB, mSrvB)))
+        nowPlayingTitle = TextView(this)
+        nowPlayingTitle.text = "📻 Žiadna stanica nehrá"
+        nowPlayingTitle.textSize = 16f
+        nowPlayingTitle.typeface = Typeface.DEFAULT_BOLD
+        nowPlayingTitle.setTextColor(C_WHITE)
 
-        // Tlačidlo na vyžiadanie zoznamu položiek z receivera + stránkovanie
-        val refreshListBtn = flatBtn("🔄 NAČÍTAŤ ZOZNAM") { requestReceiverList() }
-        refreshListBtn.background = roundedBg(C_CYAN_D, 12, C_CYAN)
-        val pgUpBtn = flatBtn("⏫ STRANA −") { send("04NW"); requestReceiverListDelayed(400) }
-        val pgDnBtn = flatBtn("⏬ STRANA +") { send("05NW"); requestReceiverListDelayed(400) }
-        page.addView(rowOf(listOf(refreshListBtn, pgUpBtn, pgDnBtn)))
+        nowPlayingSub = TextView(this)
+        nowPlayingSub.text = "Skladba / Interpret: —"
+        nowPlayingSub.textSize = 13f
+        nowPlayingSub.setTextColor(C_CYAN)
+        nowPlayingSub.setPadding(0, dp(4), 0, 0)
 
-        val nwUp = flatBtn("▲ HORE") { send("00NW"); requestReceiverListDelayed(350) }
-        val nwDown = flatBtn("▼ DOLE") { send("01NW"); requestReceiverListDelayed(350) }
-        val nwEnt = flatBtn("⏎ VYBRAŤ") { send("13NW"); requestReceiverListDelayed(600) }
-        val nwRet = flatBtn("↩ SPÄŤ") { send("14NW"); requestReceiverListDelayed(600) }
-        val nwPlay = flatBtn("▶ PLAY") { send("10NW") }
-        val nwStop = flatBtn("⏹ STOP") { send("20NW") }
-        page.addView(rowOf(listOf(nwUp, nwDown, nwEnt)))
-        page.addView(rowOf(listOf(nwRet, nwPlay, nwStop)))
+        nowPlayingMeta = TextView(this)
+        nowPlayingMeta.text = "Formát / Bitrate: —   ·   Čas: —"
+        nowPlayingMeta.textSize = 12f
+        nowPlayingMeta.setTextColor(C_SLATE)
+        nowPlayingMeta.setPadding(0, dp(4), 0, 0)
 
-        // Riadok s aktuálnym názvom obrazovky z receivera
-        nwTitleText = TextView(this)
-        nwTitleText.text = "📋 Zoznam na receiveri (klikni FAVORITES alebo 🔄 NAČÍTAŤ ZOZNAM):"
-        nwTitleText.textSize = 12f
-        nwTitleText.setTextColor(C_CYAN)
-        nwTitleText.setPadding(0, dp(8), 0, dp(4))
-        page.addView(nwTitleText)
+        nowPlayingFl = TextView(this)
+        nowPlayingFl.text = "Displej receivera: —"
+        nowPlayingFl.textSize = 12f
+        nowPlayingFl.typeface = Typeface.MONOSPACE
+        nowPlayingFl.setTextColor(C_DIM)
+        nowPlayingFl.setPadding(0, dp(6), 0, 0)
 
-        // Dynamický zoznam položiek načítaných priamo z receivera (GEP01..GEP08)
-        nwListLayout = LinearLayout(this)
-        nwListLayout.orientation = LinearLayout.VERTICAL
-        page.addView(nwListLayout)
-        renderReceiverList()
-
-        // Rýchle tlačidlá pre priamy výber pozície 1..8 na aktuálnej strane
-        page.addView(sectionLabel("PRIAMA VOĽBA RIADKU NA OBRAZOVKE (1–8)"))
-        val directBtns = (1..8).map { idx ->
-            val cmd = String.format("%02dGHP", idx)
-            flatBtn("Položka $idx") {
-                send(cmd)
-                requestReceiverListDelayed(700)
-            }
-        }
-        page.addView(rowOf(directBtns.subList(0, 4)))
-        page.addView(rowOf(directBtns.subList(4, 8)))
+        dispCard.addView(nowPlayingTitle)
+        dispCard.addView(nowPlayingSub)
+        dispCard.addView(nowPlayingMeta)
+        dispCard.addView(nowPlayingFl)
+        page.addView(dispCard)
 
         page.addView(hint("← swipe na ovládanie / médiá →"))
         return sv
+    }
+
+    private fun renderFavoriteButtons() {
+        if (!::favGridContainer.isInitialized) return
+        favGridContainer.removeAllViews()
+        favButtons.clear()
+
+        // Ak ešte nemáme načítané názvy zo siete, zobrazíme 8 predvolieb (Predvoľba 1..8),
+        // ktoré hneď fungujú na priame spustenie a zároveň načítajú skutočné názvy
+        val entriesToRender = if (favStations.isNotEmpty()) {
+            favStations.entries.map { it.key to it.value }
+        } else {
+            (1..8).map { it to "Predvoľba $it" }
+        }
+
+        val btns = entriesToRender.map { (idx, name) ->
+            val b = flatBtn("$idx. $name") {
+                selectFavoritePreset(idx, name)
+            }
+            b.gravity = Gravity.START or Gravity.CENTER_VERTICAL
+            b.setPadding(dp(12), dp(10), dp(12), dp(10))
+            favButtons[idx] = b
+            highlightBtn(b, idx == activeFavIndex)
+            b
+        }
+        favGridContainer.addView(makeGrid(btns, 2))
+    }
+
+    private fun styleFavButtons() {
+        favButtons.forEach { (idx, b) ->
+            highlightBtn(b, idx == activeFavIndex)
+        }
+    }
+
+    private fun ensureFavoritesLoaded() {
+        if (favStations.isEmpty() || activeInput != "FAVORITES") {
+            syncFavoritesFromReceiver()
+        } else {
+            sendSilent("?GAP")
+            sendSilent("?FL")
+        }
+    }
+
+    private fun syncFavoritesFromReceiver() {
+        favSwitchJob?.cancel()
+        statusText.text = "🔄 Načítavam zoznam Favorites z receivera…"
+        favSwitchJob = scope.launch(Dispatchers.IO) {
+            if (!isOn) {
+                sendSilent("PO")
+                delay(2500)
+            }
+            if (activeInput != "FAVORITES" && activeInput != "45FN") {
+                sendSilent("45FN")
+                sendSilent("?F")
+                delay(1400)
+            } else {
+                // Ak už sme vo Favorites, ale receiver práve hrá stanicu (je na Play obrazovke),
+                // pošleme 20NW (Stop) + 14NW (Return), aby sa vrátil do koreňového zoznamu Favorites
+                if (nwScreenType == "04" || nwScreenType == "05") {
+                    sendSilent("20NW")
+                    delay(350)
+                    sendSilent("14NW")
+                    delay(600)
+                }
+            }
+            sendSilent("?GAP")
+            sendSilent("?GAH")
+            sendSilent("?FL")
+            delay(900)
+            sendSilent("?GAP")
+            ui { statusText.text = "" }
+        }
+    }
+
+    // Kľúčová oprava: spoľahlivé prepnutie na ľubovoľnú predvoľbu Favorites v ľubovoľnom poradí,
+    // aj keď už iná predvoľba práve hrá!
+    private fun selectFavoritePreset(index: Int, name: String) {
+        favSwitchJob?.cancel()
+        activeFavIndex = index
+        styleFavButtons()
+        radioLine.text = "Stanica: $name ▶"
+        nowPlayingTitle.text = "📻 $index. $name"
+        nowPlayingSub.text = "Prepínam na predvoľbu $index…"
+
+        favSwitchJob = scope.launch(Dispatchers.IO) {
+            if (!isOn) {
+                sendSilent("PO")
+                delay(2500)
+            }
+
+            if (activeInput != "FAVORITES" && activeInput != "45FN") {
+                // Receiver je na inom vstupe -> prepneme na Favorites (45FN) a počkáme na zoznam
+                sendSilent("45FN")
+                sendSilent("?F")
+                delay(1500)
+            } else {
+                // Receiver už je vo FAVORITES.
+                // Keď hrá predchádzajúca predvoľba, receiver je v "Play Screen" (typ obrazovky 04),
+                // kde ignoruje príkaz xxGHP!
+                // Preto najprv zastavíme stream (20NW) a vrátime sa o úroveň späť do zoznamu Favorites (14NW).
+                sendSilent("20NW")
+                delay(350)
+                sendSilent("14NW")
+                delay(650)
+            }
+
+            // Overíme stav obrazovky a odošleme priamu voľbu položky v zozname
+            val ghpCmd = String.format("%02dGHP", index)
+            sendSilent(ghpCmd)
+            delay(500)
+            sendSilent("?GAP")
+            sendSilent("?FL")
+
+            // Počkáme, kým sa stream rozbehne, a vyžiadame si metadáta prehrávanej stanice
+            delay(1500)
+            sendSilent("?GAP")
+            sendSilent("?GAH")
+            sendSilent("?FL")
+        }
     }
 
     // =====================================================================
@@ -793,9 +884,44 @@ class MainActivity : AppCompatActivity() {
         modeButtons.forEach { (name, b) -> highlightBtn(b, name == activeMode) }
     }
 
-    private fun styleRadioButtons() {
-        radioButtons.forEach { (name, b) -> highlightBtn(b, name == activeRadio) }
-        radioLine.text = "Rádio: " + (activeRadio ?: "—")
+    private fun decodeFlHex(hexStr: String): String {
+        val sb = StringBuilder()
+        var i = 0
+        while (i + 1 < hexStr.length) {
+            val code = hexStr.substring(i, i + 2).toIntOrNull(16) ?: 32
+            if (code in 32..126) sb.append(code.toChar())
+            else if (code > 127) sb.append('·')
+            i += 2
+        }
+        return sb.toString().trim()
+    }
+
+    private fun updateNowPlayingCardFromScreen() {
+        if (!::nowPlayingTitle.isInitialized) return
+        // Keď je receiver na Play obrazovke (typ 04/05) alebo posiela metadáta v riadkoch 1..6:
+        // Riadok 1 býva názov stanice/skladby, riadok 2 interpret/žáner, riadok 3/4 album alebo formát/bitrate
+        val l1 = screenLines[1]?.second.orEmpty()
+        val l2 = screenLines[2]?.second.orEmpty()
+        val l3 = screenLines[3]?.second.orEmpty()
+        val l4 = screenLines[4]?.second.orEmpty()
+        val l5 = screenLines[5]?.second.orEmpty()
+
+        if (l1.isNotEmpty()) {
+            nowPlayingTitle.text = "📻 $l1"
+            radioLine.text = "Stanica: $l1 ▶"
+        }
+        val subParts = listOf(l2, l3).filter { it.isNotBlank() }
+        nowPlayingSub.text = if (subParts.isNotEmpty())
+            subParts.joinToString("  ·  ")
+        else
+            "Prehrávanie z Favorites"
+
+        val metaParts = listOf(l4, l5).filter { it.isNotBlank() }.toMutableList()
+        if (playTimeText.isNotBlank()) metaParts.add("Čas: $playTimeText")
+        nowPlayingMeta.text = if (metaParts.isNotEmpty())
+            metaParts.joinToString("   ·   ")
+        else
+            "Formát / Bitrate: podľa vysielateľa"
     }
 
     // =====================================================================
@@ -909,392 +1035,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     // =====================================================================
-    // TEST DOSTUPNOSTI STREAMOV A PREHRAVANIE S FALLBACKOM NA NIŽŠÍ BITRATE
-    // =====================================================================
-
-    private fun testStreams() {
-        scope.launch(Dispatchers.IO) {
-            radios.forEach { (name, urls) ->
-                launch {
-                    var bestStatus = 0
-                    for (url in urls) {
-                        val s = checkStream(url)
-                        if (s > bestStatus) {
-                            bestStatus = s
-                            if (s == 2) break
-                        }
-                    }
-                    ui { markStream(name, bestStatus) }
-                }
-            }
-        }
-    }
-
-    private fun checkStream(url: String): Int {
-        for (method in listOf("HEAD", "GET")) {
-            try {
-                val conn = URL(url).openConnection() as HttpURLConnection
-                conn.requestMethod = method
-                conn.connectTimeout = 3000
-                conn.readTimeout = 3000
-                conn.instanceFollowRedirects = true
-                val code = conn.responseCode
-                if (code in 200..299) {
-                    val br = conn.getHeaderField("icy-br")?.trim()?.toIntOrNull()
-                    runCatching { conn.inputStream?.close() }
-                    return if (br != null && br in 1 until 128) 1 else 2
-                }
-                conn.disconnect()
-            } catch (_: Exception) {
-            }
-        }
-        return 0
-    }
-
-    private fun markStream(name: String, status: Int) {
-        val dot = when (status) {
-            2 -> "🟢 "
-            1 -> "🟠 "
-            else -> "🔴 "
-        }
-        radioButtons[name]?.text = dot + name
-    }
-
-    // ===== OVLADANIE INTERNEHO ZOZNAMU RECEIVERA (FAVORITES / NETRADIO / MEDIA SRV) =====
-
-    private fun openReceiverNetworkInput(fnCode: String, label: String) {
-        activeRadio = label
-        styleRadioButtons()
-        nwItems.clear()
-        renderReceiverList()
-        nwTitleText.text = "⏳ Prepínam na $label a načítavam zoznam z receivera…"
-        scope.launch(Dispatchers.IO) {
-            if (!isOn) {
-                sendSilent("PO")
-                delay(2500)
-            }
-            sendSilent(fnCode)
-            sendSilent("?F")
-            delay(1200)
-            sendSilent("?GAP")
-            sendSilent("?GAH")
-            sendSilent("?FL")
-            delay(1200)
-            sendSilent("?GAP")
-        }
-    }
-
-    private fun requestReceiverList() {
-        nwTitleText.text = "🔄 Načítavam zoznam položiek z receivera…"
-        sendSilent("?GAP")
-        sendSilent("?GAH")
-        sendSilent("?FL")
-    }
-
-    private fun requestReceiverListDelayed(ms: Long) {
-        scope.launch(Dispatchers.IO) {
-            delay(ms)
-            sendSilent("?GAP")
-            sendSilent("?GAH")
-            sendSilent("?FL")
-        }
-    }
-
-    private fun renderReceiverList() {
-        if (!::nwListLayout.isInitialized) return
-        nwListLayout.removeAllViews()
-        if (nwItems.isEmpty()) {
-            val emptyTv = TextView(this)
-            emptyTv.text = "(Zatiaľ žiadne položky — klikni na FAVORITES (45FN) alebo 🔄 NAČÍTAŤ ZOZNAM)"
-            emptyTv.textSize = 11f
-            emptyTv.setTextColor(C_DIM)
-            emptyTv.setPadding(dp(4), dp(4), dp(4), dp(8))
-            nwListLayout.addView(emptyTv)
-            return
-        }
-        for (idx in 1..8) {
-            val entry = nwItems[idx] ?: continue
-            val itemType = entry.first
-            val itemTitle = entry.second
-            if (itemTitle.isBlank()) continue
-            val icon = when (itemType) {
-                "00" -> "📁 "
-                "01" -> "📻 "
-                else -> "▶ "
-            }
-            val cmd = String.format("%02dGHP", idx)
-            val b = flatBtn("$idx. $icon$itemTitle") {
-                activeRadio = itemTitle
-                radioLine.text = "Rádio: $itemTitle ▶"
-                statusText.text = "Vyberám položku $idx: $itemTitle ($cmd)"
-                send(cmd)
-                requestReceiverListDelayed(800)
-            }
-            b.gravity = Gravity.START or Gravity.CENTER_VERTICAL
-            b.setPadding(dp(12), dp(8), dp(12), dp(8))
-            b.background = roundedBg(C_CARD2, 10, C_CYAN_D)
-            val lp = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            )
-            lp.topMargin = dp(3)
-            nwListLayout.addView(b, lp)
-        }
-    }
-
-    private fun decodeFlHex(hexStr: String): String {
-        val sb = StringBuilder()
-        var i = 0
-        while (i + 1 < hexStr.length) {
-            val code = hexStr.substring(i, i + 2).toIntOrNull(16) ?: 32
-            if (code in 32..126) sb.append(code.toChar())
-            else if (code > 127) sb.append('·')
-            i += 2
-        }
-        return sb.toString().trim()
-    }
-
-    // ===== LOKALNA DLNA HTTP PROXY V TELEFONE =====
-
-    private fun ensureStreamProxy(): Int {
-        proxyServer?.let { if (!it.isClosed) return proxyPort }
-        val srv = ServerSocket(0)
-        proxyServer = srv
-        proxyPort = srv.localPort
-        scope.launch(Dispatchers.IO) {
-            while (isActive && !srv.isClosed) {
-                val client = try { srv.accept() } catch (_: Exception) { break }
-                launch(Dispatchers.IO) { handleProxyClient(client) }
-            }
-        }
-        return proxyPort
-    }
-
-    private fun handleProxyClient(client: Socket) {
-        try {
-            client.soTimeout = 10000
-            val reader = BufferedReader(InputStreamReader(client.getInputStream(), Charsets.US_ASCII))
-            val reqLine = reader.readLine() ?: run { client.close(); return }
-            val isHead = reqLine.startsWith("HEAD", ignoreCase = true)
-            while (true) {
-                val h = reader.readLine() ?: break
-                if (h.isEmpty()) break
-            }
-
-            val target = proxyTargetUrl
-            val mime = proxyTargetMime
-            val dlnaPn = if (mime == "audio/aac") "AAC_ISO" else "MP3"
-            val out = client.getOutputStream()
-
-            val headers = "HTTP/1.1 200 OK\r\n" +
-                "Content-Type: $mime\r\n" +
-                "Content-Length: 2000000000\r\n" +
-                "Accept-Ranges: none\r\n" +
-                "Cache-Control: no-cache\r\n" +
-                "Connection: close\r\n" +
-                "transferMode.dlna.org: Streaming\r\n" +
-                "contentFeatures.dlna.org: DLNA.ORG_PN=$dlnaPn;DLNA.ORG_OP=00;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000\r\n\r\n"
-
-            out.write(headers.toByteArray(Charsets.US_ASCII))
-            out.flush()
-
-            if (isHead || target.isEmpty()) {
-                client.close()
-                return
-            }
-
-            var currentUrl = target
-            var upstream: HttpURLConnection? = null
-            repeat(5) {
-                val c = URL(currentUrl).openConnection() as HttpURLConnection
-                c.instanceFollowRedirects = true
-                c.connectTimeout = 5000
-                c.readTimeout = 10000
-                c.setRequestProperty("User-Agent", "VLC/3.0.18 LibVLC/3.0.18")
-                c.setRequestProperty("Icy-MetaData", "0")
-                val code = c.responseCode
-                if (code in 300..399) {
-                    val loc = c.getHeaderField("Location")
-                    c.disconnect()
-                    if (!loc.isNullOrBlank()) {
-                        currentUrl = loc
-                        return@repeat
-                    }
-                }
-                upstream = c
-                return@repeat
-            }
-
-            upstream?.inputStream?.use { input ->
-                val buf = ByteArray(8192)
-                while (true) {
-                    val n = input.read(buf)
-                    if (n <= 0) break
-                    out.write(buf, 0, n)
-                    out.flush()
-                }
-            }
-            upstream?.disconnect()
-        } catch (_: Exception) {
-        } finally {
-            runCatching { client.close() }
-        }
-    }
-
-    private fun resolveFinalUrl(urlStr: String): String {
-        var current = urlStr
-        repeat(4) {
-            try {
-                val conn = URL(current).openConnection() as HttpURLConnection
-                conn.instanceFollowRedirects = false
-                conn.requestMethod = "GET"
-                conn.connectTimeout = 2500
-                conn.readTimeout = 2500
-                conn.setRequestProperty("Icy-MetaData", "0")
-                val code = conn.responseCode
-                if (code in 300..399) {
-                    val loc = conn.getHeaderField("Location")
-                    conn.disconnect()
-                    if (!loc.isNullOrBlank()) {
-                        current = loc
-                        return@repeat
-                    }
-                }
-                runCatching { conn.inputStream?.close() }
-                conn.disconnect()
-                return current
-            } catch (_: Exception) {
-                return current
-            }
-        }
-        return current
-    }
-
-    private fun extractUpnpError(xml: String?): String? {
-        if (xml == null) return "bez odpovede"
-        if (!xml.contains("UPnPError", ignoreCase = true) && !xml.contains("Fault", ignoreCase = true)) return null
-        val code = Regex("(?is)<errorCode>(.*?)</errorCode>").find(xml)?.groupValues?.get(1)
-        val desc = Regex("(?is)<errorDescription>(.*?)</errorDescription>").find(xml)?.groupValues?.get(1)
-        return if (code != null) "$code (${desc ?: "UPnP Fault"})" else "SOAP Fault"
-    }
-
-    private fun playRadioWithFallback(name: String, urls: List<String>) {
-        queueJob?.cancel()
-        ui {
-            radioLine.text = "Rádio: spúšťam $name…"
-            statusText.text = "Spúšťam lokálnu DLNA proxy a pripravujem receiver…"
-        }
-        scope.launch(Dispatchers.IO) {
-            try {
-                if (!isOn) {
-                    sendSilent("PO")
-                    delay(2500)
-                }
-
-                if (activeInput == "NETRADIO" || activeInput == "38FN") {
-                    sendSilent("47FN")
-                    delay(900)
-                }
-
-                val control = ensureAvtControl() ?: run {
-                    ui { statusText.text = "UPnP: nenašiel som AVTransport na $host." }
-                    return@launch
-                }
-
-                val myIp = phoneIp()
-                val pPort = ensureStreamProxy()
-
-                var success = false
-                var workingDesc = ""
-                var lastErr = ""
-
-                for (rawUrl in urls) {
-                    if (checkStream(rawUrl) == 0) continue
-
-                    val resolved = resolveFinalUrl(rawUrl)
-                    val lower = resolved.lowercase()
-                    val isAac = lower.endsWith(".aac") || lower.contains("aac") || lower.endsWith("mellow-320")
-                    val mime = if (isAac) "audio/aac" else "audio/mpeg"
-                    val ext = if (isAac) "aac" else "mp3"
-
-                    proxyTargetUrl = resolved
-                    proxyTargetMime = mime
-
-                    val candidates = mutableListOf<Pair<String, String>>()
-                    if (myIp != null && pPort > 0) {
-                        candidates.add("http://$myIp:$pPort/live.$ext" to "Proxy")
-                    }
-                    candidates.add(resolved.replaceFirst(Regex("^https://", RegexOption.IGNORE_CASE), "http://") to "Direct")
-
-                    for ((candUrl, modeLabel) in candidates) {
-                        for (metaMode in listOf(0, 1, 2)) {
-                            runCatching { soapStop(control) }
-                            delay(200)
-
-                            val setResp = soapSetUriMode(control, candUrl, name, mime, metaMode)
-                            val setErr = extractUpnpError(setResp)
-                            if (setErr != null) {
-                                lastErr = "SetURI [$modeLabel/m$metaMode]: $setErr"
-                                continue
-                            }
-
-                            delay(250)
-                            val playResp = soapPlay(control)
-                            val playErr = extractUpnpError(playResp)
-                            if (playErr == null) {
-                                delay(1200)
-                                val st = transportState(control)
-                                if (st == "PLAYING" || st == "TRANSITIONING" || st.isEmpty()) {
-                                    success = true
-                                    workingDesc = "$modeLabel ($candUrl)"
-                                    break
-                                } else {
-                                    lastErr = "Stav po Play [$modeLabel/m$metaMode]: $st"
-                                }
-                            } else {
-                                lastErr = "Play [$modeLabel/m$metaMode]: $playErr"
-                            }
-                        }
-                        if (success) break
-                    }
-                    if (success) break
-                }
-
-                if (!success) {
-                    ui {
-                        statusText.text = "Zlyhalo ($name) — posledná odpoveď receivera: $lastErr"
-                    }
-                    return@launch
-                }
-
-                sendSilent("?F")
-                ui {
-                    radioLine.text = "Rádio: $name ▶"
-                    statusText.text = "Hrá: $name [$workingDesc]"
-                }
-            } catch (e: Exception) {
-                ui { statusText.text = "Rádio chyba: " + (e.message ?: "neznáma") }
-            }
-        }
-    }
-
-    private fun stopRadio() {
-        queueJob?.cancel()
-        scope.launch(Dispatchers.IO) {
-            try {
-                sendSilent("20NW")
-                val control = ensureAvtControl() ?: return@launch
-                soapStop(control)
-                ui {
-                    radioLine.text = "Rádio: zastavené"
-                    statusText.text = ""
-                }
-            } catch (_: Exception) { }
-        }
-    }
-
-    // =====================================================================
-    // DLNA SERVERY
+    // DLNA SERVERY (KARTA 3 — MÉDIÁ)
     // =====================================================================
 
     private fun scanMediaServers() {
@@ -1489,7 +1230,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     // =====================================================================
-    // UPnP NIZKOUROVNOVE VOLANIA
+    // UPnP NIZKOUROVNOVE VOLANIA (PRE KARTU 3 — MÉDIÁ)
     // =====================================================================
 
     private fun ssdpFindAll(st: String, timeoutMs: Int = 3500): List<String> {
@@ -1607,56 +1348,15 @@ class MainActivity : AppCompatActivity() {
             .find(resp)?.groupValues?.get(1) ?: ""
     }
 
-    private fun soapSetUriMode(controlUrl: String, streamUrl: String,
-                               title: String, mime: String, metaMode: Int): String? {
-        val escUrl = streamUrl.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        val escTitle = title.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-
-        val escDidl = if (metaMode == 2) {
-            ""
-        } else {
-            val dlnaPn = if (mime == "audio/aac") "AAC_ISO" else "MP3"
-            val upnpClass = if (metaMode == 0)
-                "object.item.audioItem.musicTrack"
-            else
-                "object.item.audioItem.audioBroadcast"
-            val dlnaOp = if (metaMode == 0) "01" else "00"
-            val dlnaFlags = "01700000000000000000000000000000"
-
-            val didl = "<DIDL-Lite xmlns=\"urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/\" " +
-                "xmlns:dc=\"http://purl.org/dc/elements/1.1/\" " +
-                "xmlns:upnp=\"urn:schemas-upnp-org:metadata-1-0/upnp/\">" +
-                "<item id=\"0\" parentID=\"-1\" restricted=\"1\">" +
-                "<dc:title>$escTitle</dc:title>" +
-                "<upnp:class>$upnpClass</upnp:class>" +
-                "<res size=\"2000000000\" protocolInfo=\"http-get:*:$mime:DLNA.ORG_PN=$dlnaPn;DLNA.ORG_OP=$dlnaOp;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=$dlnaFlags\">$escUrl</res>" +
-                "</item></DIDL-Lite>"
-
-            didl.replace("&", "&amp;")
-                .replace("<", "&lt;")
-                .replace(">", "&gt;")
-                .replace("\"", "&quot;")
-        }
-
-        return soap(controlUrl, "SetAVTransportURI",
-            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n" +
-            "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" " +
-            "s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">" +
-            "<s:Body><u:SetAVTransportURI xmlns:u=\"urn:schemas-upnp-org:service:AVTransport:1\">" +
-            "<InstanceID>0</InstanceID><CurrentURI>" + escUrl + "</CurrentURI>" +
-            "<CurrentURIMetaData>" + escDidl + "</CurrentURIMetaData>" +
-            "</u:SetAVTransportURI></s:Body></s:Envelope>")
-    }
-
     private fun soapSetUri(controlUrl: String, streamUrl: String,
-                           title: String = "Internet Radio",
-                           isBroadcast: Boolean = true): String? {
+                           title: String = "Media",
+                           isBroadcast: Boolean = false): String? {
         val escUrl = streamUrl.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
         val escTitle = title.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
         val lower = streamUrl.lowercase()
         val mime = when {
-            lower.endsWith(".aac") || lower.contains("aac") || lower.endsWith("mellow-320") -> "audio/aac"
+            lower.endsWith(".aac") || lower.contains("aac") -> "audio/aac"
             lower.endsWith(".flac") -> "audio/flac"
             lower.endsWith(".wav") -> "audio/wav"
             else -> "audio/mpeg"
@@ -1803,43 +1503,58 @@ class MainActivity : AppCompatActivity() {
                 line == "PWR0" -> { isOn = true; updatePowerButton() }
                 line == "PWR2" || line == "PWR1" -> { isOn = false; updatePowerButton() }
                 line.startsWith("FL") && line.length >= 6 -> {
-                    // Predný displej receivera v HEX (napr. FL0220464156...)
                     val txt = decodeFlHex(line.substring(4))
                     if (txt.isNotEmpty()) {
                         flDisplayText.text = "📟 $txt"
-                    }
-                }
-                line.startsWith("GBH") || line.startsWith("GBP") -> {
-                    // Max počet položiek na obrazovke (napr. GBH08)
-                    val maxLine = line.substring(3).trim().toIntOrNull() ?: 0
-                    if (maxLine == 0) nwItems.clear()
-                }
-                line.startsWith("GDH") || line.startsWith("GDP") -> {
-                    // Rozsah a celkový počet položiek v zozname (napr. GDH000010000800015)
-                    if (line.length >= 18) {
-                        nwTotalItems = line.substring(13, 18).toIntOrNull() ?: 0
-                        nwTitleText.text = "📋 Položky v zozname receivera (celkom: $nwTotalItems):"
+                        if (::nowPlayingFl.isInitialized) {
+                            nowPlayingFl.text = "Displej receivera: $txt"
+                        }
                     }
                 }
                 line.startsWith("GCH") || line.startsWith("GCP") -> {
-                    // Názov obrazovky v sieťovom menu
-                    val screenName = line.substringAfter("\"", "").substringBeforeLast("\"", "")
-                    if (screenName.isNotEmpty()) {
-                        nwTitleText.text = "📋 $screenName" + (if (nwTotalItems > 0) " ($nwTotalItems)" else "")
+                    // Informácia o type obrazovky (napr. GCP01... = List screen, GCP04... = Play screen)
+                    if (line.length >= 5) {
+                        nwScreenType = line.substring(3, 5)
+                    }
+                    nwScreenName = line.substringAfter("\"", "").substringBeforeLast("\"", "")
+                    if (nwScreenType == "01" || nwScreenType == "02") {
+                        screenLines.clear()
+                    }
+                }
+                line.startsWith("GHH") || line.startsWith("GHP") || line.startsWith("GIH") || line.startsWith("GIP") -> {
+                    // Upcha/čas prehrávania zo sieťového modulu
+                    val raw = line.substring(3).trim()
+                    if (raw.length >= 4) {
+                        playTimeText = raw
+                        updateNowPlayingCardFromScreen()
                     }
                 }
                 line.startsWith("GEH") || line.startsWith("GEP") -> {
-                    // Riadok zoznamu (napr. GEP01001"Rádio Slovensko" alebo GEH010"Rádio Slovensko")
                     val idx = line.substring(3, 5).toIntOrNull()
                     val title = line.substringAfter("\"", "").substringBeforeLast("\"", "")
                     val typeCode = if (line.length >= 8) line.substring(6, 8) else "01"
                     if (idx != null) {
                         if (title.isNotEmpty()) {
-                            nwItems[idx] = typeCode to title
+                            screenLines[idx] = typeCode to title
                         } else {
-                            nwItems.remove(idx)
+                            screenLines.remove(idx)
                         }
-                        renderReceiverList()
+
+                        // Rozlíšime, či ide o zoznam staníc (List screen) alebo o detail prehrávania (Play screen):
+                        // Na Play obrazovke (04/05) posiela Pioneer v GEP01..GEP05 názov stanice, skladbu, žáner a bitrate.
+                        val isPlayScreen = nwScreenType == "04" || nwScreenType == "05" ||
+                            nwScreenName.contains("Play", ignoreCase = true)
+
+                        if (isPlayScreen) {
+                            updateNowPlayingCardFromScreen()
+                        } else if (activeInput == "FAVORITES" || nwScreenName.contains("Favorite", ignoreCase = true)) {
+                            // Sme v zozname Favorites -> uložíme si stanicu do trvalého zoznamu tlačidiel
+                            if (title.isNotEmpty() && !title.startsWith("[")) {
+                                favStations[idx] = title
+                                saveCachedFavorites()
+                                renderFavoriteButtons()
+                            }
+                        }
                     }
                 }
             }
