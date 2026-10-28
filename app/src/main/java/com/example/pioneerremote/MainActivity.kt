@@ -455,218 +455,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun connectPressed() {
         host = ipEdit.text.toString().trim()
-        avtControlUrl = null // resetujeme staru UPnP adresu pri zmene IP
-        prefs().edit().putString("host", host).apply()
-        connect()
-    }
-
-    // =====================================================================
-    // SCREEN 1 — OVLADANIE
-    // =====================================================================
-
-    private fun buildScreenHome(): ScrollView {
-        val pag ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        }
-        return r
-    }
-
-    private fun makeGrid(buttons: List<Button>): GridLayout {
-        val g = GridLayout(this)
-        g.columnCount = 3
-        g.useDefaultMargins = true
-        buttons.forEach { b ->
-            val lp = GridLayout.LayoutParams()
-            lp.columnSpec = GridLayout.spec(GridLayout.UNDEFINED, 1f)
-            lp.width = 0
-            g.addView(b, lp)
-        }
-        return g
-    }
-
-    private fun sectionLabel(t: String): TextView {
-        val tv = TextView(this)
-        tv.text = t
-        tv.textSize = 13f
-        tv.typeface = Typeface.DEFAULT_BOLD
-        tv.setTextColor(C_SLATE)
-        tv.setPadding(0, dp(14), 0, dp(6))
-        return tv
-    }
-
-    private fun hint(t: String): TextView {
-        val tv = TextView(this)
-        tv.text = t
-        tv.textSize = 10f
-        tv.setTextColor(C_DIM)
-        tv.gravity = Gravity.CENTER
-        tv.setPadding(0, dp(16), 0, dp(8))
-        return tv
-    }
-
-    // =====================================================================
-    // VYTVORENIE UI
-    // =====================================================================
-
-    private fun buildUI() {
-        val pad = dp(14)
-        val root = LinearLayout(this)
-        root.orientation = LinearLayout.VERTICAL
-        root.setBackgroundColor(C_BG)
-        root.setPadding(pad, dp(10), pad, 0)
-
-        // ZAP / VYP uplne hore, kazde na polovicu sirky
-        powerBtn = flatBtn("⏻ ZAP") { send("PO"); sendSilent("?P") }
-        val vypBtn = flatBtn("⏻ VYP") { send("PF"); sendSilent("?P") }
-        powerBtn.textSize = 14f; vypBtn.textSize = 14f
-        root.addView(rowOf(listOf(powerBtn, vypBtn)))
-
-        val title = TextView(this)
-        title.text = "Pioneer Remote"
-        title.textSize = 20f
-        title.typeface = Typeface.DEFAULT_BOLD
-        title.setTextColor(C_WHITE)
-        title.gravity = Gravity.CENTER
-        root.addView(title)
-        val sub = TextView(this)
-        sub.text = "VSX-S510"
-        sub.textSize = 11f
-        sub.setTextColor(C_CYAN)
-        sub.gravity = Gravity.CENTER
-        sub.setPadding(0, 0, 0, dp(8))
-        root.addView(sub)
-
-        // riadok: IP + hladanie + pripojenie
-        val top = LinearLayout(this)
-        top.orientation = LinearLayout.HORIZONTAL
-        ipEdit = EditText(this)
-        ipEdit.setText(host)
-        ipEdit.hint = "IP adresa receivera"
-        ipEdit.inputType = InputType.TYPE_CLASS_PHONE
-        ipEdit.setTextColor(C_WHITE)
-        ipEdit.setHintTextColor(C_DIM)
-        ipEdit.textSize = 13f
-        ipEdit.background = roundedBg(C_CARD2, 10, C_STROKE)
-        ipEdit.setPadding(dp(10), dp(8), dp(10), dp(8))
-        top.addView(ipEdit, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        val scanBtn = pillBtn("🔍", C_BTN, C_WHITE) { discoverReceivers() }
-        top.addView(scanBtn, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
-        val connBtn = pillBtn("Pripoj", C_CYAN, C_ON_ACCENT) { connectPressed() }
-        top.addView(connBtn, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
-        root.addView(top)
-
-        // stavova karta
-        val card = LinearLayout(this)
-        card.orientation = LinearLayout.VERTICAL
-        card.setPadding(dp(12), dp(10), dp(12), dp(10))
-        card.background = roundedBg(C_CARD, 18, C_CYAN_D)
-        volumeBig = TextView(this)
-        volumeBig.text = "🔊  —"
-        volumeBig.textSize = 22f
-        volumeBig.typeface = Typeface.DEFAULT_BOLD
-        volumeBig.setTextColor(C_WHITE)
-        volumeBig.gravity = Gravity.CENTER
-        infoLine = TextView(this)
-        infoLine.text = "Vstup: —   ·   Režim: —"
-        infoLine.textSize = 13f
-        infoLine.setTextColor(C_SLATE)
-        infoLine.gravity = Gravity.CENTER
-        radioLine = TextView(this)
-        radioLine.text = "Rádio: —"
-        radioLine.textSize = 13f
-        radioLine.setTextColor(C_DIM)
-        radioLine.gravity = Gravity.CENTER
-        connLine = TextView(this)
-        connLine.text = "○  Odpojené"
-        connLine.textSize = 11f
-        connLine.setTextColor(C_RED)
-        connLine.gravity = Gravity.CENTER
-        statusText = TextView(this)
-        statusText.text = ""
-        statusText.textSize = 11f
-        statusText.setTextColor(C_DIM)
-        statusText.gravity = Gravity.CENTER
-        card.addView(volumeBig)
-        card.addView(infoLine)
-        card.addView(radioLine)
-        card.addView(connLine)
-        card.addView(statusText)
-        val cardLp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT)
-        cardLp.topMargin = dp(8)
-        root.addView(card, cardLp)
-
-        // tabs
-        val tabDefs = listOf("🎚 OVLÁDANIE", "📻 RÁDIO", "💽 MÉDIÁ")
-        val tabBtns = tabDefs.map { t -> pillBtn(t, C_BTN, C_SLATE) { } }
-        val tabs = LinearLayout(this)
-        tabs.orientation = LinearLayout.HORIZONTAL
-        tabBtns.forEachIndexed { i, b ->
-            tabs.addView(b, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        }
-        val tabsLp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT)
-        tabsLp.topMargin = dp(8)
-        root.addView(tabs, tabsLp)
-
-        // swipe screeny
-        val pager = ViewPager2(this)
-        pager.layoutParams = LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
-        val screens = listOf(buildScreenHome(), buildScreenRadio(), buildScreenMedia())
-        pager.adapter = object : RecyclerView.Adapter<RecyclerView.ViewHolder>() {
-            override fun getItemCount() = screens.size
-            override fun onCreateViewHolder(parent: ViewGroup, viewType: Int) =
-                object : RecyclerView.ViewHolder(FrameLayout(this@MainActivity).apply {
-                    layoutParams = ViewGroup.LayoutParams(
-                        ViewGroup.LayoutParams.MATCH_PARENT,
-                        ViewGroup.LayoutParams.MATCH_PARENT)
-                }) {}
-            override fun onBindViewHolder(holder: RecyclerView.ViewHolder, position: Int) {
-                val frame = holder.itemView as FrameLayout
-                frame.removeAllViews()
-                frame.addView(screens[position])
-            }
-        }
-        pager.registerOnPageChangeCallback(object : ViewPager2.OnPageChangeCallback() {
-            override fun onPageSelected(position: Int) {
-                tabBtns.forEachIndexed { i, b -> styleTab(b, i == position) }
-            }
-        })
-        tabBtns.forEachIndexed { i, b ->
-            b.setOnClickListener { pager.currentItem = i }
-        }
-        styleTab(tabBtns[0], true)
-
-        // MUTE / VSTUP pod prepinacmi screenov, kazde na polovicu sirky
-        muteBtn = flatBtn("🔇 MUTE") { toggleMute() }
-        val vstupBtn = flatBtn("VSTUP ▶") { send("FU"); sendSilent("?F") }
-        muteBtn.textSize = 14f; vstupBtn.textSize = 14f
-        val muteLp = LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
-        muteLp.topMargin = dp(8)
-        root.addView(rowOf(listOf(muteBtn, vstupBtn)), muteLp)
-
-        // VOL − / VOL + pod nimi
-        val volMinus = flatBtn("VOL −") { send("VD"); sendSilent("?V") }
-        val volPlus = flatBtn("VOL +") { send("VU"); sendSilent("?V") }
-        volMinus.textSize = 14f; volPlus.textSize = 14f
-        root.addView(rowOf(listOf(volMinus, volPlus)))
-
-        root.addView(pager)
-        setContentView(root)
-    }
-
-    private fun styleTab(btn: Button, active: Boolean) {
-        btn.background = roundedBg(
-            if (active) C_ORANGE else C_BTN, 10, if (active) C_ORANGE else C_STROKE)
-        btn.setTextColor(if (active) C_ON_ACCENT else C_SLATE)
-        btn.typeface = if (active) Typeface.DEFAULT_BOLD else Typeface.DEFAULT
-    }
-
-    private fun connectPressed() {
-        host = ipEdit.text.toString().trim()
+        avtControlUrl = null
         prefs().edit().putString("host", host).apply()
         connect()
     }
@@ -683,7 +472,6 @@ class MainActivity : AppCompatActivity() {
         sv.addView(page, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
 
-        // posuvnik hlasitosti — posiela AZ po pusteni palca
         val sc = LinearLayout(this)
         sc.orientation = LinearLayout.HORIZONTAL
         sc.gravity = Gravity.CENTER_VERTICAL
@@ -716,7 +504,7 @@ class MainActivity : AppCompatActivity() {
 
         page.addView(sectionLabel("VÝBER VSTUPU"))
         val ib = mutableListOf<Button>()
-        inputs.filterKeys { !it.startsWith("HDMI") }.forEach { (name, code) ->
+        inputs.forEach { (name, code) ->
             val b = flatBtn(name) {
                 send(code); sendSilent("?F")
                 activeInput = name
@@ -744,7 +532,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     // =====================================================================
-    // SCREEN 2 — RADIO
+    // SCREEN 2 — RADIO (UPnP PUSH + FAV + VSTAVANE NETRADIO / FAVORITES)
     // =====================================================================
 
     private fun buildScreenRadio(): ScrollView {
@@ -755,20 +543,31 @@ class MainActivity : AppCompatActivity() {
         sv.addView(page, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
 
-        page.addView(sectionLabel("INTERNETOVÉ RÁDIO (UPnP)"))
+        page.addView(sectionLabel("INTERNETOVÉ RÁDIO (UPnP / DLNA Push)"))
+        
+        val favAddBtn = flatBtn("⭐ +FAV (Uložiť do Favorites)") {
+            send("30NW")
+            statusText.text = "Uložené do Favorites (30NW)"
+        }
+        favAddBtn.background = roundedBg(C_CYAN_D, 12, C_CYAN)
+        favAddBtn.setTextColor(C_WHITE)
+        val favLp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+        favLp.bottomMargin = dp(6)
+        page.addView(favAddBtn, favLp)
+
         val rb = mutableListOf<Button>()
-        radios.forEach { (name, url) ->
+        radios.forEach { (name, urls) ->
             val b = flatBtn(name) {
                 activeRadio = name
                 styleRadioButtons()
-                playRadio(name, url)
+                playRadioWithFallback(name, urls)
             }
             radioButtons[name] = b
             rb.add(b)
         }
         page.addView(makeGrid(rb))
 
-        val stopB = flatBtn("⏹ ZASTAVIŤ RÁDIO") {
+        val stopB = flatBtn("⏹ ZASTAVIŤ STREAM") {
             activeRadio = null
             styleRadioButtons()
             stopRadio()
@@ -780,16 +579,34 @@ class MainActivity : AppCompatActivity() {
         stopLp.topMargin = dp(10)
         page.addView(stopB, stopLp)
 
-        page.addView(sectionLabel("PÔVODNÉ NETRADIO RECEIVERA"))
-        val netB = flatBtn("NETRADIO (vstup 38FN)") {
+        page.addView(sectionLabel("INTERNÉ RÁDIO RECEIVERA (vTuner / Favorites)"))
+        val netB = flatBtn("NETRADIO (38FN)") {
             send("38FN"); sendSilent("?F")
             activeRadio = "NETRADIO"
             styleRadioButtons()
         }
-        val netLp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT)
-        page.addView(netB, netLp)
-        page.addView(hint("← swipe na ovládanie →"))
+        val favB = flatBtn("FAVORITES (45FN)") {
+            send("45FN"); sendSilent("?F")
+            activeRadio = "FAVORITES"
+            styleRadioButtons()
+        }
+        val mSrvB = flatBtn("MEDIA SRV (44FN)") {
+            send("44FN"); sendSilent("?F")
+            activeRadio = "MEDIA SRV"
+            styleRadioButtons()
+        }
+        page.addView(rowOf(listOf(netB, favB, mSrvB)))
+
+        val nwUp = flatBtn("▲ HORE") { send("00NW") }
+        val nwDown = flatBtn("▼ DOLE") { send("01NW") }
+        val nwEnt = flatBtn("⏎ VYBRAŤ") { send("13NW") }
+        val nwRet = flatBtn("↩ SPÄŤ") { send("14NW") }
+        val nwPlay = flatBtn("▶ PLAY") { send("10NW") }
+        val nwStop = flatBtn("⏹ STOP") { send("20NW") }
+        page.addView(rowOf(listOf(nwUp, nwDown, nwEnt)))
+        page.addView(rowOf(listOf(nwRet, nwPlay, nwStop)))
+
+        page.addView(hint("← swipe na ovládanie / médiá →"))
         return sv
     }
 
@@ -896,7 +713,7 @@ class MainActivity : AppCompatActivity() {
                             it.write(cmd + "\r\n")
                             it.flush()
                         }
-                        delay(90)
+                        delay(50)
                     }
                 }
                 sendSilent("?V")
@@ -912,7 +729,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     // =====================================================================
-    // VYHLADANIE RECEIVERA V SITI TELEFONU
+    // VYHLADANIE RECEIVERA V SIETI TELEFONU
     // =====================================================================
 
     private fun phoneIp(): String? {
@@ -980,6 +797,7 @@ class MainActivity : AppCompatActivity() {
             .setTitle(if (found.size > 1) "Nájdené prijímače" else "Nájdený prijímač")
             .setItems(found.toTypedArray()) { _, i ->
                 host = found[i]
+                avtControlUrl = null
                 ipEdit.setText(host)
                 prefs().edit().putString("host", host).apply()
                 connect()
@@ -989,21 +807,22 @@ class MainActivity : AppCompatActivity() {
     }
 
     // =====================================================================
-    // RADIO (UPnP push)
-    // =====================================================================
-
-    // =====================================================================
-    // TEST DOSTUPNOSTI STREAMOV
-    // zelená = dostupný (128 kbps+), oranžová = dostupný, nižšia kvalita,
-    // červená = nedostupný
+    // TEST DOSTUPNOSTI STREAMOV A PREHRAVANIE S FALLBACKOM NA NIŽŠÍ BITRATE
     // =====================================================================
 
     private fun testStreams() {
         scope.launch(Dispatchers.IO) {
-            radios.forEach { (name, url) ->
+            radios.forEach { (name, urls) ->
                 launch {
-                    val s = checkStream(url)
-                    ui { markStream(name, s) }
+                    var bestStatus = 0
+                    for (url in urls) {
+                        val s = checkStream(url)
+                        if (s > bestStatus) {
+                            bestStatus = s
+                            if (s == 2) break
+                        }
+                    }
+                    ui { markStream(name, bestStatus) }
                 }
             }
         }
@@ -1014,8 +833,8 @@ class MainActivity : AppCompatActivity() {
             try {
                 val conn = URL(url).openConnection() as HttpURLConnection
                 conn.requestMethod = method
-                conn.connectTimeout = 4000
-                conn.readTimeout = 4000
+                conn.connectTimeout = 3000
+                conn.readTimeout = 3000
                 conn.instanceFollowRedirects = true
                 val code = conn.responseCode
                 if (code in 200..299) {
@@ -1039,35 +858,107 @@ class MainActivity : AppCompatActivity() {
         radioButtons[name]?.text = dot + name
     }
 
-    private fun playRadio(name: String, url: String) {
+    private fun resolveFinalUrl(urlStr: String): String {
+        var current = urlStr
+        repeat(3) {
+            try {
+                val conn = URL(current).openConnection() as HttpURLConnection
+                conn.instanceFollowRedirects = false
+                conn.requestMethod = "GET"
+                conn.connectTimeout = 2500
+                conn.readTimeout = 2500
+                val code = conn.responseCode
+                if (code in 300..399) {
+                    val loc = conn.getHeaderField("Location")
+                    conn.disconnect()
+                    if (!loc.isNullOrBlank()) {
+                        current = loc.replaceFirst(Regex("^https://", RegexOption.IGNORE_CASE), "http://")
+                        return@repeat
+                    }
+                }
+                runCatching { conn.inputStream?.close() }
+                conn.disconnect()
+                return current
+            } catch (_: Exception) {
+                return current
+            }
+        }
+        return current
+    }
+
+    private fun playRadioWithFallback(name: String, urls: List<String>) {
+        queueJob?.cancel()
         ui {
             radioLine.text = "Rádio: spúšťam $name…"
-            statusText.text = "Hľadám receiver cez UPnP…"
+            statusText.text = "Hľadám fungujúci stream (od najvyššieho bitrate)…"
         }
         scope.launch(Dispatchers.IO) {
             try {
+                if (!isOn) {
+                    sendSilent("PO")
+                    delay(2500)
+                }
+
+                if (activeInput == null || activeInput == "NETRADIO" ||
+                    (activeInput != "MEDIA SRV" && activeInput != "44FN" && activeInput != "47FN" && activeInput != "DMR")) {
+                    sendSilent("44FN")
+                    delay(1200)
+                }
+
                 val control = ensureAvtControl() ?: run {
-                    ui { statusText.text = "UPnP: nenašiel som AVTransport na receiveri." }
+                    ui { statusText.text = "UPnP: nenašiel som AVTransport na $host." }
                     return@launch
                 }
-                soapSetUri(control, url)
-                soapPlay(control)
+
+                var success = false
+                var workingUrl = ""
+
+                for (url in urls) {
+                    val resolved = resolveFinalUrl(url)
+                        .replaceFirst(Regex("^https://", RegexOption.IGNORE_CASE), "http://")
+
+                    runCatching { soapStop(control) }
+                    delay(250)
+
+                    val setResp = soapSetUri(control, resolved, name, isBroadcast = true)
+                    if (setResp == null || setResp.contains("UPnPError")) continue
+
+                    delay(250)
+                    val playResp = soapPlay(control)
+                    if (playResp != null && !playResp.contains("UPnPError")) {
+                        success = true
+                        workingUrl = resolved
+                        break
+                    }
+                }
+
+                if (!success) {
+                    ui { statusText.text = "Všetky streamy pre $name zlyhali." }
+                    return@launch
+                }
+
+                sendSilent("?F")
                 ui {
                     radioLine.text = "Rádio: $name ▶"
-                    statusText.text = "Rádio prehráva na receiveri."
+                    statusText.text = "Hrá: $name ($workingUrl)"
                 }
             } catch (e: Exception) {
-                ui { statusText.text = "Rádio chyba: " + e.message }
+                ui { statusText.text = "Rádio chyba: " + (e.message ?: "neznáma") }
             }
         }
     }
 
     private fun stopRadio() {
+        queueJob?.cancel()
         scope.launch(Dispatchers.IO) {
             try {
+                sendSilent("20NW")
                 val control = ensureAvtControl() ?: return@launch
                 soapStop(control)
-                ui { radioLine.text = "Rádio: stop" }
+                ui {
+                    radioLine.text = "Rádio: zastavené"
+                    statusText.text = ""
+                }
             } catch (_: Exception) { }
         }
     }
@@ -1137,10 +1028,10 @@ class MainActivity : AppCompatActivity() {
         val control = cdsControlUrl ?: return
         if (pushStack) browseStack.add(objectId to title)
         scope.launch(Dispatchers.IO) {
-            val body = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n" +
-                "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" " +
-                "s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">" +
-                "<s:Body><u:Browse xmlns:u=\"urn:schemas-upnp-org:service:ContentDirectory:1\">" +
+            val body = "<?xml version="1.0" encoding="utf-8"?>\n" +
+                "<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" " +
+                "s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">" +
+                "<s:Body><u:Browse xmlns:u="urn:schemas-upnp-org:service:ContentDirectory:1">" +
                 "<ObjectID>" + objectId + "</ObjectID>" +
                 "<BrowseFlag>BrowseDirectChildren</BrowseFlag>" +
                 "<Filter>*</Filter><StartingIndex>0</StartingIndex>" +
@@ -1162,14 +1053,14 @@ class MainActivity : AppCompatActivity() {
     private fun parseDidl(xml: String): List<MediaEntry> {
         val decoded = xml
             .replace("&lt;", "<").replace("&gt;", ">")
-            .replace("&quot;", "\"").replace("&amp;", "&")
-        val containers = Regex("(?is)<container[^>]*?id=\"([^\"]+)\"[^>]*>(.*?)</container>")
+            .replace("&quot;", """).replace("&amp;", "&")
+        val containers = Regex("(?is)<container[^>]*?id="([^"]+)"[^>]*>(.*?)</container>")
             .findAll(decoded).map { c ->
                 val title = Regex("(?i)<dc:title>(.*?)</dc:title>")
                     .find(c.groupValues[2])?.groupValues?.get(1) ?: "(priečinok)"
                 MediaEntry(c.groupValues[1], title.trim(), true, null)
             }.toList()
-        val items = Regex("(?is)<item[^>]*?id=\"([^\"]+)\"[^>]*>(.*?)</item>")
+        val items = Regex("(?is)<item[^>]*?id="([^"]+)"[^>]*>(.*?)</item>")
             .findAll(decoded).map { i ->
                 val title = Regex("(?i)<dc:title>(.*?)</dc:title>")
                     .find(i.groupValues[2])?.groupValues?.get(1) ?: "(skladba)"
@@ -1192,8 +1083,10 @@ class MainActivity : AppCompatActivity() {
             }
             btn.gravity = Gravity.LEFT or Gravity.CENTER_VERTICAL
             if (!e.isContainer) btn.background = roundedBg(C_CARD2, 12, C_STROKE)
-            mediaList.addView(btn, LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+            val lp = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+            lp.topMargin = dp(3)
+            mediaList.addView(btn, lp)
         }
         if (entries.isEmpty()) {
             val t = TextView(this)
@@ -1218,6 +1111,10 @@ class MainActivity : AppCompatActivity() {
         queueIdx = startIndex
         queueJob = scope.launch(Dispatchers.IO) {
             try {
+                if (activeInput != "MEDIA SRV" && activeInput != "44FN" && activeInput != "47FN") {
+                    sendSilent("44FN")
+                    delay(1000)
+                }
                 while (isActive && queueIdx < playQueue.size) {
                     val track = playQueue[queueIdx]
                     val control = ensureAvtControl() ?: run {
@@ -1228,7 +1125,10 @@ class MainActivity : AppCompatActivity() {
                         mediaStatusText.text = "▶ " + track.title +
                             "  (" + (queueIdx + 1) + "/" + playQueue.size + ")"
                     }
-                    soapSetUri(control, track.url!!)
+                    runCatching { soapStop(control) }
+                    delay(250)
+                    soapSetUri(control, track.url!!, track.title, isBroadcast = false)
+                    delay(250)
                     soapPlay(control)
 
                     var started = false
@@ -1253,34 +1153,38 @@ class MainActivity : AppCompatActivity() {
                     }
                     queueIdx++
                 }
-                ui { mediaStatusText.text = "✓ Album dokončený" }
+                ui { mediaStatusText.text = "✓ Prehrávanie dokončené" }
             } catch (_: Exception) { }
         }
     }
 
     // =====================================================================
-    // UPnP NIZKOUREOVNOVE
+    // UPnP NIZKOUROVNOVE VOLANIA
     // =====================================================================
 
-    private fun ssdpFindAll(st: String, timeoutMs: Int = 4000): List<String> {
+    private fun ssdpFindAll(st: String, timeoutMs: Int = 3500): List<String> {
         val result = linkedSetOf<String>()
         val msearch = "M-SEARCH * HTTP/1.1\r\n" +
             "HOST: 239.255.255.250:1900\r\n" +
             "MAN: \"ssdp:discover\"\r\n" +
             "MX: 2\r\n" +
             "ST: " + st + "\r\n\r\n"
-        MulticastSocket().use { sock ->
-            sock.soTimeout = timeoutMs
-            val addr = InetAddress.getByName("239.255.255.250")
-            sock.send(DatagramPacket(msearch.toByteArray(), msearch.length, addr, 1900))
-            val buf = ByteArray(4096)
-            val deadline = System.currentTimeMillis() + timeoutMs
-            while (System.currentTimeMillis() < deadline) {
-                val pkt = DatagramPacket(buf, buf.size)
-                try { sock.receive(pkt) } catch (_: Exception) { break }
-                val resp = String(pkt.data, 0, pkt.length, Charsets.US_ASCII)
-                Regex("(?i)LOCATION:\\s*(\\S+)").find(resp)?.groupValues?.get(1)
-                    ?.let { result.add(it) }
+        runCatching {
+            MulticastSocket().use { sock ->
+                sock.soTimeout = timeoutMs
+                val addr = InetAddress.getByName("239.255.255.250")
+                val pktOut = DatagramPacket(msearch.toByteArray(), msearch.length, addr, 1900)
+                sock.send(pktOut)
+                sock.send(pktOut)
+                val buf = ByteArray(4096)
+                val deadline = System.currentTimeMillis() + timeoutMs
+                while (System.currentTimeMillis() < deadline) {
+                    val pkt = DatagramPacket(buf, buf.size)
+                    try { sock.receive(pkt) } catch (_: Exception) { break }
+                    val resp = String(pkt.data, 0, pkt.length, Charsets.US_ASCII)
+                    Regex("(?i)LOCATION:\s*(\S+)").find(resp)?.groupValues?.get(1)
+                        ?.let { result.add(it) }
+                }
             }
         }
         return result.toList()
@@ -1288,10 +1192,29 @@ class MainActivity : AppCompatActivity() {
 
     private fun ensureAvtControl(): String? {
         avtControlUrl?.let { return it }
-        val descUrl = ssdpFindAll("urn:schemas-upnp-org:device:MediaRenderer:1")
-            .firstOrNull() ?: ("http://" + host + ":49152/description.xml")
-        return readServiceControlUrl(descUrl,
-            "urn:schemas-upnp-org:service:AVTransport")?.also { avtControlUrl = it }
+
+        val allRenderers = ssdpFindAll("urn:schemas-upnp-org:device:MediaRenderer:1", 2500)
+        val matched = allRenderers.firstOrNull { it.contains(host) }
+        if (matched != null) {
+            readServiceControlUrl(matched, "urn:schemas-upnp-org:service:AVTransport")
+                ?.let { avtControlUrl = it; return it }
+        }
+
+        val fallbackLocations = listOf(
+            "http://$host:49152/description.xml",
+            "http://$host:49153/description.xml",
+            "http://$host:49154/description.xml",
+            "http://$host:8080/description.xml",
+            "http://$host:60006/upnp/desc/aios_device/aios_device.xml"
+        )
+        for (loc in fallbackLocations) {
+            val ctrl = readServiceControlUrl(loc, "urn:schemas-upnp-org:service:AVTransport")
+            if (ctrl != null) {
+                avtControlUrl = ctrl
+                return ctrl
+            }
+        }
+        return null
     }
 
     private fun readServiceControlUrl(descUrl: String, serviceUrn: String): String? {
@@ -1301,15 +1224,22 @@ class MainActivity : AppCompatActivity() {
             .find(xml)?.value ?: return null
         val controlPath = Regex("(?is)<controlURL>(.*?)</controlURL>")
             .find(serviceBlock)?.groupValues?.get(1)?.trim() ?: return null
+        if (controlPath.startsWith("http://", ignoreCase = true) ||
+            controlPath.startsWith("https://", ignoreCase = true)) {
+            return controlPath
+        }
         val base = Regex("(?is)<URLBase>(.*?)</URLBase>")
-            .find(xml)?.groupValues?.get(1)?.trim()
-            ?: URL(descUrl).let { it.protocol + "://" + it.host + ":" + it.port }
+            .find(xml)?.groupValues?.get(1)?.trim()?.takeIf { it.isNotEmpty() }
+            ?: URL(descUrl).let {
+                val p = if (it.port != -1) ":${it.port}" else ""
+                "${it.protocol}://${it.host}$p"
+            }
         return base.trimEnd('/') + "/" + controlPath.trimStart('/')
     }
 
     private fun httpGet(urlStr: String): String? = runCatching {
         val conn = URL(urlStr).openConnection() as HttpURLConnection
-        conn.connectTimeout = 5000; conn.readTimeout = 5000
+        conn.connectTimeout = 3500; conn.readTimeout = 3500
         BufferedReader(InputStreamReader(conn.inputStream)).use { it.readText() }
     }.getOrNull()
 
@@ -1320,7 +1250,7 @@ class MainActivity : AppCompatActivity() {
         conn.doOutput = true
         conn.connectTimeout = 5000; conn.readTimeout = 8000
         conn.setRequestProperty("Content-Type", "text/xml; charset=\"utf-8\"")
-        conn.setRequestProperty("SOAPACTION", "\"" + soapAction + "\"")
+        conn.setRequestProperty("SOAPACTION", "\" + soapAction + "\"")
         OutputStreamWriter(conn.outputStream, Charsets.UTF_8).use {
             it.write(body); it.flush()
         }
@@ -1329,8 +1259,8 @@ class MainActivity : AppCompatActivity() {
         return BufferedReader(InputStreamReader(stream ?: return null)).use { it.readText() }
     }
 
-    private fun soap(controlUrl: String, action: String, body: String) {
-        soapRequest(controlUrl, action,
+    private fun soap(controlUrl: String, action: String, body: String): String? {
+        return soapRequest(controlUrl, action,
             "urn:schemas-upnp-org:service:AVTransport:1#" + action, body)
     }
 
@@ -1347,20 +1277,56 @@ class MainActivity : AppCompatActivity() {
             .find(resp)?.groupValues?.get(1) ?: ""
     }
 
-    private fun soapSetUri(controlUrl: String, streamUrl: String) {
-        val esc = streamUrl.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        soap(controlUrl, "SetAVTransportURI",
+    private fun soapSetUri(controlUrl: String, streamUrl: String,
+                           title: String = "Internet Radio",
+                           isBroadcast: Boolean = true): String? {
+        val escUrl = streamUrl.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        val escTitle = title.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+        val lower = streamUrl.lowercase()
+        val mime = when {
+            lower.endsWith(".aac") || lower.contains("aac") -> "audio/aac"
+            lower.endsWith(".flac") -> "audio/flac"
+            lower.endsWith(".wav") -> "audio/wav"
+            else -> "audio/mpeg"
+        }
+        val dlnaPn = if (mime == "audio/aac") "AAC_ISO" else "MP3"
+        val upnpClass = if (isBroadcast)
+            "object.item.audioItem.audioBroadcast"
+        else
+            "object.item.audioItem.musicTrack"
+        val dlnaOp = if (isBroadcast) "00" else "01"
+        val dlnaFlags = if (isBroadcast)
+            "01700000000000000000000000000000"
+        else
+            "01500000000000000000000000000000"
+
+        val didl = "<DIDL-Lite xmlns=\"urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/\" " +
+            "xmlns:dc=\"http://purl.org/dc/elements/1.1/\" " +
+            "xmlns:upnp=\"urn:schemas-upnp-org:metadata-1-0/upnp/\">" +
+            "<item id=\"0\" parentID=\"-1\" restricted=\"1\">" +
+            "<dc:title>$escTitle</dc:title>" +
+            "<upnp:class>$upnpClass</upnp:class>" +
+            "<res protocolInfo=\"http-get:*:$mime:DLNA.ORG_PN=$dlnaPn;DLNA.ORG_OP=$dlnaOp;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=$dlnaFlags\">$escUrl</res>" +
+            "</item></DIDL-Lite>"
+
+        val escDidl = didl.replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace("\"", "&quot;")
+
+        return soap(controlUrl, "SetAVTransportURI",
             "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n" +
             "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" " +
             "s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">" +
             "<s:Body><u:SetAVTransportURI xmlns:u=\"urn:schemas-upnp-org:service:AVTransport:1\">" +
-            "<InstanceID>0</InstanceID><CurrentURI>" + esc + "</CurrentURI>" +
-            "<CurrentURIMetaData></CurrentURIMetaData>" +
+            "<InstanceID>0</InstanceID><CurrentURI>" + escUrl + "</CurrentURI>" +
+            "<CurrentURIMetaData>" + escDidl + "</CurrentURIMetaData>" +
             "</u:SetAVTransportURI></s:Body></s:Envelope>")
     }
 
-    private fun soapPlay(controlUrl: String) {
-        soap(controlUrl, "Play",
+    private fun soapPlay(controlUrl: String): String? {
+        return soap(controlUrl, "Play",
             "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n" +
             "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" " +
             "s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">" +
@@ -1369,8 +1335,8 @@ class MainActivity : AppCompatActivity() {
             "</u:Play></s:Body></s:Envelope>")
     }
 
-    private fun soapStop(controlUrl: String) {
-        soap(controlUrl, "Stop",
+    private fun soapStop(controlUrl: String): String? {
+        return soap(controlUrl, "Stop",
             "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n" +
             "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" " +
             "s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">" +
@@ -1447,7 +1413,11 @@ class MainActivity : AppCompatActivity() {
                 line.startsWith("FN") && line.length == 4 -> {
                     val code = line.substring(2) + "FN"
                     activeInput = inputs.entries.firstOrNull { it.value == code }?.key
-                        ?: (if (code == "38FN") "NETRADIO" else code)
+                        ?: when (code) {
+                            "47FN" -> "DMR"
+                            "26FN" -> "NETWORK"
+                            else -> code
+                        }
                     updateInfoLine()
                     styleInputButtons()
                 }
@@ -1460,7 +1430,7 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
                 line == "PWR0" -> { isOn = true; updatePowerButton() }
-                line == "PWR2" -> { isOn = false; updatePowerButton() }
+                line == "PWR2" || line == "PWR1" -> { isOn = false; updatePowerButton() }
             }
         }
     }
@@ -1478,4 +1448,3 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun ui(block: () -> Unit) = runOnUiThread { block() }
-}
