@@ -309,11 +309,13 @@ class MainActivity : AppCompatActivity() {
         root.setBackgroundColor(C_BG)
         root.setPadding(pad, dp(10), pad, 0)
 
-        // ZAP / VYP uplne hore, kazde na polovicu sirky
-        powerBtn = flatBtn("⏻ ZAP") { send("PO"); sendSilent("?P") }
-        val vypBtn = flatBtn("⏻ VYP") { send("PF"); sendSilent("?P") }
-        powerBtn.textSize = 14f; vypBtn.textSize = 14f
-        root.addView(rowOf(listOf(powerBtn, vypBtn)))
+        // Hlavicka: vycentrovany nazov + podnadpis a napravo okruhla gulicka ON/OFF
+        val header = FrameLayout(this)
+        header.setPadding(0, 0, 0, dp(8))
+
+        val titleBox = LinearLayout(this)
+        titleBox.orientation = LinearLayout.VERTICAL
+        titleBox.gravity = Gravity.CENTER_HORIZONTAL
 
         val title = TextView(this)
         title.text = "Pioneer Remote"
@@ -321,14 +323,40 @@ class MainActivity : AppCompatActivity() {
         title.typeface = Typeface.DEFAULT_BOLD
         title.setTextColor(C_WHITE)
         title.gravity = Gravity.CENTER
-        root.addView(title)
+        titleBox.addView(title)
+
         val sub = TextView(this)
         sub.text = "VSX-S510"
         sub.textSize = 11f
         sub.setTextColor(C_CYAN)
         sub.gravity = Gravity.CENTER
-        sub.setPadding(0, 0, 0, dp(8))
-        root.addView(sub)
+        titleBox.addView(sub)
+
+        header.addView(titleBox, FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT,
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+            Gravity.CENTER
+        ))
+
+        val circleSize = dp(42)
+        powerBtn = Button(this)
+        powerBtn.textSize = 11f
+        powerBtn.typeface = Typeface.DEFAULT_BOLD
+        powerBtn.gravity = Gravity.CENTER
+        powerBtn.transformationMethod = null
+        powerBtn.setPadding(0, 0, 0, 0)
+        powerBtn.minimumWidth = 0
+        powerBtn.minimumHeight = 0
+        powerBtn.setOnClickListener { togglePower() }
+        updatePowerButton()
+
+        header.addView(powerBtn, FrameLayout.LayoutParams(
+            circleSize,
+            circleSize,
+            Gravity.END or Gravity.CENTER_VERTICAL
+        ))
+
+        root.addView(header)
 
         // riadok: IP + hladanie + pripojenie
         val top = LinearLayout(this)
@@ -687,7 +715,23 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun updatePowerButton() {
-        highlightBtn(powerBtn, isOn, C_GREEN)
+        val bg = if (isOn) C_GREEN else C_RED
+        val fg = if (isOn) C_ON_ACCENT else C_WHITE
+        powerBtn.text = if (isOn) "ON" else "OFF"
+        powerBtn.setTextColor(fg)
+        powerBtn.background = GradientDrawable().apply {
+            shape = GradientDrawable.OVAL
+            setColor(bg)
+            setStroke(dp(1), C_WHITE)
+        }
+    }
+
+    private fun togglePower() {
+        send(if (isOn) "PF" else "PO")
+        scope.launch(Dispatchers.IO) {
+            delay(800)
+            sendSilent("?P")
+        }
     }
 
     private fun styleInputButtons() {
