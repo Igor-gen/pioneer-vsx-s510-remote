@@ -1,22 +1,18 @@
 // ============================================================================
-// Pioneer VSX-S510 Remote — verzia 14
-// - Automatické pripojenie na poslednú uloženú IP adresu pri štarte; ak neodpovedá,
-//   automaticky prehľadá sieť, pripojí nájdený receiver a uloží novú IP adresu
-// - Hlavný displej (horná karta):
-//     * Hore výrazným písmom názov rádiovej stanice (alebo aktívny vstup/displej)
-//     * Pod ním menším písmom názov relácie/skladby a bitrate
-//     * Pod tým zvolený vstup a priestorový režim
-//     * Stav pripojenia (Pripojené + IP adresa / Odpojené + chybová hláška)
-//     * V dolnej časti displeja zelený posuvník hlasitosti + hodnota hlasitosti
-// - Odstránené tlačidlá HDMI 1 až HDMI 6 zo zoznamu vstupov
-// - Opravené príkazy pre priestorový zvuk (Surround) na VSX-S510 (0001SR, 0005SR,
-//   0006SR, 0009SR, 0010SR, 0151SR, 0013SR, 0014SR + dotaz ?S / ?L)
-// - Karta RÁDIO (Preferovaná 2. možnosť — výsuvný zoznam predvolieb):
-//     * Tlačidlo "⭐ FAVORITES (Zoznam)" a vedľa neho "⏹ ZASTAVIŤ"
-//     * Stlačenie FAVORITES zastaví prípadné prehrávanie (20NW + 14NW), načíta
-//       čerstvý zoznam z receivera a vysunie tabuľku s klikateľnými predvoľbami
-//     * Po kliknutí na predvoľbu sa stanica spustí (xxGHP) a zoznam sa zasunie (skryje)
-//     * Opätovné stlačenie FAVORITES preruší hrajúci stream a znova vysunie zoznam
+// Pioneer VSX-S510 Remote — verzia 15
+// - Zrušený interaktívny posuvník hlasitosti (SeekBar), ktorý spôsoboval nekonečné
+//   zvyšovanie/znižovanie hlasitosti. Nahradený čisto vizuálnym zeleným pásikom
+//   (ProgressBar) ukazujúcim úroveň hlasitosti. Ovládanie ostáva cez VOL − / VOL +.
+// - Karta RÁDIO:
+//     * Odstránené tlačidlo "⏹ ZASTAVIŤ" a odstránený dolný displej "DETAIL PREHRÁVANIA"
+//     * Jediné hlavné tlačidlo "⭐ FAVORITES (Načítať predvoľby)"
+//     * Po každom stlačení tlačidla FAVORITES sa vykoná:
+//       1. Krátke prepnutie na vstup NETRADIO (38FN) — garantovane preruší hrajúci stream
+//       2. Okamžité prepnutie späť na FAVORITES (45FN)
+//       3. Načítanie čerstvého zoznamu predvolieb z receivera (?GAP / ?GAH)
+//       4. Vysunutie zoznamu predvolieb s načítanými popismi z receivera
+//     * Po výbere (kliknutí) na predvoľbu sa zoznam okamžite zasunie a predvoľba sa prehráva
+//     * Opätovné stlačenie FAVORITES zopakuje celý cyklus (38FN -> 45FN -> načítanie -> vysunutie)
 // ============================================================================
 
 package com.example.pioneerremote
@@ -35,8 +31,8 @@ import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.GridLayout
 import android.widget.LinearLayout
+import android.widget.ProgressBar
 import android.widget.ScrollView
-import android.widget.SeekBar
 import android.widget.TextView
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
@@ -59,7 +55,6 @@ import java.net.Socket
 import java.net.URL
 import java.util.Collections
 import java.util.concurrent.atomic.AtomicReference
-import kotlin.math.abs
 
 class MainActivity : AppCompatActivity() {
 
@@ -95,7 +90,6 @@ class MainActivity : AppCompatActivity() {
     private var activeMode: String? = null
     private var activeFavIndex: Int = -1
     private var activeStationName: String = ""
-    private var seekJob: Job? = null
     private var favJob: Job? = null
     private var multicastLock: WifiManager.MulticastLock? = null
 
@@ -107,7 +101,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var connLine: TextView
     private lateinit var statusText: TextView
     private lateinit var volumeLabel: TextView
-    private lateinit var volSlider: SeekBar
+    private lateinit var volBar: ProgressBar
     private lateinit var powerBtn: Button
     private lateinit var muteBtn: Button
 
@@ -131,10 +125,7 @@ class MainActivity : AppCompatActivity() {
         "FAVORITES" to "45FN"
     )
 
-    // Opravené príkazy pre priestorový zvuk na Pioneer VSX-S510:
-    // 0001SR = STEREO, 0005SR = AUTO SURR/STREAM DIRECT, 0006SR = DIRECT,
-    // 0009SR = STEREO (DIRECT), 0151SR = AUTO LEVEL CONTROL, 0010SR = STANDARD (PLII),
-    // 0013SR = PRO LOGIC2 MOVIE, 0014SR = PRO LOGIC2 MUSIC, 0100SR = ADVANCED SURROUND (cycle)
+    // Príkazy pre priestorový zvuk na Pioneer VSX-S510
     private val modes = linkedMapOf(
         "STEREO" to "0001SR",
         "AUTO SURR." to "0005SR",
@@ -146,22 +137,16 @@ class MainActivity : AppCompatActivity() {
         "ADV. SURR." to "0100SR"
     )
 
-    // ===== KARTA RÁDIO (Výsuvný zoznam predvolieb + detail prehrávania) =====
+    // ===== KARTA RÁDIO (Iba tlačidlo FAVORITES + výsuvný zoznam predvolieb) =====
     private lateinit var favToggleBtn: Button
-    private lateinit var favStopBtn: Button
     private lateinit var favDrawerCard: LinearLayout
     private lateinit var favDrawerStatus: TextView
     private lateinit var favTableContainer: LinearLayout
     private var isFavListExpanded: Boolean = false
 
-    private lateinit var nowPlayingTitle: TextView
-    private lateinit var nowPlayingSub: TextView
-    private lateinit var nowPlayingMeta: TextView
-    private lateinit var nowPlayingFl: TextView
-
     // Načítané stanice vo Favorites (poradie 1..N -> názov)
     private val favStations = linkedMapOf<Int, String>()
-    // Metadáta z obrazovky prehrávania (riadok 1..8 -> Pair(typeCode, text))
+    // Metadáta z obrazovky prehrávania (riadok 1..8 -> Pair(typeCode, text)) pre horný displej
     private val playMetaLines = mutableMapOf<Int, Pair<String, String>>()
     @Volatile private var isSyncingFavorites: Boolean = false
     @Volatile private var isPlayingFavorite: Boolean = false
@@ -209,8 +194,6 @@ class MainActivity : AppCompatActivity() {
             setReferenceCounted(false); acquire()
         }
 
-        // Po zapnutí aplikácie ihneď skúsime poslednú uloženú IP adresu;
-        // ak neodpovedá, automaticky prehľadáme sieť, pripojíme nájdený receiver a IP uložíme.
         autoConnectOrDiscoverOnStartup()
 
         if (mediaServerDesc != null) initMediaServer(mediaServerDesc!!)
@@ -453,7 +436,7 @@ class MainActivity : AppCompatActivity() {
         // 2. Pod ním menším fontom názov relácie / skladby a bitrate
         // 3. Pod tým zvolený vstup a režim
         // 4. Stav pripojenia + IP adresa (alebo Odpojené + chybová hláška)
-        // 5. V dolnej časti displeja zelený posuvník hlasitosti
+        // 5. V dolnej časti displeja čisto vizuálny zelený pásik hlasitosti
         // =================================================================
         val card = LinearLayout(this)
         card.orientation = LinearLayout.VERTICAL
@@ -493,36 +476,31 @@ class MainActivity : AppCompatActivity() {
         statusText.setTextColor(C_ORANGE)
         statusText.gravity = Gravity.CENTER
 
-        // Zelený posuvník hlasitosti v dolnej časti hlavného displeja
+        // Vizuálny zelený pásik úrovne hlasitosti (neinteraktívny ProgressBar)
         val volBox = LinearLayout(this)
         volBox.orientation = LinearLayout.HORIZONTAL
         volBox.gravity = Gravity.CENTER_VERTICAL
-        volBox.setPadding(dp(6), dp(6), dp(6), dp(2))
+        volBox.setPadding(dp(6), dp(8), dp(6), dp(2))
 
         volumeLabel = TextView(this)
         volumeLabel.text = "🔊 —"
         volumeLabel.textSize = 13f
         volumeLabel.typeface = Typeface.DEFAULT_BOLD
         volumeLabel.setTextColor(C_GREEN)
-        volumeLabel.setPadding(0, 0, dp(8), 0)
+        volumeLabel.setPadding(0, 0, dp(10), 0)
 
-        volSlider = SeekBar(this)
-        volSlider.max = volMax
-        volSlider.progressTintList = ColorStateList.valueOf(C_GREEN)
-        volSlider.thumbTintList = ColorStateList.valueOf(C_GREEN)
-        volSlider.progressBackgroundTintList = ColorStateList.valueOf(C_STROKE)
-        volSlider.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-            override fun onProgressChanged(s: SeekBar?, p: Int, fromUser: Boolean) {
-                if (fromUser) volumeLabel.text = volShortText(p)
-            }
-            override fun onStartTrackingTouch(s: SeekBar?) {}
-            override fun onStopTrackingTouch(s: SeekBar?) { seekVolume(s?.progress ?: 0) }
-        })
+        volBar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal)
+        volBar.max = volMax
+        volBar.progress = 0
+        volBar.progressTintList = ColorStateList.valueOf(C_GREEN)
+        volBar.progressBackgroundTintList = ColorStateList.valueOf(C_STROKE)
+        volBar.isClickable = false
+        volBar.isFocusable = false
 
+        val barLp = LinearLayout.LayoutParams(0, dp(10), 1f)
         volBox.addView(volumeLabel, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
-        volBox.addView(volSlider, LinearLayout.LayoutParams(
-            0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        volBox.addView(volBar, barLp)
 
         card.addView(mainStationBig)
         card.addView(mainShowBitrate)
@@ -587,7 +565,7 @@ class MainActivity : AppCompatActivity() {
         muteLp.topMargin = dp(6)
         root.addView(rowOf(listOf(muteBtn, vstupBtn)), muteLp)
 
-        // Tlačidlá hlasitosti VOL − / VOL + ostávajú ako boli
+        // Tlačidlá hlasitosti VOL − / VOL +
         val volMinus = flatBtn("VOL −") { send("VD"); sendSilent("?V") }
         val volPlus = flatBtn("VOL +") { send("VU"); sendSilent("?V") }
         volMinus.textSize = 13f; volPlus.textSize = 13f
@@ -614,7 +592,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     // =====================================================================
-    // SCREEN 1 — OVLADANIE (VSTUPY BEZ HDMI 1-6 + OPRAVENY PRIESTOROVY ZVUK)
+    // SCREEN 1 — OVLADANIE (VSTUPY BEZ HDMI 1-6 + PRIESTOROVY ZVUK)
     // =====================================================================
 
     private fun buildScreenHome(): ScrollView {
@@ -656,8 +634,6 @@ class MainActivity : AppCompatActivity() {
         return sv
     }
 
-    // Opravené prepínanie priestorového zvuku pre Pioneer VSX-S510:
-    // Pošle príkaz xxxxSR a následne si vyžiada potvrdenie ?S (Listening Mode Set) aj ?L (Playing Listening Mode)
     private fun setListeningMode(name: String, code: String) {
         activeMode = name
         updateInfoLine()
@@ -671,7 +647,11 @@ class MainActivity : AppCompatActivity() {
     }
 
     // =====================================================================
-    // SCREEN 2 — RADIO (DRUHA MOZNOST: VYSUVNY ZOZNAM FAVORITES + STOP)
+    // SCREEN 2 — RADIO
+    // - Iba tlačidlo FAVORITES (bez tlačidla Zastaviť a bez dolného displeja)
+    // - Po stlačení FAVORITES: krátke prepnutie na NETRADIO (38FN) -> okamžite
+    //   späť na FAVORITES (45FN) -> načítanie zoznamu z receivera -> vysunutie zoznamu
+    // - Po kliknutí na predvoľbu: zoznam sa zasunie a predvoľba sa prehráva
     // =====================================================================
 
     private fun buildScreenRadio(): ScrollView {
@@ -682,27 +662,21 @@ class MainActivity : AppCompatActivity() {
         sv.addView(page, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
 
-        // Horné dve tlačidlá vedľa seba:
-        // 1. ⭐ FAVORITES (vysunie zoznam / ak hrá stream, preruší ho a znova vysunie zoznam)
-        // 2. ⏹ ZASTAVIŤ (zastaví prehrávanie streamu)
-        favToggleBtn = flatBtn("⭐ FAVORITES (Načítať zoznam)") {
+        favToggleBtn = flatBtn("⭐ FAVORITES (Načítať predvoľby ▼)") {
             onFavoritesButtonClicked()
         }
         favToggleBtn.background = roundedBg(C_CYAN_D, 12, C_CYAN)
         favToggleBtn.setTextColor(C_WHITE)
         favToggleBtn.typeface = Typeface.DEFAULT_BOLD
+        favToggleBtn.textSize = 14f
+        favToggleBtn.setPadding(dp(12), dp(12), dp(12), dp(12))
 
-        favStopBtn = flatBtn("⏹ ZASTAVIŤ") {
-            stopFavoriteStream()
-        }
-        favStopBtn.background = roundedBg(C_RED, 12, C_RED)
-        favStopBtn.setTextColor(C_WHITE)
-        favStopBtn.typeface = Typeface.DEFAULT_BOLD
+        val btnLp = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+        btnLp.setMargins(dp(2), dp(4), dp(2), dp(4))
+        page.addView(favToggleBtn, btnLp)
 
-        page.addView(rowOf(listOf(favToggleBtn, favStopBtn)))
-
-        // Výsuvný kontajner so zoznamom predvolieb (zobrazí sa po stlačení FAVORITES,
-        // po kliknutí na predvoľbu sa automaticky zasunie/skryje)
+        // Výsuvný kontajner so zoznamom predvolieb
         favDrawerCard = LinearLayout(this)
         favDrawerCard.orientation = LinearLayout.VERTICAL
         favDrawerCard.setPadding(dp(10), dp(10), dp(10), dp(10))
@@ -727,49 +701,10 @@ class MainActivity : AppCompatActivity() {
         page.addView(favDrawerCard)
         renderFavoriteTable()
 
-        // Spodný displej s detailom prehrávanej skladby / stanice, bitrate a ostatnými údajmi
-        page.addView(sectionLabel("DETAIL PREHRÁVANIA"))
-        val dispCard = LinearLayout(this)
-        dispCard.orientation = LinearLayout.VERTICAL
-        dispCard.setPadding(dp(14), dp(12), dp(14), dp(12))
-        dispCard.background = roundedBg(C_CARD2, 16, C_CYAN_D)
-
-        nowPlayingTitle = TextView(this)
-        nowPlayingTitle.text = "📻 Žiadna stanica nehrá"
-        nowPlayingTitle.textSize = 16f
-        nowPlayingTitle.typeface = Typeface.DEFAULT_BOLD
-        nowPlayingTitle.setTextColor(C_WHITE)
-
-        nowPlayingSub = TextView(this)
-        nowPlayingSub.text = "Relácia / Skladba: —"
-        nowPlayingSub.textSize = 13f
-        nowPlayingSub.setTextColor(C_CYAN)
-        nowPlayingSub.setPadding(0, dp(4), 0, 0)
-
-        nowPlayingMeta = TextView(this)
-        nowPlayingMeta.text = "Formát / Bitrate: —   ·   Čas: —"
-        nowPlayingMeta.textSize = 12f
-        nowPlayingMeta.setTextColor(C_SLATE)
-        nowPlayingMeta.setPadding(0, dp(4), 0, 0)
-
-        nowPlayingFl = TextView(this)
-        nowPlayingFl.text = "Displej receivera: —"
-        nowPlayingFl.textSize = 12f
-        nowPlayingFl.typeface = Typeface.MONOSPACE
-        nowPlayingFl.setTextColor(C_DIM)
-        nowPlayingFl.setPadding(0, dp(6), 0, 0)
-
-        dispCard.addView(nowPlayingTitle)
-        dispCard.addView(nowPlayingSub)
-        dispCard.addView(nowPlayingMeta)
-        dispCard.addView(nowPlayingFl)
-        page.addView(dispCard)
-
         page.addView(hint("← swipe na ovládanie / médiá →"))
         return sv
     }
 
-    // Vykreslí tabuľku predvolieb zoradenú presne tak, ako sú uložené v receiveri
     private fun renderFavoriteTable() {
         if (!::favTableContainer.isInitialized) return
         favTableContainer.removeAllViews()
@@ -806,47 +741,71 @@ class MainActivity : AppCompatActivity() {
             favDrawerCard.visibility = if (expanded) View.VISIBLE else View.GONE
         }
         if (::favToggleBtn.isInitialized) {
-            favToggleBtn.text = if (expanded) "⭐ FAVORITES (Skryť ▲)" else "⭐ FAVORITES (Zoznam ▼)"
+            favToggleBtn.text = if (expanded)
+                "⭐ FAVORITES (Zoznam otvorený ▲)"
+            else
+                "⭐ FAVORITES (Načítať predvoľby ▼)"
         }
     }
 
-    // Preferovaná 2. možnosť:
-    // - Stlačenie tlačidla FAVORITES preruší prípadné prehrávanie hrajúceho streamu,
-    //   vráti receiver do koreňového zoznamu Favorites, načíta predvoľby a vysunie zoznam.
-    // - Ak už je zoznam vysunutý a nič nehrá, stlačením sa zoznam zasunie.
+    // Po každom stlačení tlačidla FAVORITES:
+    // 1. Najprv sa vykoná krátke prepnutie na NETRADIO (38FN) -> tým sa na 100 % preruší hrajúci stream
+    // 2. Vzápätí sa automaticky prepne späť na FAVORITES (45FN)
+    // 3. Vysunie sa zoznam predvolieb s načítanými popismi z receivera
     private fun onFavoritesButtonClicked() {
-        if (isFavListExpanded && !isPlayingFavorite) {
-            setFavDrawerExpanded(false)
-            return
-        }
-
         favJob?.cancel()
         setFavDrawerExpanded(true)
-        favDrawerStatus.text = "⏳ Zastavujem prehrávanie a načítavam zoznam Favorites…"
+        favDrawerStatus.text = "⏳ Prepínam NETRADIO → FAVORITES a načítavam predvoľby z receivera…"
         renderFavoriteTable()
 
         favJob = scope.launch(Dispatchers.IO) {
             try {
                 isSyncingFavorites = true
                 isPlayingFavorite = false
+                listScreenReady = false
+
                 if (!isOn) {
                     sendSilent("PO")
                     delay(2500)
                 }
 
-                // Prerušíme prípadný hrajúci stream a vrátime receiver do koreňového zoznamu Favorites
-                returnReceiverToFavoritesList()
+                // 1. Krátke prepnutie na NETRADIO (38FN) na garantované prerušenie prehrávania
+                sendSilent("38FN")
+                ui {
+                    activeInput = "NETRADIO"
+                    updateInfoLine()
+                    styleInputButtons()
+                }
+                delay(700)
 
-                // Vyžiadame čerstvý zoznam predvolieb z receivera
+                // 2. Okamžité prepnutie späť na FAVORITES (45FN)
+                sendSilent("45FN")
+                sendSilent("?F")
+                ui {
+                    activeInput = "FAVORITES"
+                    updateInfoLine()
+                    styleInputButtons()
+                }
+
+                // 3. Počkáme, kým receiver otvorí koreňový zoznam Favorites, a vyžiadame položky
+                for (step in 0 until 12) {
+                    delay(200)
+                    if (step == 3 || step == 7) {
+                        sendSilent("?GAP")
+                        sendSilent("?GAH")
+                    }
+                    if (listScreenReady) break
+                }
+
                 sendSilent("?GAP")
                 sendSilent("?GAH")
                 sendSilent("?FL")
                 delay(700)
                 sendSilent("?GAP")
-                delay(500)
+                delay(400)
 
                 ui {
-                    favDrawerStatus.text = "Klikni na predvoľbu pre spustenie (zoznam sa automaticky zasunie):"
+                    favDrawerStatus.text = "Vyber predvoľbu (po kliknutí sa zoznam zasunie a stanica začne hrať):"
                     renderFavoriteTable()
                 }
             } finally {
@@ -855,116 +814,42 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // Po kliknutí na predvoľbu v tabuľke:
-    // 1. Zoznam predvolieb sa okamžite zasunie (skryje pod tlačidlá)
-    // 2. Spustí sa zvolená predvoľba (keďže pri vysunutí zoznamu už bolo prehrávanie zastavené
-    //    a receiver čaká priamo v zozname Favorites, príkaz xxGHP okamžite zafunguje!)
+    // Po výbere predvoľby zo zoznamu:
+    // 1. Zoznam sa okamžite zasunie
+    // 2. Keďže sme už v čerstvo otvorenom zozname FAVORITES, priamy príkaz xxGHP okamžite spustí novú predvoľbu
     private fun onFavoritePresetSelected(index: Int, name: String) {
         favJob?.cancel()
         activeFavIndex = index
         val stationTitle = favStations[index] ?: name
         activeStationName = stationTitle
 
-        // Zasunieme zoznam predvolieb pod tlačidlá
+        // Zasunieme zoznam predvolieb
         setFavDrawerExpanded(false)
 
-        // Aktualizujeme hlavný aj spodný displej
-        nowPlayingTitle.text = "📻 $index. $stationTitle"
-        nowPlayingSub.text = "Spúšťam predvoľbu $index…"
-        nowPlayingMeta.text = "Načítavam stream…"
+        // Aktualizujeme hlavný displej hore
+        playMetaLines.clear()
+        playTimeText = ""
         updateMainDisplayHeader()
 
         favJob = scope.launch(Dispatchers.IO) {
             isSyncingFavorites = false
             isPlayingFavorite = true
-            playMetaLines.clear()
 
-            if (!isOn) {
-                sendSilent("PO")
-                delay(2500)
-            }
-
-            if (activeInput != "FAVORITES" && activeInput != "45FN") {
-                sendSilent("45FN")
-                sendSilent("?F")
-                delay(1400)
-            }
-
-            // Receiver je pripravený v zozname Favorites -> pošleme priamu voľbu riadku (xxGHP)
+            // Odošleme priamu voľbu položky zo zoznamu Favorites (01GHP .. 08GHP)
             val ghpCmd = String.format("%02dGHP", index)
             sendSilent(ghpCmd)
-            delay(400)
-            sendSilent("10NW") // potvrdenie Play
+            delay(350)
+            // Potvrdenie prehrávania (Enter / Play) pre prípad, že položka len čaká na potvrdenie
+            sendSilent("10NW")
 
-            // Počkáme na nabehnutie streamu a načítame metadáta relácie a bitrate
-            delay(1400)
+            // Načítame informácie o prehrávanej stanici a bitrate na horný displej
+            delay(1500)
             sendSilent("?GAP")
             sendSilent("?GAH")
             sendSilent("?FL")
-            delay(1600)
+            delay(1500)
             sendSilent("?GAP")
             sendSilent("?FL")
-        }
-    }
-
-    // Tlačidlo ⏹ ZASTAVIŤ vedľa FAVORITES:
-    // Zastaví prehrávanie streamu a vráti receiver do zoznamu Favorites
-    private fun stopFavoriteStream() {
-        favJob?.cancel()
-        isPlayingFavorite = false
-        activeFavIndex = -1
-        activeStationName = ""
-        playMetaLines.clear()
-        playTimeText = ""
-
-        nowPlayingTitle.text = "⏹ Prehrávanie zastavené"
-        nowPlayingSub.text = "Relácia / Skladba: —"
-        nowPlayingMeta.text = "Formát / Bitrate: —"
-        updateMainDisplayHeader()
-        renderFavoriteTable()
-
-        favJob = scope.launch(Dispatchers.IO) {
-            sendSilent("20NW")
-            delay(300)
-            sendSilent("14NW")
-            delay(400)
-            sendSilent("?FL")
-            sendSilent("?GAP")
-        }
-    }
-
-    // Spoľahlivý návrat receivera z hrajúceho streamu do koreňového zoznamu Favorites
-    private suspend fun returnReceiverToFavoritesList() {
-        listScreenReady = false
-        if (activeInput != "FAVORITES" && activeInput != "45FN") {
-            sendSilent("45FN")
-            sendSilent("?F")
-            for (step in 0 until 10) {
-                delay(200)
-                if (listScreenReady) return
-            }
-            return
-        }
-
-        // 1. Zastavíme stream (20NW) a vrátime sa o úroveň späť do zoznamu (14NW)
-        sendSilent("20NW")
-        delay(300)
-        sendSilent("14NW")
-        delay(400)
-        sendSilent("?GAP")
-        delay(350)
-
-        // 2. Ak receiver stále neohlásil zoznam (zostal visieť v Play obrazovke),
-        // urobíme rýchly reset vstupu: 38FN (NetRadio) -> 45FN (Favorites)
-        if (!listScreenReady) {
-            sendSilent("38FN")
-            delay(450)
-            sendSilent("45FN")
-            sendSilent("?F")
-            for (step in 0 until 10) {
-                delay(200)
-                if (listScreenReady) break
-            }
         }
     }
 
@@ -1014,7 +899,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     // =====================================================================
-    // AKTUALIZACIE HLAVNEHO A SPODNEHO DISPLEJA
+    // AKTUALIZACIE HLAVNEHO DISPLEJA
     // =====================================================================
 
     private fun volShortText(v: Int): String {
@@ -1023,13 +908,16 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun updateVolumeCard() {
-        if (!::volumeLabel.isInitialized) return
+        if (!::volumeLabel.isInitialized || !::volBar.isInitialized) return
+        volBar.progress = currentVol.coerceIn(0, volMax)
         if (isMuted) {
             volumeLabel.text = "🔇 MUTE"
             volumeLabel.setTextColor(C_RED)
+            volBar.progressTintList = ColorStateList.valueOf(C_RED)
         } else {
             volumeLabel.text = volShortText(currentVol)
             volumeLabel.setTextColor(C_GREEN)
+            volBar.progressTintList = ColorStateList.valueOf(C_GREEN)
         }
     }
 
@@ -1082,42 +970,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun updateNowPlayingCardFromMeta() {
-        updateMainDisplayHeader()
-        if (!::nowPlayingTitle.isInitialized) return
-
-        val presetName = if (activeFavIndex > 0) favStations[activeFavIndex] else null
-        val l1 = playMetaLines[1]?.second.orEmpty()
-        val l2 = playMetaLines[2]?.second.orEmpty()
-        val l3 = playMetaLines[3]?.second.orEmpty()
-        val l4 = playMetaLines[4]?.second.orEmpty()
-        val l5 = playMetaLines[5]?.second.orEmpty()
-        val l6 = playMetaLines[6]?.second.orEmpty()
-
-        val stationTitle = when {
-            !presetName.isNullOrBlank() -> "$activeFavIndex. $presetName"
-            activeStationName.isNotBlank() -> activeStationName
-            l1.isNotBlank() -> l1
-            else -> "Prehrávanie z Favorites"
-        }
-        nowPlayingTitle.text = "📻 $stationTitle"
-
-        val trackParts = listOf(l1, l2, l3).filter {
-            it.isNotBlank() && !it.equals(presetName, ignoreCase = true)
-        }.distinct()
-        nowPlayingSub.text = if (trackParts.isNotEmpty())
-            trackParts.joinToString("  ·  ")
-        else
-            "Relácia / Skladba: —"
-
-        val techParts = listOf(l4, l5, l6).filter { it.isNotBlank() }.distinct().toMutableList()
-        if (playTimeText.isNotBlank()) techParts.add("Čas: $playTimeText")
-        nowPlayingMeta.text = if (techParts.isNotEmpty())
-            techParts.joinToString("   ·   ")
-        else
-            "Formát / Bitrate: —"
-    }
-
     private fun updateMuteButton() {
         muteBtn.text = if (isMuted) "🔊 ODMUTOVAŤ" else "🔇 MUTE"
         highlightBtn(muteBtn, isMuted, C_RED)
@@ -1163,33 +1015,6 @@ class MainActivity : AppCompatActivity() {
         return sb.toString().trim()
     }
 
-    // =====================================================================
-    // HLASITOST — posuvnik posiela az po pusteni, s pevnym poctom krokov
-    // =====================================================================
-
-    private fun seekVolume(target: Int) {
-        seekJob?.cancel()
-        volSlider.isEnabled = false
-        seekJob = scope.launch(Dispatchers.IO) {
-            try {
-                val diff = target - currentVol
-                if (diff != 0) {
-                    val cmd = if (diff > 0) "VU" else "VD"
-                    repeat(minOf(abs(diff), 100)) {
-                        outWriter?.let {
-                            it.write(cmd + "\r\n")
-                            it.flush()
-                        }
-                        delay(50)
-                    }
-                }
-                sendSilent("?V")
-            } finally {
-                ui { volSlider.isEnabled = true }
-            }
-        }
-    }
-
     private fun toggleMute() {
         send(if (isMuted) "MF" else "MO")
         sendSilent("?M")
@@ -1206,13 +1031,11 @@ class MainActivity : AppCompatActivity() {
             statusText.text = ""
         }
         scope.launch(Dispatchers.IO) {
-            // 1. Najprv skúsime poslednú uloženú IP adresu
             if (probe(host)) {
                 saveHostIp(host)
                 connect(silentFail = false)
                 return@launch
             }
-            // 2. Ak uložená IP neodpovedá, automaticky prehľadáme sieť a pripojíme nájdený receiver
             ui {
                 connLine.text = "○ Uložená IP $host neodpovedá"
                 connLine.setTextColor(C_RED)
@@ -1757,7 +1580,6 @@ class MainActivity : AppCompatActivity() {
                     val v = line.substring(3).trim().toIntOrNull() ?: return@ui
                     currentVol = v
                     updateVolumeCard()
-                    volSlider.progress = v.coerceIn(0, volMax)
                 }
                 line.startsWith("MUT") -> {
                     isMuted = line.startsWith("MUT0")
@@ -1782,7 +1604,6 @@ class MainActivity : AppCompatActivity() {
                     styleInputButtons()
                     updateMainDisplayHeader()
                 }
-                // Spätná väzba pre priestorový režim: SRxxxx (nastavený režim) alebo LMxxxx (aktuálny dekodér)
                 line.startsWith("SR") && line.length >= 6 -> {
                     val code = line.substring(2, 6) + "SR"
                     val m = modes.entries.firstOrNull { it.value == code }
@@ -1812,7 +1633,6 @@ class MainActivity : AppCompatActivity() {
                 line == "PWR0" -> { isOn = true; updatePowerButton() }
                 line == "PWR2" || line == "PWR1" -> { isOn = false; updatePowerButton() }
                 line.startsWith("E0") -> {
-                    // Chybové kódy Pioneer (E02 = NOT AVAILABLE NOW, E04 = COMMAND ERROR, E06 = PARAMETER ERROR)
                     val errDesc = when (line) {
                         "E02" -> "Príkaz teraz nie je dostupný (E02)"
                         "E03" -> "Neplatný príkaz (E03)"
@@ -1826,9 +1646,6 @@ class MainActivity : AppCompatActivity() {
                     val txt = decodeFlHex(line.substring(4))
                     if (txt.isNotEmpty()) {
                         lastFlText = txt
-                        if (::nowPlayingFl.isInitialized) {
-                            nowPlayingFl.text = "Displej receivera: $txt"
-                        }
                         updateMainDisplayHeader()
                     }
                 }
@@ -1850,11 +1667,10 @@ class MainActivity : AppCompatActivity() {
                     val raw = line.substring(3).trim()
                     if (raw.length >= 4) {
                         playTimeText = raw
-                        updateNowPlayingCardFromMeta()
+                        updateMainDisplayHeader()
                     }
                 }
                 line.startsWith("GEH") || line.startsWith("GEP") -> {
-                    // GEP + riadok(01..08) + fokus(0/1) + dataType(2 znaky) + "Text"
                     val idx = line.substring(3, 5).toIntOrNull()
                     val title = line.substringAfter("\"", "").substringBeforeLast("\"", "")
                     val typeCode = if (line.length >= 8) line.substring(6, 8) else "01"
@@ -1870,7 +1686,7 @@ class MainActivity : AppCompatActivity() {
                             } else {
                                 playMetaLines.remove(idx)
                             }
-                            updateNowPlayingCardFromMeta()
+                            updateMainDisplayHeader()
                         } else if (isSyncingFavorites || favStations.size < 8) {
                             listScreenReady = true
                             if (title.isNotEmpty() && !title.startsWith("[")) {
