@@ -1,16 +1,22 @@
 // ============================================================================
-// Pioneer VSX-S510 Remote — verzia 12
-// - Opravený vstup SAT/CBL (06FN) + pridaný vstup TV (05FN)
-// - Hlavička s okrúhlym prepínačom ON/OFF napravo
-// - Screen 2 (RÁDIO):
-//     * Ochrana tlačidiel predvolieb Favorites pred prepísaním údajmi o skladbe/bitrate:
-//       - Rozlíšenie podľa GEP/GEH Data Type kódu (00..04 = položka zoznamu vs. 20..30 = metadáta prehrávania)
-//       - Zápis do tlačidiel Favorites len počas synchronizácie zoznamu (isSyncingFavorites)
-//     * Spoľahlivé okamžité prepínanie predvolieb Favorites v ľubovoľnom poradí:
-//       - Ak už hrá stanica (Play obrazovka), vykoná sa tvrdý reštart vstupu Favorites
-//         (prepnutie 38FN -> 45FN + návrat 14NW), počká sa na načítanie zoznamu a ihneď spustí novú predvoľbu (xxGHP)
-//     * Spodný informačný displej s detailom prehrávanej stanice/skladby, bitrate a časom
-// - Screen 3 (MÉDIÁ): DLNA prehliadač + album fronta (nezmenené)
+// Pioneer VSX-S510 Remote — verzia 14
+// - Automatické pripojenie na poslednú uloženú IP adresu pri štarte; ak neodpovedá,
+//   automaticky prehľadá sieť, pripojí nájdený receiver a uloží novú IP adresu
+// - Hlavný displej (horná karta):
+//     * Hore výrazným písmom názov rádiovej stanice (alebo aktívny vstup/displej)
+//     * Pod ním menším písmom názov relácie/skladby a bitrate
+//     * Pod tým zvolený vstup a priestorový režim
+//     * Stav pripojenia (Pripojené + IP adresa / Odpojené + chybová hláška)
+//     * V dolnej časti displeja zelený posuvník hlasitosti + hodnota hlasitosti
+// - Odstránené tlačidlá HDMI 1 až HDMI 6 zo zoznamu vstupov
+// - Opravené príkazy pre priestorový zvuk (Surround) na VSX-S510 (0001SR, 0005SR,
+//   0006SR, 0009SR, 0010SR, 0151SR, 0013SR, 0014SR + dotaz ?S / ?L)
+// - Karta RÁDIO (Preferovaná 2. možnosť — výsuvný zoznam predvolieb):
+//     * Tlačidlo "⭐ FAVORITES (Zoznam)" a vedľa neho "⏹ ZASTAVIŤ"
+//     * Stlačenie FAVORITES zastaví prípadné prehrávanie (20NW + 14NW), načíta
+//       čerstvý zoznam z receivera a vysunie tabuľku s klikateľnými predvoľbami
+//     * Po kliknutí na predvoľbu sa stanica spustí (xxGHP) a zoznam sa zasunie (skryje)
+//     * Opätovné stlačenie FAVORITES preruší hrajúci stream a znova vysunie zoznam
 // ============================================================================
 
 package com.example.pioneerremote
@@ -22,6 +28,7 @@ import android.net.wifi.WifiManager
 import android.os.Bundle
 import android.text.InputType
 import android.view.Gravity
+import android.view.View
 import android.view.ViewGroup
 import android.widget.Button
 import android.widget.EditText
@@ -61,7 +68,7 @@ class MainActivity : AppCompatActivity() {
     private val port: Int = 8102
     private val volMax = 160
 
-    // ===== farby (tmavy dizajn ako v nahlade) =====
+    // ===== farby (tmavy dizajn) =====
     private val C_BG = 0xFF0B1220.toInt()
     private val C_CARD = 0xFF1E293B.toInt()
     private val C_CARD2 = 0xFF16202F.toInt()
@@ -87,54 +94,72 @@ class MainActivity : AppCompatActivity() {
     private var activeInput: String? = null
     private var activeMode: String? = null
     private var activeFavIndex: Int = -1
+    private var activeStationName: String = ""
     private var seekJob: Job? = null
-    private var favSwitchJob: Job? = null
+    private var favJob: Job? = null
     private var multicastLock: WifiManager.MulticastLock? = null
 
-    // ===== UI =====
+    // ===== Hlavný displej a ovládacie prvky =====
     private lateinit var ipEdit: EditText
-    private lateinit var statusText: TextView
-    private lateinit var volumeBig: TextView
+    private lateinit var mainStationBig: TextView
+    private lateinit var mainShowBitrate: TextView
     private lateinit var infoLine: TextView
-    private lateinit var radioLine: TextView
     private lateinit var connLine: TextView
-    private lateinit var flDisplayText: TextView
+    private lateinit var statusText: TextView
+    private lateinit var volumeLabel: TextView
     private lateinit var volSlider: SeekBar
     private lateinit var powerBtn: Button
     private lateinit var muteBtn: Button
+
     private val inputButtons = mutableMapOf<String, Button>()
     private val modeButtons = mutableMapOf<String, Button>()
     private val favButtons = mutableMapOf<Int, Button>()
 
-    // Opravené kódy vstupov pre Pioneer VSX-S510:
-    // SAT/CBL = 06FN, TV = 05FN
+    // Vstupy bez HDMI 1..6 (SAT/CBL = 06FN, TV = 05FN)
     private val inputs = linkedMapOf(
-        "BD" to "25FN", "CD" to "01FN", "DVR/BDR" to "15FN",
-        "DVD" to "04FN", "IPOD/USB" to "17FN", "SAT/CBL" to "06FN",
-        "TV" to "05FN", "TUNER" to "02FN", "VIDEO" to "10FN",
-        "MEDIA SRV" to "44FN", "NETRADIO" to "38FN", "FAVORITES" to "45FN",
-        "HDMI 1" to "19FN", "HDMI 2" to "20FN", "HDMI 3" to "21FN",
-        "HDMI 4" to "22FN", "HDMI 5" to "23FN", "HDMI 6" to "24FN"
+        "BD" to "25FN",
+        "CD" to "01FN",
+        "DVR/BDR" to "15FN",
+        "DVD" to "04FN",
+        "IPOD/USB" to "17FN",
+        "SAT/CBL" to "06FN",
+        "TV" to "05FN",
+        "TUNER" to "02FN",
+        "VIDEO" to "10FN",
+        "MEDIA SRV" to "44FN",
+        "NETRADIO" to "38FN",
+        "FAVORITES" to "45FN"
     )
 
+    // Opravené príkazy pre priestorový zvuk na Pioneer VSX-S510:
+    // 0001SR = STEREO, 0005SR = AUTO SURR/STREAM DIRECT, 0006SR = DIRECT,
+    // 0009SR = STEREO (DIRECT), 0151SR = AUTO LEVEL CONTROL, 0010SR = STANDARD (PLII),
+    // 0013SR = PRO LOGIC2 MOVIE, 0014SR = PRO LOGIC2 MUSIC, 0100SR = ADVANCED SURROUND (cycle)
     private val modes = linkedMapOf(
         "STEREO" to "0001SR",
-        "DIRECT" to "0004SR",
-        "PURE DIRECT" to "0006SR",
-        "AUTO SURR." to "0007SR",
-        "PLII MOVIE" to "0016SR",
-        "PLII MUSIC" to "0017SR"
+        "AUTO SURR." to "0005SR",
+        "DIRECT" to "0006SR",
+        "ALC / PURE" to "0151SR",
+        "PLII MOVIE" to "0013SR",
+        "PLII MUSIC" to "0014SR",
+        "STANDARD" to "0010SR",
+        "ADV. SURR." to "0100SR"
     )
 
-    // ===== FAVORITES A DETAIL PREHRAVANIA NA KARTE RADIO =====
-    private lateinit var favGridContainer: LinearLayout
+    // ===== KARTA RÁDIO (Výsuvný zoznam predvolieb + detail prehrávania) =====
+    private lateinit var favToggleBtn: Button
+    private lateinit var favStopBtn: Button
+    private lateinit var favDrawerCard: LinearLayout
+    private lateinit var favDrawerStatus: TextView
+    private lateinit var favTableContainer: LinearLayout
+    private var isFavListExpanded: Boolean = false
+
     private lateinit var nowPlayingTitle: TextView
     private lateinit var nowPlayingSub: TextView
     private lateinit var nowPlayingMeta: TextView
     private lateinit var nowPlayingFl: TextView
 
-    // Uzamknutý zoznam Favorites staníc (index 1..8 -> názov stanice),
-    // chránený pred prepísaním metadátami prehrávanej skladby
+    // Načítané stanice vo Favorites (poradie 1..N -> názov)
     private val favStations = linkedMapOf<Int, String>()
     // Metadáta z obrazovky prehrávania (riadok 1..8 -> Pair(typeCode, text))
     private val playMetaLines = mutableMapOf<Int, Pair<String, String>>()
@@ -143,6 +168,7 @@ class MainActivity : AppCompatActivity() {
     @Volatile private var nwScreenType: String = ""
     @Volatile private var listScreenReady: Boolean = false
     private var playTimeText: String = ""
+    private var lastFlText: String = ""
 
     // ===== DLNA =====
     private data class MediaEntry(
@@ -177,11 +203,16 @@ class MainActivity : AppCompatActivity() {
         mediaServerName = p.getString("dlnaName", "") ?: ""
         loadCachedFavorites()
         buildUI()
-        connect()
+
         val wifi = applicationContext.getSystemService(WIFI_SERVICE) as WifiManager
         multicastLock = wifi.createMulticastLock("pioneerSSDP").apply {
             setReferenceCounted(false); acquire()
         }
+
+        // Po zapnutí aplikácie ihneď skúsime poslednú uloženú IP adresu;
+        // ak neodpovedá, automaticky prehľadáme sieť, pripojíme nájdený receiver a IP uložíme.
+        autoConnectOrDiscoverOnStartup()
+
         if (mediaServerDesc != null) initMediaServer(mediaServerDesc!!)
     }
 
@@ -193,6 +224,16 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun prefs() = getSharedPreferences("pioneer", MODE_PRIVATE)
+
+    private fun saveHostIp(newIp: String) {
+        host = newIp.trim()
+        prefs().edit().putString("host", host).apply()
+        ui {
+            if (::ipEdit.isInitialized && ipEdit.text.toString() != host) {
+                ipEdit.setText(host)
+            }
+        }
+    }
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 
@@ -225,7 +266,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // Filter, ktorý zabráni, aby sa bitrate, formát alebo čas uložil ako názov predvoľby
     private fun looksLikeMetadata(text: String): Boolean {
         val t = text.trim()
         if (t.isEmpty()) return true
@@ -312,7 +352,7 @@ class MainActivity : AppCompatActivity() {
         tv.textSize = 13f
         tv.typeface = Typeface.DEFAULT_BOLD
         tv.setTextColor(C_SLATE)
-        tv.setPadding(0, dp(12), 0, dp(6))
+        tv.setPadding(0, dp(10), 0, dp(4))
         return tv
     }
 
@@ -322,7 +362,7 @@ class MainActivity : AppCompatActivity() {
         tv.textSize = 10f
         tv.setTextColor(C_DIM)
         tv.gravity = Gravity.CENTER
-        tv.setPadding(0, dp(14), 0, dp(8))
+        tv.setPadding(0, dp(12), 0, dp(8))
         return tv
     }
 
@@ -331,15 +371,15 @@ class MainActivity : AppCompatActivity() {
     // =====================================================================
 
     private fun buildUI() {
-        val pad = dp(14)
+        val pad = dp(12)
         val root = LinearLayout(this)
         root.orientation = LinearLayout.VERTICAL
         root.setBackgroundColor(C_BG)
-        root.setPadding(pad, dp(10), pad, 0)
+        root.setPadding(pad, dp(8), pad, 0)
 
-        // Hlavicka: vycentrovany nazov + podnadpis a napravo okruhla gulicka ON/OFF
+        // Hlavička: vycentrovaný názov + podnadpis a napravo okrúhla gulička ON/OFF
         val header = FrameLayout(this)
-        header.setPadding(0, 0, 0, dp(8))
+        header.setPadding(0, 0, 0, dp(6))
 
         val titleBox = LinearLayout(this)
         titleBox.orientation = LinearLayout.VERTICAL
@@ -347,7 +387,7 @@ class MainActivity : AppCompatActivity() {
 
         val title = TextView(this)
         title.text = "Pioneer Remote"
-        title.textSize = 20f
+        title.textSize = 19f
         title.typeface = Typeface.DEFAULT_BOLD
         title.setTextColor(C_WHITE)
         title.gravity = Gravity.CENTER
@@ -366,7 +406,7 @@ class MainActivity : AppCompatActivity() {
             Gravity.CENTER
         ))
 
-        val circleSize = dp(42)
+        val circleSize = dp(40)
         powerBtn = Button(this)
         powerBtn.textSize = 11f
         powerBtn.typeface = Typeface.DEFAULT_BOLD
@@ -386,7 +426,7 @@ class MainActivity : AppCompatActivity() {
 
         root.addView(header)
 
-        // riadok: IP + hladanie + pripojenie
+        // Riadok: IP + vyhľadanie + pripojenie
         val top = LinearLayout(this)
         top.orientation = LinearLayout.HORIZONTAL
         ipEdit = EditText(this)
@@ -395,11 +435,11 @@ class MainActivity : AppCompatActivity() {
         ipEdit.inputType = InputType.TYPE_CLASS_PHONE
         ipEdit.setTextColor(C_WHITE)
         ipEdit.setHintTextColor(C_DIM)
-        ipEdit.textSize = 13f
+        ipEdit.textSize = 12f
         ipEdit.background = roundedBg(C_CARD2, 10, C_STROKE)
-        ipEdit.setPadding(dp(10), dp(8), dp(10), dp(8))
+        ipEdit.setPadding(dp(10), dp(6), dp(10), dp(6))
         top.addView(ipEdit, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        val scanBtn = pillBtn("🔍", C_BTN, C_WHITE) { discoverReceivers() }
+        val scanBtn = pillBtn("🔍", C_BTN, C_WHITE) { discoverReceivers(autoConnectFirst = false) }
         top.addView(scanBtn, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
         val connBtn = pillBtn("Pripoj", C_CYAN, C_ON_ACCENT) { connectPressed() }
@@ -407,57 +447,96 @@ class MainActivity : AppCompatActivity() {
             ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
         root.addView(top)
 
-        // stavova karta
+        // =================================================================
+        // HLAVNÝ DISPLEJ (KARTA HORE)
+        // 1. Výrazným písmom názov rádiovej stanice
+        // 2. Pod ním menším fontom názov relácie / skladby a bitrate
+        // 3. Pod tým zvolený vstup a režim
+        // 4. Stav pripojenia + IP adresa (alebo Odpojené + chybová hláška)
+        // 5. V dolnej časti displeja zelený posuvník hlasitosti
+        // =================================================================
         val card = LinearLayout(this)
         card.orientation = LinearLayout.VERTICAL
         card.setPadding(dp(12), dp(10), dp(12), dp(10))
         card.background = roundedBg(C_CARD, 18, C_CYAN_D)
-        volumeBig = TextView(this)
-        volumeBig.text = "🔊  —"
-        volumeBig.textSize = 22f
-        volumeBig.typeface = Typeface.DEFAULT_BOLD
-        volumeBig.setTextColor(C_WHITE)
-        volumeBig.gravity = Gravity.CENTER
+
+        mainStationBig = TextView(this)
+        mainStationBig.text = "📻  —"
+        mainStationBig.textSize = 20f
+        mainStationBig.typeface = Typeface.DEFAULT_BOLD
+        mainStationBig.setTextColor(C_WHITE)
+        mainStationBig.gravity = Gravity.CENTER
+        mainStationBig.maxLines = 2
+
+        mainShowBitrate = TextView(this)
+        mainShowBitrate.text = "Relácia / Skladba: —   ·   Bitrate: —"
+        mainShowBitrate.textSize = 12f
+        mainShowBitrate.setTextColor(C_CYAN)
+        mainShowBitrate.gravity = Gravity.CENTER
+        mainShowBitrate.setPadding(0, dp(2), 0, dp(2))
+
         infoLine = TextView(this)
         infoLine.text = "Vstup: —   ·   Režim: —"
-        infoLine.textSize = 13f
+        infoLine.textSize = 12f
         infoLine.setTextColor(C_SLATE)
         infoLine.gravity = Gravity.CENTER
-        radioLine = TextView(this)
-        radioLine.text = "Stanica: —"
-        radioLine.textSize = 13f
-        radioLine.setTextColor(C_DIM)
-        radioLine.gravity = Gravity.CENTER
+
         connLine = TextView(this)
-        connLine.text = "○  Odpojené"
+        connLine.text = "○  Odpojené ($host)"
         connLine.textSize = 11f
         connLine.setTextColor(C_RED)
         connLine.gravity = Gravity.CENTER
+
         statusText = TextView(this)
         statusText.text = ""
         statusText.textSize = 11f
-        statusText.setTextColor(C_DIM)
+        statusText.setTextColor(C_ORANGE)
         statusText.gravity = Gravity.CENTER
-        flDisplayText = TextView(this)
-        flDisplayText.text = "📟 Displej: —"
-        flDisplayText.textSize = 13f
-        flDisplayText.typeface = Typeface.MONOSPACE
-        flDisplayText.setTextColor(C_CYAN)
-        flDisplayText.gravity = Gravity.CENTER
-        flDisplayText.setPadding(dp(6), dp(2), dp(6), dp(2))
 
-        card.addView(volumeBig)
-        card.addView(flDisplayText)
+        // Zelený posuvník hlasitosti v dolnej časti hlavného displeja
+        val volBox = LinearLayout(this)
+        volBox.orientation = LinearLayout.HORIZONTAL
+        volBox.gravity = Gravity.CENTER_VERTICAL
+        volBox.setPadding(dp(6), dp(6), dp(6), dp(2))
+
+        volumeLabel = TextView(this)
+        volumeLabel.text = "🔊 —"
+        volumeLabel.textSize = 13f
+        volumeLabel.typeface = Typeface.DEFAULT_BOLD
+        volumeLabel.setTextColor(C_GREEN)
+        volumeLabel.setPadding(0, 0, dp(8), 0)
+
+        volSlider = SeekBar(this)
+        volSlider.max = volMax
+        volSlider.progressTintList = ColorStateList.valueOf(C_GREEN)
+        volSlider.thumbTintList = ColorStateList.valueOf(C_GREEN)
+        volSlider.progressBackgroundTintList = ColorStateList.valueOf(C_STROKE)
+        volSlider.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(s: SeekBar?, p: Int, fromUser: Boolean) {
+                if (fromUser) volumeLabel.text = volShortText(p)
+            }
+            override fun onStartTrackingTouch(s: SeekBar?) {}
+            override fun onStopTrackingTouch(s: SeekBar?) { seekVolume(s?.progress ?: 0) }
+        })
+
+        volBox.addView(volumeLabel, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        volBox.addView(volSlider, LinearLayout.LayoutParams(
+            0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+
+        card.addView(mainStationBig)
+        card.addView(mainShowBitrate)
         card.addView(infoLine)
-        card.addView(radioLine)
         card.addView(connLine)
         card.addView(statusText)
-        val cardLp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT)
-        cardLp.topMargin = dp(8)
+        card.addView(volBox)
+
+        val cardLp = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+        cardLp.topMargin = dp(6)
         root.addView(card, cardLp)
 
-        // tabs
+        // Prepínače kariet (tabs)
         val tabDefs = listOf("🎚 OVLÁDANIE", "📻 RÁDIO", "💽 MÉDIÁ")
         val tabBtns = tabDefs.map { t -> pillBtn(t, C_BTN, C_SLATE) { } }
         val tabs = LinearLayout(this)
@@ -465,12 +544,12 @@ class MainActivity : AppCompatActivity() {
         tabBtns.forEach { b ->
             tabs.addView(b, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         }
-        val tabsLp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT)
-        tabsLp.topMargin = dp(8)
+        val tabsLp = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+        tabsLp.topMargin = dp(6)
         root.addView(tabs, tabsLp)
 
-        // swipe screeny
+        // Swipe obrazovky
         val pager = ViewPager2(this)
         pager.layoutParams = LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
@@ -492,9 +571,6 @@ class MainActivity : AppCompatActivity() {
         pager.registerOnPageChangeCallback(object : ViewPager2.OnPageChangeCallback() {
             override fun onPageSelected(position: Int) {
                 tabBtns.forEachIndexed { i, b -> styleTab(b, i == position) }
-                if (position == 1) {
-                    ensureFavoritesLoaded()
-                }
             }
         })
         tabBtns.forEachIndexed { i, b ->
@@ -502,19 +578,19 @@ class MainActivity : AppCompatActivity() {
         }
         styleTab(tabBtns[0], true)
 
-        // MUTE / VSTUP pod prepinacmi screenov, kazde na polovicu sirky
+        // MUTE / VSTUP pod prepínačmi kariet
         muteBtn = flatBtn("🔇 MUTE") { toggleMute() }
         val vstupBtn = flatBtn("VSTUP ▶") { send("FU"); sendSilent("?F") }
-        muteBtn.textSize = 14f; vstupBtn.textSize = 14f
+        muteBtn.textSize = 13f; vstupBtn.textSize = 13f
         val muteLp = LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
-        muteLp.topMargin = dp(8)
+        muteLp.topMargin = dp(6)
         root.addView(rowOf(listOf(muteBtn, vstupBtn)), muteLp)
 
-        // VOL − / VOL + pod nimi
+        // Tlačidlá hlasitosti VOL − / VOL + ostávajú ako boli
         val volMinus = flatBtn("VOL −") { send("VD"); sendSilent("?V") }
         val volPlus = flatBtn("VOL +") { send("VU"); sendSilent("?V") }
-        volMinus.textSize = 14f; volPlus.textSize = 14f
+        volMinus.textSize = 13f; volPlus.textSize = 13f
         root.addView(rowOf(listOf(volMinus, volPlus)))
 
         root.addView(pager)
@@ -529,86 +605,73 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun connectPressed() {
-        host = ipEdit.text.toString().trim()
+        val entered = ipEdit.text.toString().trim()
+        if (entered.isNotEmpty()) {
+            saveHostIp(entered)
+        }
         avtControlUrl = null
-        prefs().edit().putString("host", host).apply()
-        connect()
+        connect(silentFail = false)
     }
 
     // =====================================================================
-    // SCREEN 1 — OVLADANIE
+    // SCREEN 1 — OVLADANIE (VSTUPY BEZ HDMI 1-6 + OPRAVENY PRIESTOROVY ZVUK)
     // =====================================================================
 
     private fun buildScreenHome(): ScrollView {
         val page = LinearLayout(this)
         page.orientation = LinearLayout.VERTICAL
-        page.setPadding(0, dp(6), 0, dp(8))
+        page.setPadding(0, dp(4), 0, dp(8))
         val sv = ScrollView(this)
         sv.addView(page, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
-
-        val sc = LinearLayout(this)
-        sc.orientation = LinearLayout.HORIZONTAL
-        sc.gravity = Gravity.CENTER_VERTICAL
-        sc.setPadding(dp(12), dp(4), dp(12), dp(4))
-        sc.background = roundedBg(C_CARD2, 14)
-        val lblMin = TextView(this)
-        lblMin.text = "−80"; lblMin.textSize = 12f; lblMin.setTextColor(C_DIM)
-        val lblMax = TextView(this)
-        lblMax.text = "+80"; lblMax.textSize = 12f; lblMax.setTextColor(C_DIM)
-        volSlider = SeekBar(this)
-        volSlider.max = volMax
-        volSlider.progressTintList = ColorStateList.valueOf(C_CYAN)
-        volSlider.thumbTintList = ColorStateList.valueOf(C_CYAN)
-        volSlider.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-            override fun onProgressChanged(s: SeekBar?, p: Int, fromUser: Boolean) {
-                if (fromUser) volumeBig.text = volText(p)
-            }
-            override fun onStartTrackingTouch(s: SeekBar?) {}
-            override fun onStopTrackingTouch(s: SeekBar?) { seekVolume(s?.progress ?: 0) }
-        })
-        sc.addView(lblMin, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
-        sc.addView(volSlider, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        sc.addView(lblMax, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
-        val scLp = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
-            ViewGroup.LayoutParams.WRAP_CONTENT)
-        scLp.topMargin = dp(10)
-        page.addView(sc, scLp)
 
         page.addView(sectionLabel("VÝBER VSTUPU"))
         val ib = mutableListOf<Button>()
         inputs.forEach { (name, code) ->
             val b = flatBtn(name) {
                 if (code != "45FN") isPlayingFavorite = false
-                send(code); sendSilent("?F")
+                send(code)
+                sendSilent("?F")
                 activeInput = name
-                updateInfoLine(); styleInputButtons()
+                updateInfoLine()
+                styleInputButtons()
+                updateMainDisplayHeader()
             }
             inputButtons[name] = b
             ib.add(b)
         }
-        page.addView(makeGrid(ib))
+        page.addView(makeGrid(ib, 3))
 
-        page.addView(sectionLabel("PRIESTOROVÝ REŽIM"))
+        page.addView(sectionLabel("PRIESTOROVÝ REŽIM (SURROUND)"))
         val mb = mutableListOf<Button>()
         modes.forEach { (name, code) ->
             val b = flatBtn(name) {
-                send(code)
-                activeMode = name
-                updateInfoLine(); styleModeButtons()
+                setListeningMode(name, code)
             }
             modeButtons[name] = b
             mb.add(b)
         }
-        page.addView(makeGrid(mb))
+        page.addView(makeGrid(mb, 2))
         page.addView(hint("← swipe na rádio →"))
         return sv
     }
 
+    // Opravené prepínanie priestorového zvuku pre Pioneer VSX-S510:
+    // Pošle príkaz xxxxSR a následne si vyžiada potvrdenie ?S (Listening Mode Set) aj ?L (Playing Listening Mode)
+    private fun setListeningMode(name: String, code: String) {
+        activeMode = name
+        updateInfoLine()
+        styleModeButtons()
+        scope.launch(Dispatchers.IO) {
+            sendSilent(code)
+            delay(250)
+            sendSilent("?S")
+            sendSilent("?L")
+        }
+    }
+
     // =====================================================================
-    // SCREEN 2 — RADIO (IBA ZOZNAM FAVORITES AKO TLACIDLA + DOLNY DISPLEJ)
+    // SCREEN 2 — RADIO (DRUHA MOZNOST: VYSUVNY ZOZNAM FAVORITES + STOP)
     // =====================================================================
 
     private fun buildScreenRadio(): ScrollView {
@@ -619,30 +682,50 @@ class MainActivity : AppCompatActivity() {
         sv.addView(page, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
 
-        val hdrRow = LinearLayout(this)
-        hdrRow.orientation = LinearLayout.HORIZONTAL
-        hdrRow.gravity = Gravity.CENTER_VERTICAL
-        hdrRow.setPadding(0, dp(6), 0, dp(6))
-
-        val lbl = TextView(this)
-        lbl.text = "OBĽÚBENÉ STANICE (FAVORITES)"
-        lbl.textSize = 13f
-        lbl.typeface = Typeface.DEFAULT_BOLD
-        lbl.setTextColor(C_SLATE)
-        hdrRow.addView(lbl, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-
-        val syncBtn = pillBtn("🔄 Obnoviť zoznam", C_CARD2, C_CYAN) {
-            syncFavoritesFromReceiver(forceClear = true)
+        // Horné dve tlačidlá vedľa seba:
+        // 1. ⭐ FAVORITES (vysunie zoznam / ak hrá stream, preruší ho a znova vysunie zoznam)
+        // 2. ⏹ ZASTAVIŤ (zastaví prehrávanie streamu)
+        favToggleBtn = flatBtn("⭐ FAVORITES (Načítať zoznam)") {
+            onFavoritesButtonClicked()
         }
-        hdrRow.addView(syncBtn, LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
-        page.addView(hdrRow)
+        favToggleBtn.background = roundedBg(C_CYAN_D, 12, C_CYAN)
+        favToggleBtn.setTextColor(C_WHITE)
+        favToggleBtn.typeface = Typeface.DEFAULT_BOLD
 
-        // Kontajner pre tlačidlá predvolieb Favorites
-        favGridContainer = LinearLayout(this)
-        favGridContainer.orientation = LinearLayout.VERTICAL
-        page.addView(favGridContainer)
-        renderFavoriteButtons()
+        favStopBtn = flatBtn("⏹ ZASTAVIŤ") {
+            stopFavoriteStream()
+        }
+        favStopBtn.background = roundedBg(C_RED, 12, C_RED)
+        favStopBtn.setTextColor(C_WHITE)
+        favStopBtn.typeface = Typeface.DEFAULT_BOLD
+
+        page.addView(rowOf(listOf(favToggleBtn, favStopBtn)))
+
+        // Výsuvný kontajner so zoznamom predvolieb (zobrazí sa po stlačení FAVORITES,
+        // po kliknutí na predvoľbu sa automaticky zasunie/skryje)
+        favDrawerCard = LinearLayout(this)
+        favDrawerCard.orientation = LinearLayout.VERTICAL
+        favDrawerCard.setPadding(dp(10), dp(10), dp(10), dp(10))
+        favDrawerCard.background = roundedBg(C_CARD, 14, C_CYAN)
+        val drawerLp = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+        drawerLp.topMargin = dp(6)
+        favDrawerCard.layoutParams = drawerLp
+        favDrawerCard.visibility = View.GONE
+
+        favDrawerStatus = TextView(this)
+        favDrawerStatus.text = "Vyber predvoľbu zo zoznamu receivera:"
+        favDrawerStatus.textSize = 12f
+        favDrawerStatus.setTextColor(C_CYAN)
+        favDrawerStatus.setPadding(dp(4), 0, dp(4), dp(6))
+        favDrawerCard.addView(favDrawerStatus)
+
+        favTableContainer = LinearLayout(this)
+        favTableContainer.orientation = LinearLayout.VERTICAL
+        favDrawerCard.addView(favTableContainer)
+
+        page.addView(favDrawerCard)
+        renderFavoriteTable()
 
         // Spodný displej s detailom prehrávanej skladby / stanice, bitrate a ostatnými údajmi
         page.addView(sectionLabel("DETAIL PREHRÁVANIA"))
@@ -658,7 +741,7 @@ class MainActivity : AppCompatActivity() {
         nowPlayingTitle.setTextColor(C_WHITE)
 
         nowPlayingSub = TextView(this)
-        nowPlayingSub.text = "Skladba / Interpret: —"
+        nowPlayingSub.text = "Relácia / Skladba: —"
         nowPlayingSub.textSize = 13f
         nowPlayingSub.setTextColor(C_CYAN)
         nowPlayingSub.setPadding(0, dp(4), 0, 0)
@@ -686,9 +769,10 @@ class MainActivity : AppCompatActivity() {
         return sv
     }
 
-    private fun renderFavoriteButtons() {
-        if (!::favGridContainer.isInitialized) return
-        favGridContainer.removeAllViews()
+    // Vykreslí tabuľku predvolieb zoradenú presne tak, ako sú uložené v receiveri
+    private fun renderFavoriteTable() {
+        if (!::favTableContainer.isInitialized) return
+        favTableContainer.removeAllViews()
         favButtons.clear()
 
         val entriesToRender = if (favStations.isNotEmpty()) {
@@ -697,61 +781,182 @@ class MainActivity : AppCompatActivity() {
             (1..8).map { it to "Predvoľba $it" }
         }
 
-        val btns = entriesToRender.map { (idx, name) ->
-            val b = flatBtn("$idx. $name") {
-                selectFavoritePreset(idx, name)
+        entriesToRender.forEach { (idx, name) ->
+            val b = flatBtn("$idx.  📻  $name") {
+                onFavoritePresetSelected(idx, name)
             }
             b.gravity = Gravity.START or Gravity.CENTER_VERTICAL
-            b.setPadding(dp(12), dp(10), dp(12), dp(10))
+            b.textSize = 13f
+            b.setPadding(dp(14), dp(10), dp(14), dp(10))
+            highlightBtn(b, idx == activeFavIndex)
             favButtons[idx] = b
-            highlightBtn(b, idx == activeFavIndex)
-            b
-        }
-        favGridContainer.addView(makeGrid(btns, 2))
-    }
 
-    private fun styleFavButtons() {
-        favButtons.forEach { (idx, b) ->
-            highlightBtn(b, idx == activeFavIndex)
+            val lp = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT
+            )
+            lp.topMargin = dp(4)
+            favTableContainer.addView(b, lp)
         }
     }
 
-    private fun ensureFavoritesLoaded() {
-        if (favStations.isEmpty()) {
-            syncFavoritesFromReceiver(forceClear = false)
-        } else {
+    private fun setFavDrawerExpanded(expanded: Boolean) {
+        isFavListExpanded = expanded
+        if (::favDrawerCard.isInitialized) {
+            favDrawerCard.visibility = if (expanded) View.VISIBLE else View.GONE
+        }
+        if (::favToggleBtn.isInitialized) {
+            favToggleBtn.text = if (expanded) "⭐ FAVORITES (Skryť ▲)" else "⭐ FAVORITES (Zoznam ▼)"
+        }
+    }
+
+    // Preferovaná 2. možnosť:
+    // - Stlačenie tlačidla FAVORITES preruší prípadné prehrávanie hrajúceho streamu,
+    //   vráti receiver do koreňového zoznamu Favorites, načíta predvoľby a vysunie zoznam.
+    // - Ak už je zoznam vysunutý a nič nehrá, stlačením sa zoznam zasunie.
+    private fun onFavoritesButtonClicked() {
+        if (isFavListExpanded && !isPlayingFavorite) {
+            setFavDrawerExpanded(false)
+            return
+        }
+
+        favJob?.cancel()
+        setFavDrawerExpanded(true)
+        favDrawerStatus.text = "⏳ Zastavujem prehrávanie a načítavam zoznam Favorites…"
+        renderFavoriteTable()
+
+        favJob = scope.launch(Dispatchers.IO) {
+            try {
+                isSyncingFavorites = true
+                isPlayingFavorite = false
+                if (!isOn) {
+                    sendSilent("PO")
+                    delay(2500)
+                }
+
+                // Prerušíme prípadný hrajúci stream a vrátime receiver do koreňového zoznamu Favorites
+                returnReceiverToFavoritesList()
+
+                // Vyžiadame čerstvý zoznam predvolieb z receivera
+                sendSilent("?GAP")
+                sendSilent("?GAH")
+                sendSilent("?FL")
+                delay(700)
+                sendSilent("?GAP")
+                delay(500)
+
+                ui {
+                    favDrawerStatus.text = "Klikni na predvoľbu pre spustenie (zoznam sa automaticky zasunie):"
+                    renderFavoriteTable()
+                }
+            } finally {
+                isSyncingFavorites = false
+            }
+        }
+    }
+
+    // Po kliknutí na predvoľbu v tabuľke:
+    // 1. Zoznam predvolieb sa okamžite zasunie (skryje pod tlačidlá)
+    // 2. Spustí sa zvolená predvoľba (keďže pri vysunutí zoznamu už bolo prehrávanie zastavené
+    //    a receiver čaká priamo v zozname Favorites, príkaz xxGHP okamžite zafunguje!)
+    private fun onFavoritePresetSelected(index: Int, name: String) {
+        favJob?.cancel()
+        activeFavIndex = index
+        val stationTitle = favStations[index] ?: name
+        activeStationName = stationTitle
+
+        // Zasunieme zoznam predvolieb pod tlačidlá
+        setFavDrawerExpanded(false)
+
+        // Aktualizujeme hlavný aj spodný displej
+        nowPlayingTitle.text = "📻 $index. $stationTitle"
+        nowPlayingSub.text = "Spúšťam predvoľbu $index…"
+        nowPlayingMeta.text = "Načítavam stream…"
+        updateMainDisplayHeader()
+
+        favJob = scope.launch(Dispatchers.IO) {
+            isSyncingFavorites = false
+            isPlayingFavorite = true
+            playMetaLines.clear()
+
+            if (!isOn) {
+                sendSilent("PO")
+                delay(2500)
+            }
+
+            if (activeInput != "FAVORITES" && activeInput != "45FN") {
+                sendSilent("45FN")
+                sendSilent("?F")
+                delay(1400)
+            }
+
+            // Receiver je pripravený v zozname Favorites -> pošleme priamu voľbu riadku (xxGHP)
+            val ghpCmd = String.format("%02dGHP", index)
+            sendSilent(ghpCmd)
+            delay(400)
+            sendSilent("10NW") // potvrdenie Play
+
+            // Počkáme na nabehnutie streamu a načítame metadáta relácie a bitrate
+            delay(1400)
+            sendSilent("?GAP")
+            sendSilent("?GAH")
+            sendSilent("?FL")
+            delay(1600)
             sendSilent("?GAP")
             sendSilent("?FL")
         }
     }
 
-    // Vynúti návrat receivera do koreňového zoznamu Favorites (List Screen) a načíta názvy staníc
-    private suspend fun forceReturnToFavoritesList() {
+    // Tlačidlo ⏹ ZASTAVIŤ vedľa FAVORITES:
+    // Zastaví prehrávanie streamu a vráti receiver do zoznamu Favorites
+    private fun stopFavoriteStream() {
+        favJob?.cancel()
+        isPlayingFavorite = false
+        activeFavIndex = -1
+        activeStationName = ""
+        playMetaLines.clear()
+        playTimeText = ""
+
+        nowPlayingTitle.text = "⏹ Prehrávanie zastavené"
+        nowPlayingSub.text = "Relácia / Skladba: —"
+        nowPlayingMeta.text = "Formát / Bitrate: —"
+        updateMainDisplayHeader()
+        renderFavoriteTable()
+
+        favJob = scope.launch(Dispatchers.IO) {
+            sendSilent("20NW")
+            delay(300)
+            sendSilent("14NW")
+            delay(400)
+            sendSilent("?FL")
+            sendSilent("?GAP")
+        }
+    }
+
+    // Spoľahlivý návrat receivera z hrajúceho streamu do koreňového zoznamu Favorites
+    private suspend fun returnReceiverToFavoritesList() {
         listScreenReady = false
         if (activeInput != "FAVORITES" && activeInput != "45FN") {
             sendSilent("45FN")
             sendSilent("?F")
-            // Čakáme na načítanie zoznamu Favorites (max 2.2 s)
-            for (step in 0 until 11) {
+            for (step in 0 until 10) {
                 delay(200)
                 if (listScreenReady) return
             }
             return
         }
 
-        // Ak už sme vo FAVORITES a práve hrá stanica (alebo je receiver na Play obrazovke),
-        // samotné 14NW/20NW na VSX-S510 často nestačí, pretože zoznam Favorites ostane zamknutý v streame.
-        // Najprv skúsime Stop (20NW) + Return (14NW):
+        // 1. Zastavíme stream (20NW) a vrátime sa o úroveň späť do zoznamu (14NW)
         sendSilent("20NW")
-        delay(250)
+        delay(300)
         sendSilent("14NW")
-        delay(350)
+        delay(400)
         sendSilent("?GAP")
         delay(350)
 
+        // 2. Ak receiver stále neohlásil zoznam (zostal visieť v Play obrazovke),
+        // urobíme rýchly reset vstupu: 38FN (NetRadio) -> 45FN (Favorites)
         if (!listScreenReady) {
-            // Tvrdý reštart zoznamu Favorites: krátko prepneme na 38FN (NetRadio) a hneď späť na 45FN (Favorites).
-            // Týmto receiver na 100 % opustí prehrávaný stream a otvorí čistý zoznam Favorites od položky 1!
             sendSilent("38FN")
             delay(450)
             sendSilent("45FN")
@@ -760,97 +965,6 @@ class MainActivity : AppCompatActivity() {
                 delay(200)
                 if (listScreenReady) break
             }
-        }
-    }
-
-    private fun syncFavoritesFromReceiver(forceClear: Boolean) {
-        favSwitchJob?.cancel()
-        if (forceClear) {
-            favStations.clear()
-            saveCachedFavorites()
-            renderFavoriteButtons()
-        }
-        statusText.text = "🔄 Načítavam zoznam Favorites z receivera…"
-        favSwitchJob = scope.launch(Dispatchers.IO) {
-            try {
-                isSyncingFavorites = true
-                isPlayingFavorite = false
-                if (!isOn) {
-                    sendSilent("PO")
-                    delay(2500)
-                }
-                forceReturnToFavoritesList()
-                sendSilent("?GAP")
-                sendSilent("?GAH")
-                sendSilent("?FL")
-                delay(900)
-                sendSilent("?GAP")
-            } finally {
-                delay(400)
-                isSyncingFavorites = false
-                ui { statusText.text = "" }
-            }
-        }
-    }
-
-    // Spoľahlivé prepnutie na ľubovoľnú predvoľbu Favorites v ľubovoľnom poradí:
-    private fun selectFavoritePreset(index: Int, name: String) {
-        favSwitchJob?.cancel()
-        activeFavIndex = index
-        styleFavButtons()
-        val displayTitle = favStations[index] ?: name
-        radioLine.text = "Stanica: $displayTitle ▶"
-        nowPlayingTitle.text = "📻 $index. $displayTitle"
-        nowPlayingSub.text = "Prepínam na predvoľbu $index…"
-        nowPlayingMeta.text = "Čakám na spustenie streamu…"
-
-        favSwitchJob = scope.launch(Dispatchers.IO) {
-            isSyncingFavorites = false
-            if (!isOn) {
-                sendSilent("PO")
-                delay(2500)
-            }
-
-            // Ak ešte nemáme načítané názvy staníc, povolíme ich uloženie počas prechodu cez zoznam
-            if (favStations.isEmpty()) {
-                isSyncingFavorites = true
-            }
-
-            // 1. Zabezpečíme, že receiver je v koreňovom zozname Favorites (nie v Play obrazovke predchádzajúcej stanice)
-            if (activeInput != "FAVORITES" && activeInput != "45FN") {
-                listScreenReady = false
-                sendSilent("45FN")
-                sendSilent("?F")
-                for (step in 0 until 10) {
-                    delay(200)
-                    if (listScreenReady) break
-                }
-                delay(300)
-            } else if (isPlayingFavorite || nwScreenType == "04" || nwScreenType == "05") {
-                forceReturnToFavoritesList()
-                delay(250)
-            }
-
-            // Uzamkneme zoznam predvolieb, aby následné metadáta o skladbe neprepísali názvy tlačidiel!
-            isSyncingFavorites = false
-            isPlayingFavorite = true
-            playMetaLines.clear()
-
-            // 2. Odošleme priamu voľbu položky v zozname (napr. 01GHP, 02GHP...)
-            val ghpCmd = String.format("%02dGHP", index)
-            sendSilent(ghpCmd)
-            delay(450)
-            // Pre istotu pošleme aj 10NW (Play), ak by receiver zostal stáť na vybranej položke
-            sendSilent("10NW")
-
-            // 3. Počkáme na nabehnutie streamu a vyžiadame si detail prehrávania pre spodný displej
-            delay(1400)
-            sendSilent("?GAP")
-            sendSilent("?GAH")
-            sendSilent("?FL")
-            delay(1500)
-            sendSilent("?GAP")
-            sendSilent("?FL")
         }
     }
 
@@ -900,22 +1014,108 @@ class MainActivity : AppCompatActivity() {
     }
 
     // =====================================================================
-    // AKTUALIZACIE ZOBRAZENIA
+    // AKTUALIZACIE HLAVNEHO A SPODNEHO DISPLEJA
     // =====================================================================
 
-    private fun volText(v: Int): String {
+    private fun volShortText(v: Int): String {
         val dB = v - 80
-        return "🔊  $v   (" + (if (dB >= 0) "+" else "") + dB + " dB)"
+        return "🔊 $v (" + (if (dB >= 0) "+" else "") + dB + " dB)"
     }
 
     private fun updateVolumeCard() {
-        volumeBig.text = if (isMuted) "🔇  MUTE" else volText(currentVol)
+        if (!::volumeLabel.isInitialized) return
+        if (isMuted) {
+            volumeLabel.text = "🔇 MUTE"
+            volumeLabel.setTextColor(C_RED)
+        } else {
+            volumeLabel.text = volShortText(currentVol)
+            volumeLabel.setTextColor(C_GREEN)
+        }
     }
 
     private fun updateInfoLine() {
         val i = activeInput ?: "—"
         val m = activeMode ?: "—"
         infoLine.text = "Vstup: $i   ·   Režim: $m"
+    }
+
+    private fun updateMainDisplayHeader() {
+        if (!::mainStationBig.isInitialized) return
+        val presetName = if (activeFavIndex > 0) favStations[activeFavIndex] else null
+        val l1 = playMetaLines[1]?.second.orEmpty()
+        val l2 = playMetaLines[2]?.second.orEmpty()
+        val l3 = playMetaLines[3]?.second.orEmpty()
+        val l4 = playMetaLines[4]?.second.orEmpty()
+        val l5 = playMetaLines[5]?.second.orEmpty()
+        val l6 = playMetaLines[6]?.second.orEmpty()
+
+        // 1. Horný výrazný nápis: Názov rádiovej stanice (alebo aktívny vstup / FL displej)
+        val topTitle = when {
+            !presetName.isNullOrBlank() -> "📻  $presetName"
+            activeStationName.isNotBlank() -> "📻  $activeStationName"
+            l1.isNotBlank() -> "📻  $l1"
+            lastFlText.isNotBlank() -> "📟  $lastFlText"
+            !activeInput.isNullOrBlank() -> "🎚  ${activeInput!!}"
+            else -> "📻  —"
+        }
+        mainStationBig.text = topTitle
+
+        // 2. Pod ním menším písmom: Názov relácie / skladby + bitrate
+        val showParts = listOf(l1, l2, l3).filter {
+            it.isNotBlank() &&
+                !it.equals(presetName, ignoreCase = true) &&
+                !it.equals(activeStationName, ignoreCase = true)
+        }.distinct()
+        val bitrateParts = listOf(l4, l5, l6).filter { it.isNotBlank() }.distinct()
+
+        val combinedSub = mutableListOf<String>()
+        if (showParts.isNotEmpty()) combinedSub.add(showParts.joinToString(" · "))
+        if (bitrateParts.isNotEmpty()) combinedSub.add(bitrateParts.joinToString(" "))
+        if (playTimeText.isNotBlank()) combinedSub.add(playTimeText)
+
+        mainShowBitrate.text = if (combinedSub.isNotEmpty()) {
+            combinedSub.joinToString("   |   ")
+        } else if (lastFlText.isNotBlank()) {
+            "Displej: $lastFlText"
+        } else {
+            "Relácia / Bitrate: —"
+        }
+    }
+
+    private fun updateNowPlayingCardFromMeta() {
+        updateMainDisplayHeader()
+        if (!::nowPlayingTitle.isInitialized) return
+
+        val presetName = if (activeFavIndex > 0) favStations[activeFavIndex] else null
+        val l1 = playMetaLines[1]?.second.orEmpty()
+        val l2 = playMetaLines[2]?.second.orEmpty()
+        val l3 = playMetaLines[3]?.second.orEmpty()
+        val l4 = playMetaLines[4]?.second.orEmpty()
+        val l5 = playMetaLines[5]?.second.orEmpty()
+        val l6 = playMetaLines[6]?.second.orEmpty()
+
+        val stationTitle = when {
+            !presetName.isNullOrBlank() -> "$activeFavIndex. $presetName"
+            activeStationName.isNotBlank() -> activeStationName
+            l1.isNotBlank() -> l1
+            else -> "Prehrávanie z Favorites"
+        }
+        nowPlayingTitle.text = "📻 $stationTitle"
+
+        val trackParts = listOf(l1, l2, l3).filter {
+            it.isNotBlank() && !it.equals(presetName, ignoreCase = true)
+        }.distinct()
+        nowPlayingSub.text = if (trackParts.isNotEmpty())
+            trackParts.joinToString("  ·  ")
+        else
+            "Relácia / Skladba: —"
+
+        val techParts = listOf(l4, l5, l6).filter { it.isNotBlank() }.distinct().toMutableList()
+        if (playTimeText.isNotBlank()) techParts.add("Čas: $playTimeText")
+        nowPlayingMeta.text = if (techParts.isNotEmpty())
+            techParts.joinToString("   ·   ")
+        else
+            "Formát / Bitrate: —"
     }
 
     private fun updateMuteButton() {
@@ -963,40 +1163,6 @@ class MainActivity : AppCompatActivity() {
         return sb.toString().trim()
     }
 
-    private fun updateNowPlayingCardFromMeta() {
-        if (!::nowPlayingTitle.isInitialized) return
-        val presetName = if (activeFavIndex > 0) favStations[activeFavIndex] else null
-        val l1 = playMetaLines[1]?.second.orEmpty()
-        val l2 = playMetaLines[2]?.second.orEmpty()
-        val l3 = playMetaLines[3]?.second.orEmpty()
-        val l4 = playMetaLines[4]?.second.orEmpty()
-        val l5 = playMetaLines[5]?.second.orEmpty()
-        val l6 = playMetaLines[6]?.second.orEmpty()
-
-        val stationTitle = when {
-            !presetName.isNullOrBlank() -> "$activeFavIndex. $presetName"
-            l1.isNotBlank() -> l1
-            else -> "Prehrávanie z Favorites"
-        }
-        nowPlayingTitle.text = "📻 $stationTitle"
-        radioLine.text = "Stanica: $stationTitle ▶"
-
-        val trackParts = listOf(l1, l2, l3).filter {
-            it.isNotBlank() && !it.equals(presetName, ignoreCase = true)
-        }.distinct()
-        nowPlayingSub.text = if (trackParts.isNotEmpty())
-            trackParts.joinToString("  ·  ")
-        else
-            "Skladba / Interpret: —"
-
-        val techParts = listOf(l4, l5, l6).filter { it.isNotBlank() }.distinct().toMutableList()
-        if (playTimeText.isNotBlank()) techParts.add("Čas: $playTimeText")
-        nowPlayingMeta.text = if (techParts.isNotEmpty())
-            techParts.joinToString("   ·   ")
-        else
-            "Formát / Bitrate: —"
-    }
-
     // =====================================================================
     // HLASITOST — posuvnik posiela az po pusteni, s pevnym poctom krokov
     // =====================================================================
@@ -1030,8 +1196,31 @@ class MainActivity : AppCompatActivity() {
     }
 
     // =====================================================================
-    // VYHLADANIE RECEIVERA V SIETI TELEFONU
+    // AUTOMATICKÉ VYHĽADANIE A PRIPOJENIE RECEIVERA PRI ŠTARTE
     // =====================================================================
+
+    private fun autoConnectOrDiscoverOnStartup() {
+        ui {
+            connLine.text = "⏳ Pripájam na uloženú IP $host…"
+            connLine.setTextColor(C_ORANGE)
+            statusText.text = ""
+        }
+        scope.launch(Dispatchers.IO) {
+            // 1. Najprv skúsime poslednú uloženú IP adresu
+            if (probe(host)) {
+                saveHostIp(host)
+                connect(silentFail = false)
+                return@launch
+            }
+            // 2. Ak uložená IP neodpovedá, automaticky prehľadáme sieť a pripojíme nájdený receiver
+            ui {
+                connLine.text = "○ Uložená IP $host neodpovedá"
+                connLine.setTextColor(C_RED)
+                statusText.text = "🔍 Automaticky hľadám receiver v sieti…"
+            }
+            discoverReceivers(autoConnectFirst = true)
+        }
+    }
 
     private fun phoneIp(): String? {
         return try {
@@ -1049,30 +1238,35 @@ class MainActivity : AppCompatActivity() {
     private fun probe(ip: String): Boolean {
         return try {
             Socket().use { s ->
-                s.soTimeout = 1200
-                s.connect(InetSocketAddress(ip, port), 400)
+                s.soTimeout = 1000
+                s.connect(InetSocketAddress(ip, port), 450)
                 val w = OutputStreamWriter(s.getOutputStream(), Charsets.US_ASCII)
-                w.write("?V\r\n")
+                w.write("?P\r\n?V\r\n")
                 w.flush()
                 val r = BufferedReader(InputStreamReader(s.getInputStream(), Charsets.US_ASCII))
                 val line = r.readLine() ?: return false
                 line.startsWith("VOL") || line.startsWith("PWR") || line.startsWith("FN") ||
-                    line.startsWith("MUT") || line.startsWith("LM")
+                    line.startsWith("MUT") || line.startsWith("LM") || line.startsWith("SR") ||
+                    line.startsWith("FL")
             }
         } catch (_: Exception) { false }
     }
 
-    private fun discoverReceivers() {
-        statusText.text = "🔍 Skenujem sieť (port $port)…"
+    private fun discoverReceivers(autoConnectFirst: Boolean) {
+        ui { statusText.text = "🔍 Hľadám Pioneer receiver v Wi-Fi sieti (port $port)…" }
         scope.launch(Dispatchers.IO) {
             val myIp = phoneIp()
             if (myIp == null) {
-                ui { statusText.text = "Nepodarilo sa zistiť IP telefónu — si pripojený na Wi-Fi?" }
+                ui {
+                    connLine.text = "○ Odpojené (Wi-Fi nedostupná)"
+                    connLine.setTextColor(C_RED)
+                    statusText.text = "Nepodarilo sa zistiť IP telefónu — skontroluj pripojenie na Wi-Fi."
+                }
                 return@launch
             }
             val prefix = myIp.substringBeforeLast(".")
             val found = Collections.synchronizedList(mutableListOf<String>())
-            withTimeoutOrNull(25000) {
+            withTimeoutOrNull(18000) {
                 coroutineScope {
                     (1..254).forEach { i ->
                         launch {
@@ -1084,10 +1278,19 @@ class MainActivity : AppCompatActivity() {
             }
             val sorted = found.toList().sorted()
             ui {
-                statusText.text = if (sorted.isEmpty())
-                    "V sieti $prefix.0/24 som nenašiel receiver. Je zapnutý Network Standby?"
-                else ""
-                pickReceiver(sorted)
+                if (sorted.isEmpty()) {
+                    connLine.text = "○ Odpojené ($host)"
+                    connLine.setTextColor(C_RED)
+                    statusText.text = "V sieti $prefix.0/24 sa nenašiel receiver. Skontroluj napájanie / Network Standby."
+                } else if (autoConnectFirst || sorted.size == 1) {
+                    val chosenIp = sorted.first()
+                    saveHostIp(chosenIp)
+                    statusText.text = "✓ Nájdený receiver na $chosenIp — pripájam…"
+                    connect(silentFail = false)
+                } else {
+                    statusText.text = ""
+                    pickReceiver(sorted)
+                }
             }
         }
     }
@@ -1095,13 +1298,11 @@ class MainActivity : AppCompatActivity() {
     private fun pickReceiver(found: List<String>) {
         if (found.isEmpty()) return
         AlertDialog.Builder(this)
-            .setTitle(if (found.size > 1) "Nájdené prijímače" else "Nájdený prijímač")
+            .setTitle("Nájdené prijímače")
             .setItems(found.toTypedArray()) { _, i ->
-                host = found[i]
+                saveHostIp(found[i])
                 avtControlUrl = null
-                ipEdit.setText(host)
-                prefs().edit().putString("host", host).apply()
-                connect()
+                connect(silentFail = false)
             }
             .setNegativeButton("Zrušiť", null)
             .show()
@@ -1493,30 +1694,38 @@ class MainActivity : AppCompatActivity() {
     // PRIPOJENIE A SPRAVA PRIKAZOV
     // =====================================================================
 
-    private fun connect() {
-        scope.coroutineContext.cancelChildren()
-        queueJob = null
-        scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-        scope.launch {
+    private fun connect(silentFail: Boolean = false) {
+        runCatching { socketRef.get()?.close() }
+        queueJob?.cancel()
+        scope.launch(Dispatchers.IO) {
             try {
                 val sock = Socket()
                 sock.connect(InetSocketAddress(host, port), 3000)
                 sock.keepAlive = true
                 outWriter = OutputStreamWriter(sock.getOutputStream(), Charsets.US_ASCII)
                 socketRef.set(sock)
+                saveHostIp(host)
                 ui {
-                    connLine.text = "●  Pripojené: " + host + ":" + port
+                    connLine.text = "●  Pripojené: $host:$port"
                     connLine.setTextColor(C_GREEN)
                     statusText.text = ""
                 }
-                sendSilent("?P"); sendSilent("?V"); sendSilent("?F"); sendSilent("?M"); sendSilent("?FL"); sendSilent("?GAP")
+                sendSilent("?P")
+                sendSilent("?V")
+                sendSilent("?F")
+                sendSilent("?M")
+                sendSilent("?S")
+                sendSilent("?L")
+                sendSilent("?FL")
+                sendSilent("?GAP")
                 listen(sock)
             } catch (e: Exception) {
-                ui {
-                    connLine.text = "○  Odpojené"
-                    connLine.setTextColor(C_RED)
-                    statusText.text = "Nepodarilo sa pripojiť (" + (e.message ?: "?") +
-                        "). Skús tlačidlo 🔍 vyhľadať receiver."
+                if (!silentFail) {
+                    ui {
+                        connLine.text = "○  Odpojené ($host)"
+                        connLine.setTextColor(C_RED)
+                        statusText.text = "Chyba pripojenia: ${e.message ?: "neznáma"} — klikni 🔍 pre vyhľadanie."
+                    }
                 }
             }
         }
@@ -1531,10 +1740,11 @@ class MainActivity : AppCompatActivity() {
                     val line = reader.readLine() ?: break
                     handleResponse(line.trim())
                 }
-            } catch (_: Exception) {
+            } catch (e: Exception) {
                 ui {
-                    connLine.text = "○  Odpojené"
+                    connLine.text = "○  Odpojené ($host)"
                     connLine.setTextColor(C_RED)
+                    statusText.text = "Spojenie prerušené (${e.message ?: "odpojené"})"
                 }
             }
         }
@@ -1558,30 +1768,68 @@ class MainActivity : AppCompatActivity() {
                     val code = line.substring(2) + "FN"
                     activeInput = inputs.entries.firstOrNull { it.value == code }?.key
                         ?: when (code) {
+                            "19FN" -> "HDMI 1"
+                            "20FN" -> "HDMI 2"
+                            "21FN" -> "HDMI 3"
+                            "22FN" -> "HDMI 4"
+                            "23FN" -> "HDMI 5"
+                            "24FN" -> "HDMI 6"
                             "47FN" -> "DMR"
                             "26FN" -> "NETWORK"
                             else -> code
                         }
                     updateInfoLine()
                     styleInputButtons()
+                    updateMainDisplayHeader()
                 }
-                line.startsWith("LM") -> {
-                    val m = modes.entries.firstOrNull { line.contains(it.value) }
+                // Spätná väzba pre priestorový režim: SRxxxx (nastavený režim) alebo LMxxxx (aktuálny dekodér)
+                line.startsWith("SR") && line.length >= 6 -> {
+                    val code = line.substring(2, 6) + "SR"
+                    val m = modes.entries.firstOrNull { it.value == code }
                     if (m != null) {
                         activeMode = m.key
                         updateInfoLine()
                         styleModeButtons()
                     }
                 }
+                line.startsWith("LM") && line.length >= 6 -> {
+                    val lmHex = line.substring(2).trim()
+                    val matched = when {
+                        lmHex.endsWith("01") -> "STEREO"
+                        lmHex.endsWith("05") -> "AUTO SURR."
+                        lmHex.endsWith("06") || lmHex.endsWith("07") -> "DIRECT"
+                        lmHex.endsWith("51") -> "ALC / PURE"
+                        lmHex.contains("13") || lmHex.contains("02") -> "PLII MOVIE"
+                        lmHex.contains("14") || lmHex.contains("03") -> "PLII MUSIC"
+                        else -> activeMode
+                    }
+                    if (matched != null) {
+                        activeMode = matched
+                        updateInfoLine()
+                        styleModeButtons()
+                    }
+                }
                 line == "PWR0" -> { isOn = true; updatePowerButton() }
                 line == "PWR2" || line == "PWR1" -> { isOn = false; updatePowerButton() }
+                line.startsWith("E0") -> {
+                    // Chybové kódy Pioneer (E02 = NOT AVAILABLE NOW, E04 = COMMAND ERROR, E06 = PARAMETER ERROR)
+                    val errDesc = when (line) {
+                        "E02" -> "Príkaz teraz nie je dostupný (E02)"
+                        "E03" -> "Neplatný príkaz (E03)"
+                        "E04" -> "Chyba príkazu (E04)"
+                        "E06" -> "Neplatný parameter (E06)"
+                        else -> "Odpoveď receivera: $line"
+                    }
+                    statusText.text = errDesc
+                }
                 line.startsWith("FL") && line.length >= 6 -> {
                     val txt = decodeFlHex(line.substring(4))
                     if (txt.isNotEmpty()) {
-                        flDisplayText.text = "📟 $txt"
+                        lastFlText = txt
                         if (::nowPlayingFl.isInitialized) {
                             nowPlayingFl.text = "Displej receivera: $txt"
                         }
+                        updateMainDisplayHeader()
                     }
                 }
                 line.startsWith("GCH") || line.startsWith("GCP") -> {
@@ -1606,9 +1854,7 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
                 line.startsWith("GEH") || line.startsWith("GEP") -> {
-                    // Formát Pioneer: GEP + riadok(2 znaky: 01..08) + fokus(1 znak: 0/1) + dataType(2 znaky) + "Text"
-                    // DataType 00..04 = položka zoznamu (priečinok/stanica)
-                    // DataType 20..32 = metadáta prehrávania (skladba, interpret, album, žáner, bitrate, formát, čas)
+                    // GEP + riadok(01..08) + fokus(0/1) + dataType(2 znaky) + "Text"
                     val idx = line.substring(3, 5).toIntOrNull()
                     val title = line.substringAfter("\"", "").substringBeforeLast("\"", "")
                     val typeCode = if (line.length >= 8) line.substring(6, 8) else "01"
@@ -1619,7 +1865,6 @@ class MainActivity : AppCompatActivity() {
                             nwScreenType == "04" || nwScreenType == "05" || looksLikeMetadata(title)
 
                         if (isMetadataLine) {
-                            // Ide o informácie o prehrávanej skladbe, bitrate alebo formáte -> patrí výhradne na dolný displej!
                             if (title.isNotEmpty()) {
                                 playMetaLines[idx] = typeCode to title
                             } else {
@@ -1627,12 +1872,11 @@ class MainActivity : AppCompatActivity() {
                             }
                             updateNowPlayingCardFromMeta()
                         } else if (isSyncingFavorites || favStations.size < 8) {
-                            // Ide o skutočnú položku zoznamu Favorites (typeCode 00..04) počas načítania zoznamu
                             listScreenReady = true
                             if (title.isNotEmpty() && !title.startsWith("[")) {
                                 favStations[idx] = title
                                 saveCachedFavorites()
-                                renderFavoriteButtons()
+                                renderFavoriteTable()
                             }
                         }
                     }
