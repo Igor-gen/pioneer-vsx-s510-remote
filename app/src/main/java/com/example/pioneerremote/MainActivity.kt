@@ -1,29 +1,25 @@
 // ============================================================================
-// Pioneer VSX-S510 Remote — verzia 17 (USB browser + serialized TCP writes)
-// - Vizuálny zelený pásik hlasitosti (ProgressBar) + tlačidlá VOL − / VOL +
-// - Karta RÁDIO:
-//     * Výsuvný zoznam predvolieb FAVORITES (38FN -> 45FN -> načítanie -> vysunutie)
-//     * Po výbere predvoľby sa zoznam zasunie a predvoľba sa prehráva
-// - Karta MÉDIÁ (Plán B — prepínač 🔌 USB KĽÚČ / 🌐 DLNA SERVER):
-//     * Hore na karte MÉDIÁ je prepínač režimu: "🔌 USB KĽÚČ" a "🌐 DLNA SERVER"
-//     * Režim 🔌 USB KĽÚČ:
-//         - Prepne vstup receivera na iPod/USB (17FN) a načíta obsah USB kľúča
-//         - Zobrazuje priečinky (📁) a audio súbory (🎵) priamo z USB kľúča (GEP01..GEP08)
-//         - Kliknutie na priečinok ho otvorí, kliknutie na súbor okamžite spustí
-//           prehrávanie (xxGHP) s automatickým pokračovaním celého adresára
-//         - Tlačidlá pre návrat o úroveň vyššie (↩ SPÄŤ), posun strán (⏫/⏬)
-//           a ovládanie prehrávania (⏮, ▶, ⏸, ⏹, ⏭, 🔁 Repeat)
-//     * Režim 🌐 DLNA SERVER:
-//         - Pôvodný DLNA prehliadač + prehrávanie celého albumu
+// Pioneer VSX-S510 Remote — verzia 20-log (v20 + diagnostický log)
+// - USB (vstup 17FN) prepracované:
+//     1. Načíta sa CELÝ obsah kľúča (rekurzívne) do pamäte a uloží sa.
+//     2. Pohyb po strukture, otváranie adresárov a označovanie (☐/☑) ide len z pamäte.
+//     3. Označiť sa dá celý adresár alebo konkrétny súbor; ▶ PLAY, ⏸ PAUZA, ⏹ STOP.
+//     4. Play na inom výbere vždy zastaví aktuálne prehrávanie a spustí nový výber.
+//     5. Príkazy sa odosielajú cez jedno vlákno (poradie, bez prelínania).
+//     6. Pauza / ďalšia / predošlá sa neposielajú dvojito (IP aj NW naraz).
+//     7. DIAGNOSTICKÝ LOG: všetky odoslané (TX) a prijaté (RX) riadky + udalosti (EV)
+//        sa ukladajú do pioneer_log.txt; tlačidlo 📤 Odoslať LOG na karte MÉDIÁ / USB.
 // ============================================================================
 
 package com.example.pioneerremote
 
+import android.content.Intent
 import android.content.res.ColorStateList
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.net.wifi.WifiManager
 import android.os.Bundle
+import android.os.SystemClock
 import android.text.InputType
 import android.view.Gravity
 import android.view.View
@@ -41,9 +37,12 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.recyclerview.widget.RecyclerView
 import androidx.viewpager2.widget.ViewPager2
 import kotlinx.coroutines.*
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.BufferedReader
+import java.io.File
 import java.io.InputStreamReader
 import java.io.OutputStreamWriter
 import java.net.DatagramPacket
@@ -55,7 +54,11 @@ import java.net.MulticastSocket
 import java.net.NetworkInterface
 import java.net.Socket
 import java.net.URL
+import java.text.SimpleDateFormat
 import java.util.Collections
+import java.util.Date
+import java.util.Locale
+import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicReference
 
 class MainActivity : AppCompatActivity() {
@@ -85,8 +88,6 @@ class MainActivity : AppCompatActivity() {
     private var scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val socketRef = AtomicReference<Socket?>(null)
     private var outWriter: OutputStreamWriter? = null
-    // TCP príkazy zapisujeme synchronizovane, aby sa bajty/príkazy navzájom nepomiešali.
-    private val commandWriteLock = Any()
     private var currentVol = 0
     private var isMuted = false
     private var isOn = false
@@ -97,6 +98,54 @@ class MainActivity : AppCompatActivity() {
     private var favJob: Job? = null
     private var usbJob: Job? = null
     private var multicastLock: WifiManager.MulticastLock? = null
+
+    // Jedno vlákno na odosielanie => príkazy idú v poradí a nikdy sa neprelínajú
+    private val sendDispatcher = Executors.newSingleThreadExecutor().asCoroutineDispatcher()
+
+    // ===== DIAGNOSTICKÝ LOG =====
+    private val logLock = Any()
+    private val logTimeFmt = SimpleDateFormat("HH:mm:ss.SSS", Locale.US)
+    private val logFile: File by lazy { File(getExternalFilesDir(null) ?: filesDir, "pioneer_log.txt") }
+
+    // tag: TX = odoslané receiveru, RX = prijaté z receivera, EV = udalosť v aplikácii
+    private fun logRaw(tag: String, text: String) {
+        try {
+            synchronized(logLock) {
+                val f = logFile
+                if (f.exists() && f.length() > 3_000_000L) f.delete()
+                f.appendText("${logTimeFmt.format(Date())} $tag $text\n")
+            }
+        } catch (_: Exception) { }
+    }
+
+    private fun logEv(text: String) = logRaw("EV", text)
+
+    private fun readLogTail(maxChars: Int = 120000): String {
+        return try {
+            synchronized(logLock) {
+                val t = if (logFile.exists()) logFile.readText() else ""
+                if (t.length > maxChars) "…(začiatok logu skrátený)…\n" + t.takeLast(maxChars) else t
+            }
+        } catch (e: Exception) {
+            "Chyba čítania logu: ${e.message}"
+        }
+    }
+
+    private fun shareLog() {
+        val header = "Pioneer Remote v20-log | host=$host | vstup=$activeInput | usbUseIp=$usbUseIp" +
+            " | adresárov v pamäti=${usbTreeCache.size} | ${android.os.Build.MODEL}\n"
+        val i = Intent(Intent.ACTION_SEND)
+        i.type = "text/plain"
+        i.putExtra(Intent.EXTRA_SUBJECT, "Pioneer Remote log")
+        i.putExtra(Intent.EXTRA_TEXT, header + readLogTail())
+        startActivity(Intent.createChooser(i, "Odoslať log"))
+    }
+
+    private fun clearLog() {
+        synchronized(logLock) { runCatching { logFile.delete() } }
+        logEv("log vymazaný")
+        if (::usbStatusText.isInitialized) usbStatusText.text = "🗑 Log vymazaný."
+    }
 
     // ===== Hlavný displej a ovládacie prvky =====
     private lateinit var ipEdit: EditText
@@ -149,9 +198,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var favTableContainer: LinearLayout
     private var isFavListExpanded: Boolean = false
 
-    // Načítané stanice vo Favorites (poradie 1..N -> názov)
     private val favStations = linkedMapOf<Int, String>()
-    // Metadáta z obrazovky prehrávania (riadok 1..8 -> Pair(typeCode, text)) pre horný displej
     private val playMetaLines = mutableMapOf<Int, Pair<String, String>>()
     @Volatile private var isSyncingFavorites: Boolean = false
     @Volatile private var isPlayingFavorite: Boolean = false
@@ -168,14 +215,50 @@ class MainActivity : AppCompatActivity() {
     private lateinit var usbContainer: LinearLayout
     private lateinit var dlnaContainer: LinearLayout
 
-    // Stav a UI pre USB prehliadač (predný USB port 17FN)
+    // ===== STROMOVÁ PAMÄŤ (CACHE) USB KĽÚČA + OZNAČENIE =====
+    private data class UsbNode(
+        val indexInParent: Int, // 1-based index v nadradenom priečinku
+        val title: String,
+        val isFolder: Boolean,
+        val pathKey: String     // napr. "/1", "/1/3"
+    )
+
+    private val usbTreeCache = linkedMapOf<String, MutableList<UsbNode>>()
+    private val usbCurrentPath = mutableListOf<Pair<Int, String>>()
+    private var usbSelectedPathKey: String? = null
+    private val usbNodeButtons = mutableMapOf<String, Button>()
+    private val usbCheckButtons = mutableMapOf<String, Button>()
+
+    // (ponechané kvôli kompatibilite, v20 sa dvojklik nepoužíva)
+    private var lastTapKey: String? = null
+    private var lastTapTime: Long = 0L
+
+    // Nízkoúrovňové premenné pre čítanie zoznamu z receivera (GEP01..GEP08)
+    private val rawPageLines = Collections.synchronizedMap(linkedMapOf<Int, Pair<String, String>>())
+    @Volatile private var rawRangeStart: Int = 1
+    @Volatile private var rawRangeEnd: Int = 0
+    @Volatile private var rawTotalItems: Int = 0
+    @Volatile private var rawPageUpdatedAt: Long = 0L
+    @Volatile private var rawGdhUpdatedAt: Long = 0L
+    @Volatile private var isUsbPlayingNow: Boolean = false
+
     private lateinit var usbPathText: TextView
+    private lateinit var usbSelectedText: TextView
     private lateinit var usbStatusText: TextView
     private lateinit var usbListLayout: LinearLayout
-    private val usbScreenItems = linkedMapOf<Int, Pair<String, String>>() // riadok 1..8 -> (typeCode, title)
-    private var usbTotalItems: Int = 0
-    private var usbRangeStart: Int = 0
-    private var usbRangeEnd: Int = 0
+    private lateinit var usbPlayBtn: Button
+    private lateinit var usbStopBtn: Button
+    private lateinit var usbPauseBtn: Button
+
+    // ===== USB prehrávanie (v20) =====
+    private enum class UsbState { STOPPED, PLAYING, PAUSED }
+    @Volatile private var usbState = UsbState.STOPPED
+    private var usbStartedKey: String? = null      // označenie, ktoré sa naposledy spustilo
+    @Volatile private var usbBusy = false          // beží navigácia / sken na receiveri
+    @Volatile private var usbScanning = false
+    @Volatile private var lastErrAt = 0L           // čas poslednej chyby E0x z receivera
+    private var usbUseIp: Boolean? = null          // null = ešte nezistené, true = xxIP, false = xxNW
+    private val usbCmdMutex = Mutex()
 
     // ===== DLNA =====
     private data class MediaEntry(
@@ -209,7 +292,9 @@ class MainActivity : AppCompatActivity() {
         mediaServerDesc = p.getString("dlnaServer", null)
         mediaServerName = p.getString("dlnaName", "") ?: ""
         isUsbMediaMode = p.getBoolean("isUsbMediaMode", true)
+        logEv("=== štart aplikácie v20-log, host=$host ===")
         loadCachedFavorites()
+        loadCachedUsbTree()
         buildUI()
 
         val wifi = applicationContext.getSystemService(WIFI_SERVICE) as WifiManager
@@ -227,6 +312,7 @@ class MainActivity : AppCompatActivity() {
         scope.coroutineContext.cancelChildren()
         runCatching { socketRef.get()?.close() }
         multicastLock?.release()
+        sendDispatcher.close()
     }
 
     private fun prefs() = getSharedPreferences("pioneer", MODE_PRIVATE)
@@ -272,13 +358,65 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun loadCachedUsbTree() {
+        val raw = prefs().getString("usbTreeJsonV20", null) ?: return
+        runCatching {
+            val rootObj = JSONObject(raw)
+            usbTreeCache.clear()
+            val keys = rootObj.keys()
+            while (keys.hasNext()) {
+                val k = keys.next()
+                val arr = rootObj.getJSONArray(k)
+                val list = mutableListOf<UsbNode>()
+                for (i in 0 until arr.length()) {
+                    val o = arr.getJSONObject(i)
+                    list.add(
+                        UsbNode(
+                            indexInParent = o.getInt("idx"),
+                            title = o.getString("title"),
+                            isFolder = o.getBoolean("isFolder"),
+                            pathKey = o.getString("pathKey")
+                        )
+                    )
+                }
+                usbTreeCache[k] = list
+            }
+        }
+    }
+
+    private fun saveCachedUsbTree() {
+        runCatching {
+            val rootObj = JSONObject()
+            usbTreeCache.forEach { (k, list) ->
+                val arr = JSONArray()
+                list.forEach { node ->
+                    val o = JSONObject()
+                    o.put("idx", node.indexInParent)
+                    o.put("title", node.title)
+                    o.put("isFolder", node.isFolder)
+                    o.put("pathKey", node.pathKey)
+                    arr.put(o)
+                }
+                rootObj.put(k, arr)
+            }
+            prefs().edit().putString("usbTreeJsonV20", rootObj.toString()).apply()
+        }
+    }
+
     private fun looksLikeMetadata(text: String): Boolean {
         val t = text.trim()
         if (t.isEmpty()) return true
-        if (Regex("(?i).*\\b(kbps|khz|mp3|aac|wma|flac|wav|pcm|buffer)\\b.*").matches(t)) return true
+        if (Regex("(?i).*\\b(kbps|khz|wma|pcm|buffer)\\b.*").matches(t)) return true
         if (Regex("^\\d{1,2}:\\d{2}(:\\d{2})?$").matches(t)) return true
         if (Regex("^\\d+\\s*%$").matches(t)) return true
         return false
+    }
+
+    private fun isLikelyUsbFolder(typeCode: String, title: String): Boolean {
+        val lower = title.trim().lowercase()
+        val audioExts = listOf(".mp3", ".flac", ".wav", ".m4a", ".aac", ".wma", ".ogg", ".alac", ".aif", ".aiff", ".pls", ".m3u")
+        if (audioExts.any { lower.endsWith(it) }) return false
+        return typeCode == "00" || typeCode == "01"
     }
 
     // =====================================================================
@@ -568,9 +706,9 @@ class MainActivity : AppCompatActivity() {
             override fun onPageSelected(position: Int) {
                 tabBtns.forEachIndexed { i, b -> styleTab(b, i == position) }
                 if (position == 2 && isUsbMediaMode) {
-                    // Ak sme na karte MÉDIÁ a je zvolený režim USB, obnovíme zoznam, ak už je aktívny vstup USB
-                    if (activeInput == "IPOD/USB" || activeInput == "17FN") {
-                        refreshUsbListDelayed(200)
+                    renderUsbCachedFolder()
+                    if (usbTreeCache.isEmpty()) {
+                        scanEntireUsbTree()
                     }
                 }
             }
@@ -638,9 +776,6 @@ class MainActivity : AppCompatActivity() {
                 updateInfoLine()
                 styleInputButtons()
                 updateMainDisplayHeader()
-                if (code == "17FN") {
-                    refreshUsbListDelayed(1200)
-                }
             }
             inputButtons[name] = b
             ib.add(b)
@@ -839,10 +974,8 @@ class MainActivity : AppCompatActivity() {
         val stationTitle = favStations[index] ?: name
         activeStationName = stationTitle
 
-        // Zasunieme zoznam predvolieb
         setFavDrawerExpanded(false)
 
-        // Aktualizujeme hlavný displej hore
         playMetaLines.clear()
         playTimeText = ""
         updateMainDisplayHeader()
@@ -854,6 +987,7 @@ class MainActivity : AppCompatActivity() {
             val ghpCmd = String.format("%02dGHP", index)
             sendSilent(ghpCmd)
             delay(350)
+            sendSilent("30NW")
             sendSilent("10NW")
 
             delay(1500)
@@ -880,10 +1014,10 @@ class MainActivity : AppCompatActivity() {
 
         // Horný prepínač režimu: 🔌 USB KĽÚČ vs. 🌐 DLNA SERVER
         modeUsbBtn = flatBtn("🔌 USB KĽÚČ") {
-            switchMediaMode(usbMode = true, activateUsbInput = true)
+            switchMediaMode(usbMode = true)
         }
         modeDlnaBtn = flatBtn("🌐 DLNA SERVER") {
-            switchMediaMode(usbMode = false, activateUsbInput = false)
+            switchMediaMode(usbMode = false)
         }
         modeUsbBtn.textSize = 13f
         modeDlnaBtn.textSize = 13f
@@ -894,39 +1028,66 @@ class MainActivity : AppCompatActivity() {
         page.addView(switchRow, switchLp)
 
         // =================================================================
-        // KONTAJNER 1: 🔌 USB KĽÚČ (Predný USB port — vstup 17FN)
+        // KONTAJNER 1: 🔌 USB KĽÚČ
         // =================================================================
         usbContainer = LinearLayout(this)
         usbContainer.orientation = LinearLayout.VERTICAL
 
-        // Riadok 1: Pripojiť/Načítať USB + Návrat o úroveň vyššie + Stránkovanie
-        val usbOpenBtn = flatBtn("🔌 NAČÍTAŤ USB") { openUsbAndLoadList() }
-        val usbBackBtn = flatBtn("↩ SPÄŤ (O úroveň vyššie)") { usbNavigateBack() }
-        usbContainer.addView(rowOf(listOf(usbOpenBtn, usbBackBtn)))
+        val usbScanAllBtn = flatBtn("🔄 NAČÍTAŤ CELÉ USB DO PAMÄTE") {
+            onUsbScanButton()
+        }
+        usbScanAllBtn.background = roundedBg(C_CYAN_D, 12, C_CYAN)
+        usbScanAllBtn.setTextColor(C_WHITE)
+        usbScanAllBtn.typeface = Typeface.DEFAULT_BOLD
+        usbContainer.addView(rowOf(listOf(usbScanAllBtn)))
 
-        val usbPgUpBtn = flatBtn("⏫ STRANA −") { usbPageStep(up = true) }
-        val usbPgDnBtn = flatBtn("⏬ STRANA +") { usbPageStep(up = false) }
-        val usbListModeBtn = flatBtn("📋 ZOZNAM") { usbReturnToListFromPlay() }
-        usbContainer.addView(rowOf(listOf(usbPgUpBtn, usbPgDnBtn, usbListModeBtn)))
+        // Tlačidlá ▶ PLAY, ⏸ PAUZA, ⏹ STOP
+        usbPlayBtn = flatBtn("▶ PLAY") { onUsbPlayPressed() }
+        usbPlayBtn.background = roundedBg(C_GREEN, 12, C_GREEN)
+        usbPlayBtn.setTextColor(C_ON_ACCENT)
+        usbPlayBtn.typeface = Typeface.DEFAULT_BOLD
 
-        // Riadok 2: Ovládanie prehrávania USB (keď hrá skladba, pokračuje celý adresár)
-        val uPrev = flatBtn("⏮") { send("12NW"); refreshUsbListDelayed(700) }
-        val uPlay = flatBtn("▶") { send("10NW"); refreshUsbListDelayed(700) }
-        val uPause = flatBtn("⏸") { send("11NW") }
-        val uStop = flatBtn("⏹") { usbStatusText.text = "⏹ Posielam STOP…"; send("20NW"); refreshUsbListDelayed(1000) }
-        val uNext = flatBtn("⏭") { send("13NW"); refreshUsbListDelayed(700) }
-        val uRep = flatBtn("🔁") { send("34NW") }
-        usbContainer.addView(rowOf(listOf(uPrev, uPlay, uPause, uStop, uNext, uRep)))
+        usbPauseBtn = flatBtn("⏸ PAUZA") { onUsbPausePressed() }
+        usbPauseBtn.background = roundedBg(C_ORANGE, 12, C_ORANGE)
+        usbPauseBtn.setTextColor(C_ON_ACCENT)
+        usbPauseBtn.typeface = Typeface.DEFAULT_BOLD
+
+        usbStopBtn = flatBtn("⏹ STOP") { stopUsbPlayback() }
+        usbStopBtn.background = roundedBg(C_RED, 12, C_RED)
+        usbStopBtn.setTextColor(C_WHITE)
+        usbStopBtn.typeface = Typeface.DEFAULT_BOLD
+
+        usbContainer.addView(rowOf(listOf(usbPlayBtn, usbPauseBtn, usbStopBtn)))
+
+        val uPrev = flatBtn("⏮ Predch.") { onUsbPrevPressed() }
+        val uNext = flatBtn("⏭ Ďalšia") { onUsbNextPressed() }
+        val uRep = flatBtn("🔁 Repeat") { onUsbRepeatPressed() }
+        usbContainer.addView(rowOf(listOf(uPrev, uNext, uRep)))
+
+        val logShareBtn = flatBtn("📤 Odoslať LOG") { shareLog() }
+        val logClearBtn = flatBtn("🗑 Vymazať LOG") { clearLog() }
+        usbContainer.addView(rowOf(listOf(logShareBtn, logClearBtn)))
 
         usbPathText = TextView(this)
-        usbPathText.text = "📂 USB: klikni 🔌 NAČÍTAŤ USB pre zobrazenie obsahu kľúča"
+        usbPathText.text = "📂 Adresár: / (Koreň USB)"
         usbPathText.textSize = 12f
+        usbPathText.typeface = Typeface.DEFAULT_BOLD
         usbPathText.setTextColor(C_CYAN)
         usbPathText.setPadding(dp(4), dp(8), dp(4), dp(2))
         usbContainer.addView(usbPathText)
 
+        usbSelectedText = TextView(this)
+        usbSelectedText.text = "✓ Označené: (nič) — ☐ označí adresár/súbor, klik na adresár ho otvorí"
+        usbSelectedText.textSize = 12f
+        usbSelectedText.setTextColor(C_ORANGE)
+        usbSelectedText.setPadding(dp(4), 0, dp(4), dp(2))
+        usbContainer.addView(usbSelectedText)
+
         usbStatusText = TextView(this)
-        usbStatusText.text = "Tip: Kliknutím na súbor (🎵) sa spustí prehrávanie a pokračuje celý adresár."
+        usbStatusText.text = if (usbTreeCache.isNotEmpty())
+            "Obsah USB je načítaný v pamäti (${usbTreeCache.values.sumOf { it.size }} položiek)."
+        else
+            "Klikni na 🔄 NAČÍTAŤ CELÉ USB DO PAMÄTE pre zoskenovanie kľúča."
         usbStatusText.textSize = 11f
         usbStatusText.setTextColor(C_SLATE)
         usbStatusText.setPadding(dp(4), 0, dp(4), dp(6))
@@ -935,7 +1096,7 @@ class MainActivity : AppCompatActivity() {
         usbListLayout = LinearLayout(this)
         usbListLayout.orientation = LinearLayout.VERTICAL
         usbContainer.addView(usbListLayout)
-        renderUsbList()
+        renderUsbCachedFolder()
 
         page.addView(usbContainer)
 
@@ -977,12 +1138,12 @@ class MainActivity : AppCompatActivity() {
 
         page.addView(dlnaContainer)
 
-        switchMediaMode(usbMode = isUsbMediaMode, activateUsbInput = false)
+        switchMediaMode(usbMode = isUsbMediaMode)
         page.addView(hint("← swipe na rádio →"))
         return sv
     }
 
-    private fun switchMediaMode(usbMode: Boolean, activateUsbInput: Boolean) {
+    private fun switchMediaMode(usbMode: Boolean) {
         isUsbMediaMode = usbMode
         prefs().edit().putBoolean("isUsbMediaMode", usbMode).apply()
 
@@ -994,177 +1155,685 @@ class MainActivity : AppCompatActivity() {
             usbContainer.visibility = if (usbMode) View.VISIBLE else View.GONE
             dlnaContainer.visibility = if (!usbMode) View.VISIBLE else View.GONE
         }
-        if (usbMode && activateUsbInput) {
-            openUsbAndLoadList()
-        }
     }
 
-    // Prepne receiver na predný USB port (17FN) a načíta zoznam priečinkov/súborov
-    private fun openUsbAndLoadList() {
-        usbJob?.cancel()
+    // =====================================================================
+    // USB KĽÚČ (17FN) — NAVIGÁCIA NA RECEIVERI BEZ SPÚŠŤANIA AUTO-PLAY 1. ADRESÁRA
+    // =====================================================================
+
+    private fun currentUsbPathKey(): String {
+        return if (usbCurrentPath.isEmpty()) "/" else "/" + usbCurrentPath.joinToString("/") { it.first.toString() }
+    }
+
+    private fun currentUsbPathDisplay(): String {
+        return if (usbCurrentPath.isEmpty()) "/ (Koreň USB)" else "/" + usbCurrentPath.joinToString("/") { it.second }
+    }
+
+    // Príkaz RETURN (o úroveň vyššie / návrat z Play obrazovky do zoznamu)
+    private suspend fun sendUsbReturnUp() {
+        sendSilent("31NW")
+        delay(100)
+        sendSilent("18IP")
+    }
+
+    // Príkaz ENTER (otvoriť označený priečinok / spustiť označený súbor)
+    private suspend fun sendUsbEnter() {
+        sendSilent("30NW")
+        delay(100)
+        sendSilent("17IP")
+    }
+
+    // KRITICKÁ OPRAVA:
+    // Nikdy neprepíname 38FN -> 17FN, keď už sme na USB, pretože opätovné poslanie 17FN
+    // na Pioneer VSX-S510 automaticky spustí Auto-Play prvého adresára!
+    // Namiesto toho zastavíme prehrávanie (20NW / 02IP) a vrátime sa z Play obrazovky (04)
+    // do koreňového zoznamu adresárov (01) pomocou Top Menu / View / Return príkazov.
+    private suspend fun exitUsbPlayScreenToRootList() {
+        logEv("exit→root: vstup=$activeInput obrazovka=$nwScreenType zapnuté=$isOn")
         isPlayingFavorite = false
-        usbStatusText.text = "⏳ Prepínam na vstup iPod/USB (17FN) a načítavam obsah kľúča…"
-        usbJob = scope.launch(Dispatchers.IO) {
-            if (!isOn) {
-                sendSilent("PO")
-                delay(2500)
+        isUsbPlayingNow = false
+
+        if (!isOn) {
+            sendSilent("PO")
+            delay(2500)
+        }
+
+        if (activeInput != "IPOD/USB" && activeInput != "17FN") {
+            listScreenReady = false
+            sendSilent("17FN")
+            sendSilent("?F")
+            ui {
+                activeInput = "IPOD/USB"
+                updateInfoLine()
+                styleInputButtons()
+                updateMainDisplayHeader()
             }
-            if (activeInput != "IPOD/USB" && activeInput != "17FN") {
-                sendSilent("17FN")
-                sendSilent("?F")
-                ui {
-                    activeInput = "IPOD/USB"
-                    updateInfoLine()
-                    styleInputButtons()
-                    updateMainDisplayHeader()
+            // Po prepnutí na 17FN počkáme 1.8 s (ak by VSX-S510 spustil Auto-Play 1. adresára,
+            // hneď ho zastavíme a vrátime do koreňového zoznamu!)
+            delay(1800)
+        }
+
+        // 1. Zastavíme prehrávanie (Stop pre Network/USB aj iPod/USB modul)
+        sendSilent("20NW")
+        delay(120)
+        sendSilent("02IP")
+        delay(350)
+
+        // 2. Vyžiadame aktuálny stav obrazovky
+        listScreenReady = false
+        sendSilent("?GAP")
+        sendSilent("?GAH")
+        delay(350)
+
+        // 3. Ak je receiver na Play obrazovke (04/05) alebo ešte neukazuje zoznam (01/02),
+        // prepneme ho do List režimu cez Return (31NW / 18IP), Top Menu (28NW) a View Mode (19IP)
+        if (!listScreenReady || nwScreenType == "04" || nwScreenType == "05") {
+            sendUsbReturnUp()
+            delay(400)
+            sendSilent("?GAP")
+            delay(300)
+        }
+
+        if (!listScreenReady || nwScreenType == "04" || nwScreenType == "05") {
+            sendSilent("28NW") // Top Menu
+            delay(150)
+            sendSilent("19IP") // Switch View Mode (Play screen -> List screen)
+            delay(450)
+            sendSilent("?GAP")
+            delay(300)
+        }
+
+        // 4. Vystúpime zo všetkých podadresárov až do úplného koreňa USB kľúča "/"
+        repeat(5) {
+            sendUsbReturnUp()
+            delay(320)
+        }
+
+        // 5. Posunieme okno zoznamu na položku č. 1 v koreni USB
+        sendSilent("00001GGP")
+        delay(350)
+        sendSilent("?GAP")
+        sendSilent("?GAH")
+        delay(350)
+    }
+
+    // Načíta všetky položky v aktuálne otvorenom adresári receivera (s podporou GGP stránkovania)
+    private suspend fun fetchAllItemsInCurrentReceiverFolder(parentKey: String): MutableList<UsbNode> {
+        val result = mutableListOf<UsbNode>()
+        rawPageLines.clear()
+        rawTotalItems = 0
+        rawRangeStart = 1
+        rawRangeEnd = 0
+        val beforeTs = System.currentTimeMillis()
+
+        sendSilent("?GAP")
+        sendSilent("?GAH")
+
+        for (w in 0 until 16) {
+            delay(150)
+            if (rawPageUpdatedAt > beforeTs && rawPageLines.isNotEmpty()) break
+        }
+        delay(250)
+
+        // Ak sme stále na Play obrazovke, skúsime ešte raz vyskočiť do zoznamu
+        if (nwScreenType == "04" || nwScreenType == "05") {
+            sendUsbReturnUp()
+            delay(450)
+            rawPageLines.clear()
+            val ts2 = System.currentTimeMillis()
+            sendSilent("?GAP")
+            sendSilent("?GAH")
+            for (w in 0 until 12) {
+                delay(150)
+                if (rawPageUpdatedAt > ts2 && rawPageLines.isNotEmpty()) break
+            }
+        }
+
+        val total = if (rawTotalItems > 0) rawTotalItems else rawPageLines.size
+        if (total <= 0) return result
+
+        var pageStart = 1
+        while (pageStart <= total) {
+            if (pageStart > 1) {
+                rawPageLines.clear()
+                val ts = System.currentTimeMillis()
+                val ggpCmd = String.format("%05dGGP", pageStart)
+                sendSilent(ggpCmd)
+                delay(400)
+                sendSilent("?GAP")
+                sendSilent("?GAH")
+                for (w in 0 until 14) {
+                    delay(150)
+                    if (rawPageUpdatedAt > ts && rawPageLines.isNotEmpty()) break
                 }
-                delay(1500)
-            } else if (nwScreenType == "04" || nwScreenType == "05") {
-                // Ak práve hrá súbor a sme na Play obrazovke, vrátime sa do zoznamu adresára (14NW)
-                sendSilent("14NW")
-                delay(500)
+                delay(200)
             }
 
-            // Po prepnutí vstupu najprv počkáme, kým receiver pripraví USB obrazovku.
+            val snapshot = synchronized(rawPageLines) { LinkedHashMap(rawPageLines) }
+            for (lineIdx in 1..8) {
+                val pair = snapshot[lineIdx] ?: continue
+                val absIdx = pageStart + lineIdx - 1
+                if (absIdx > total) break
+                val typeCode = pair.first
+                val title = pair.second.trim()
+                if (title.isEmpty() || looksLikeMetadata(title)) continue
+                val isFolder = isLikelyUsbFolder(typeCode, title)
+                val nodeKey = if (parentKey == "/") "/$absIdx" else "$parentKey/$absIdx"
+                if (result.none { it.indexInParent == absIdx }) {
+                    result.add(UsbNode(absIdx, title, isFolder, nodeKey))
+                }
+            }
+
+            pageStart += 8
+        }
+
+        if (total > 8) {
+            sendSilent("00001GGP")
+            delay(300)
+        }
+
+        return result
+    }
+
+    // VÝBER POLOŽKY Č. X V USB ZOZNAME:
+    // 1. Príkazom %05dGGP posunieme zoznam v receiveri tak, aby položka č. absIndex bola na 1. riadku
+    // 2. Ak sa okno neposunulo (napr. pri malom zozname <= 8 položiek), pošleme priamu voľbu %02dGHP
+    // 3. Potvrdíme otvorenie príkazom ENTER (30NW / 17IP)
+    private suspend fun openUsbItemAtIndex(absIndex: Int, isFolder: Boolean) {
+        logEv("open idx=$absIndex folder=$isFolder rangeStart=$rawRangeStart total=$rawTotalItems")
+        val beforeGdh = rawGdhUpdatedAt
+        val beforePage = rawPageUpdatedAt
+        rawPageLines.clear()
+
+        // 1. Skúsime priamu voľbu riadku cez GGP (nastaví cieľovú položku ako 1. v okne) + GHP
+        if (absIndex > 1) {
+            val ggpCmd = String.format("%05dGGP", absIndex)
+            sendSilent(ggpCmd)
+            delay(320)
+        }
+
+        val lineToSelect = if (absIndex <= 8 && rawRangeStart <= 1) absIndex else 1
+        val ghpCmd = String.format("%02dGHP", lineToSelect)
+        sendSilent(ghpCmd)
+        delay(450)
+
+        // 2. Skontrolujeme, či receiver na GHP zareagoval zmenou obrazovky/zoznamu.
+        // Ak nie, pohneme kurzorom od 1. položky šípkou DOLE (27NW / 14IP) presne (absIndex - 1)-krát a stlačíme ENTER!
+        sendSilent("?GAP")
+        delay(300)
+
+        val screenChanged = (rawGdhUpdatedAt > beforeGdh) || (rawPageUpdatedAt > beforePage && rawPageLines.isNotEmpty())
+        logEv("open idx=$absIndex: screenChanged=$screenChanged obrazovka=$nwScreenType rangeStart=$rawRangeStart")
+        if (!screenChanged) {
+            if (absIndex > 1 && rawRangeStart <= 1) {
+                repeat(absIndex - 1) {
+                    sendSilent("27NW") // Cursor Down (Network/USB)
+                    sendSilent("14IP") // Cursor Down (iPod/USB)
+                    delay(180)
+                }
+            }
+            sendUsbEnter()
             delay(500)
-            sendSilent("?GAP")
-            delay(120)
-            sendSilent("?GAH")
-            delay(120)
-            sendSilent("?FL")
-            delay(900)
-            sendSilent("?GAP")
-            delay(120)
-            sendSilent("?GAH")
+        }
+
+        if (!isFolder) {
+            // Ak ide o súbor, poistíme spustenie prehrávania príkazom Play
+            sendSilent("10NW")
+            sendSilent("00IP")
+            delay(250)
         }
     }
 
-    private fun usbNavigateBack() {
-        usbJob?.cancel()
-        usbStatusText.text = "↩ Návrat o úroveň vyššie…"
-        usbJob = scope.launch(Dispatchers.IO) {
-            sendSilent("14NW")
-            delay(900)
-            sendSilent("?GAP")
-            delay(120)
-            sendSilent("?GAH")
-            delay(120)
-            sendSilent("?FL")
-            delay(700)
-            sendSilent("?GAP")
-        }
-    }
+    // =====================================================================
+    // USB v20: celý strom v pamäti, navigácia bez receivera, jasné ovládanie
+    // =====================================================================
 
-    private fun usbReturnToListFromPlay() {
-        usbJob?.cancel()
-        usbStatusText.text = "📋 Zobrazujem aktuálny priečinok…"
+    // Vždy beží len jedna "dlhá" USB úloha; nová predchádzajúcu zruší a počká na ňu.
+    private fun launchUsb(block: suspend CoroutineScope.() -> Unit) {
+        val prev = usbJob
         usbJob = scope.launch(Dispatchers.IO) {
-            if (nwScreenType == "04" || nwScreenType == "05") {
-                sendSilent("14NW")
-                delay(500)
+            prev?.cancelAndJoin()
+            usbBusy = true
+            try {
+                block(this)
+            } finally {
+                usbBusy = false
             }
-            sendSilent("?GAP")
-            sendSilent("?GAH")
-            sendSilent("?FL")
         }
     }
 
-    private fun usbPageStep(up: Boolean) {
-        usbJob?.cancel()
-        usbJob = scope.launch(Dispatchers.IO) {
-            sendSilent(if (up) "04NW" else "05NW")
-            delay(500)
-            sendSilent("?GAP")
-            sendSilent("?GAH")
-            sendSilent("?FL")
-        }
-    }
-
-    private fun refreshUsbListDelayed(ms: Long) {
-        usbJob?.cancel()
-        usbJob = scope.launch(Dispatchers.IO) {
-            delay(ms)
-            sendSilent("?GAP")
-            sendSilent("?GAH")
-            sendSilent("?FL")
-        }
-    }
-
-    private fun onUsbItemClicked(lineIndex: Int, typeCode: String, title: String) {
-        usbJob?.cancel()
-        val isFolder = typeCode == "00"
-        val ghpCmd = String.format("%02dGHP", lineIndex)
-
-        if (isFolder) {
-            usbStatusText.text = "📁 Otváram priečinok: $title… (čakám na zoznam z receivera)"
-            usbJob = scope.launch(Dispatchers.IO) {
-                sendSilent(ghpCmd)
-                delay(600)
-                sendSilent("?GAP")
-                sendSilent("?GAH")
-                sendSilent("?FL")
+    // Transportný príkaz: najprv skúsi iPod/USB (xxIP). Ak receiver odpovie chybou E0x,
+    // skúsi sieťový variant (xxNW) a zapamätá si, ktorý funguje. Tým sa nikdy
+    // nepošle dvojitý príkaz (pauza by sa inak hneď zrušila, "ďalšia" by preskočila 2 skladby).
+    private suspend fun usbCmd(ip: String, nw: String) {
+        usbCmdMutex.withLock {
+            val mode = usbUseIp
+            logEv("usbCmd ip=$ip nw=$nw režim(usbUseIp)=$mode")
+            if (mode == true) {
+                sendSilent(ip)
+            } else if (mode == false) {
+                sendSilent(nw)
+            } else {
+                val t0 = System.currentTimeMillis()
+                sendSilent(ip)
+                delay(450)
+                if (lastErrAt >= t0) {
+                    val t1 = System.currentTimeMillis()
+                    sendSilent(nw)
+                    delay(450)
+                    usbUseIp = if (lastErrAt >= t1) null else false
+                } else {
+                    usbUseIp = true
+                }
+                logEv("usbCmd: zistený režim usbUseIp=$usbUseIp (null = obe vrátili chybu)")
             }
+            Unit
+        }
+    }
+
+    private fun updateUsbTransportUi() {
+        if (::usbPauseBtn.isInitialized) {
+            usbPauseBtn.text = if (usbState == UsbState.PAUSED) "⏯ POKRAČOVAŤ" else "⏸ PAUZA"
+        }
+    }
+
+    // ---------- načítanie celého USB ----------
+
+    private fun onUsbScanButton() {
+        if (usbScanning) {
+            usbJob?.cancel()
+            usbScanning = false
+            usbStatusText.text = "Načítavanie zrušené. Pôvodný obsah v pamäti ostal nezmenený."
         } else {
-            // Ide o audio súbor -> spustíme prehrávanie (receiver automaticky pokračuje celým adresárom)
-            activeStationName = title
-            playMetaLines.clear()
-            playTimeText = ""
-            updateMainDisplayHeader()
-            usbStatusText.text = "▶ Prehrávam: $title (pokračuje celý adresár)"
+            scanEntireUsbTree()
+        }
+    }
 
-            usbJob = scope.launch(Dispatchers.IO) {
-                sendSilent(ghpCmd)
-                delay(350)
-                sendSilent("10NW") // potvrdenie Play
-                delay(1200)
-                sendSilent("?GAP")
-                sendSilent("?GAH")
-                sendSilent("?FL")
+    // Rekurzívne prejde celý kľúč. Receiver je pri volaní v zozname adresára parentKey.
+    private suspend fun scanUsbFolderRecursive(
+        cache: MutableMap<String, MutableList<UsbNode>>,
+        parentKey: String,
+        parentTitle: String,
+        depth: Int,
+        counter: IntArray
+    ) {
+        val items = fetchAllItemsInCurrentReceiverFolder(parentKey)
+        logEv("scan: adresár $parentKey ('$parentTitle') -> ${items.size} položiek: " +
+            items.joinToString(" | ") { "${it.indexInParent}:${if (it.isFolder) "D" else "S"}:${it.title}" })
+        cache[parentKey] = items
+        counter[0] += items.size
+        ui {
+            usbStatusText.text = "⏳ Načítavam USB… adresárov: ${counter[1] + 1}, položiek: ${counter[0]}" +
+                "  (teraz: $parentTitle) — zrušíš tlačidlom 🔄"
+        }
+        if (depth >= 8) return
+
+        for (i in items.indices) {
+            currentCoroutineContext().ensureActive()
+            val node = items[i]
+            if (!node.isFolder) continue
+
+            nwScreenType = ""
+            logEv("scan: otváram ${node.pathKey} '${node.title}'")
+            openUsbItemAtIndex(node.indexInParent, isFolder = true)
+            delay(500)
+            sendSilent("?GAP")
+            delay(400)
+
+            logEv("scan: po otvorení ${node.pathKey} obrazovka=$nwScreenType")
+            if (nwScreenType == "04" || nwScreenType == "05") {
+                // Nebol to adresár ale súbor (receiver ho začal hrať) -> opravíme typ a zastavíme
+                sendSilent("02IP")
+                sendSilent("20NW")
+                delay(250)
+                isUsbPlayingNow = false
+                items[i] = node.copy(isFolder = false)
+                sendUsbReturnUp()
+                delay(450)
+                continue
+            }
+
+            counter[1]++
+            scanUsbFolderRecursive(cache, node.pathKey, node.title, depth + 1, counter)
+            sendUsbReturnUp()
+            delay(450)
+        }
+    }
+
+    private fun scanEntireUsbTree() {
+        if (usbScanning) return
+        logEv("SCAN štart")
+        usbScanning = true
+        usbState = UsbState.STOPPED
+        updateUsbTransportUi()
+        usbStatusText.text = "⏳ Zastavujem prehrávanie a načítavam celý USB kľúč… (zrušíš tlačidlom 🔄)"
+
+        launchUsb {
+            try {
+                exitUsbPlayScreenToRootList()
+                val newCache = linkedMapOf<String, MutableList<UsbNode>>()
+                val counter = IntArray(2)
+                scanUsbFolderRecursive(newCache, "/", "koreň", 0, counter)
+                ui {
+                    usbTreeCache.clear()
+                    usbTreeCache.putAll(newCache)
+                    usbCurrentPath.clear()
+                    usbSelectedPathKey = null
+                    saveCachedUsbTree()
+                    renderUsbCachedFolder()
+                    usbStatusText.text = "✓ USB načítaný: ${counter[1] + 1} adresárov, ${counter[0]} položiek."
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                ui { usbStatusText.text = "Chyba pri načítaní USB: ${e.message ?: "neznáma"}" }
+            } finally {
+                usbScanning = false
             }
         }
     }
 
-    private fun renderUsbList() {
+    // ---------- zobrazenie a výber (len z pamäte, receiver sa nedotýka) ----------
+
+    private fun usbNodeLabel(node: UsbNode): String {
+        val icon = if (node.isFolder) "📁" else "🎵"
+        var cnt = ""
+        if (node.isFolder) {
+            val n = usbTreeCache[node.pathKey]?.size
+            if (n != null) cnt = "  ($n)"
+        }
+        return "${node.indexInParent}.  $icon  ${node.title}$cnt"
+    }
+
+    private fun updateUsbSelectionStyles() {
+        val sel = findUsbNodeByKey(usbSelectedPathKey)
+        if (::usbSelectedText.isInitialized) {
+            usbSelectedText.text = if (sel != null) {
+                val lbl = if (sel.isFolder) "celý adresár" else "súbor"
+                "✓ Označené ($lbl): ${sel.title} — stlač ▶ PLAY"
+            } else {
+                "✓ Označené: (nič) — ☐ označí adresár/súbor, klik na adresár ho otvorí"
+            }
+        }
+        usbTreeCache[currentUsbPathKey()].orEmpty().forEach { node ->
+            val isSel = node.pathKey == usbSelectedPathKey
+            usbCheckButtons[node.pathKey]?.let { c ->
+                c.text = if (isSel) "☑" else "☐"
+                highlightBtn(c, isSel, C_ORANGE)
+            }
+            usbNodeButtons[node.pathKey]?.let { b ->
+                b.text = usbNodeLabel(node)
+                if (isSel) {
+                    highlightBtn(b, true, C_ORANGE)
+                } else {
+                    b.background = roundedBg(
+                        if (node.isFolder) C_BTN else C_CARD2, 12,
+                        if (node.isFolder) C_CYAN_D else C_STROKE
+                    )
+                    b.setTextColor(C_WHITE)
+                    b.typeface = Typeface.DEFAULT
+                }
+            }
+        }
+    }
+
+    private fun renderUsbCachedFolder() {
         if (!::usbListLayout.isInitialized) return
         usbListLayout.removeAllViews()
+        usbNodeButtons.clear()
+        usbCheckButtons.clear()
 
-        if (usbScreenItems.isEmpty()) {
+        usbPathText.text = "📂 Adresár: ${currentUsbPathDisplay()}"
+
+        if (usbCurrentPath.isNotEmpty()) {
+            val upBtn = flatBtn("📁  ..  (o úroveň vyššie)") { navigateUpOneUsbFolder() }
+            upBtn.gravity = Gravity.START or Gravity.CENTER_VERTICAL
+            upBtn.textSize = 13f
+            upBtn.setPadding(dp(14), dp(10), dp(14), dp(10))
+            upBtn.background = roundedBg(C_CARD, 12, C_ORANGE)
+            val lp = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+            lp.topMargin = dp(4)
+            usbListLayout.addView(upBtn, lp)
+        }
+
+        val items = usbTreeCache[currentUsbPathKey()]
+        if (items.isNullOrEmpty()) {
             val emptyTv = TextView(this)
-            emptyTv.text = "(Zoznam USB je prázdny — uisti sa, že USB kľúč je v prednom porte a klikni na 🔌 NAČÍTAŤ USB)"
+            emptyTv.text = "(Adresár nie je v pamäti alebo je prázdny — stlač 🔄 NAČÍTAŤ CELÉ USB DO PAMÄTE)"
             emptyTv.textSize = 11f
             emptyTv.setTextColor(C_DIM)
-            emptyTv.setPadding(dp(4), dp(6), dp(4), dp(8))
+            emptyTv.setPadding(dp(4), dp(8), dp(4), dp(8))
             usbListLayout.addView(emptyTv)
+            updateUsbSelectionStyles()
             return
         }
 
-        usbScreenItems.entries.sortedBy { it.key }.forEach { (idx, pair) ->
-            val typeCode = pair.first
-            val itemTitle = pair.second
-            if (itemTitle.isBlank()) return@forEach
+        items.forEach { node ->
+            val row = LinearLayout(this)
+            row.orientation = LinearLayout.HORIZONTAL
 
-            val isFolder = typeCode == "00"
-            val icon = if (isFolder) "📁" else "🎵"
-            val absNum = if (usbRangeStart > 0) (usbRangeStart + idx - 1) else idx
-
-            val b = flatBtn("$absNum.  $icon  $itemTitle") {
-                onUsbItemClicked(idx, typeCode, itemTitle)
-            }
+            val chk = flatBtn("☐") { toggleUsbSelection(node) }
+            chk.textSize = 18f
+            val b = flatBtn(usbNodeLabel(node)) { onUsbNodeClicked(node) }
             b.gravity = Gravity.START or Gravity.CENTER_VERTICAL
             b.textSize = 13f
             b.setPadding(dp(14), dp(10), dp(14), dp(10))
-            b.background = roundedBg(
-                if (isFolder) C_BTN else C_CARD2,
-                12,
-                if (isFolder) C_CYAN_D else C_STROKE
-            )
+
+            usbCheckButtons[node.pathKey] = chk
+            usbNodeButtons[node.pathKey] = b
+
+            row.addView(chk, LinearLayout.LayoutParams(dp(56), ViewGroup.LayoutParams.MATCH_PARENT))
+            val lpB = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            lpB.leftMargin = dp(4)
+            row.addView(b, lpB)
 
             val lp = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            )
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
             lp.topMargin = dp(4)
-            usbListLayout.addView(b, lp)
+            usbListLayout.addView(row, lp)
+        }
+        updateUsbSelectionStyles()
+    }
+
+    private fun navigateUpOneUsbFolder() {
+        if (usbCurrentPath.isNotEmpty()) {
+            usbCurrentPath.removeAt(usbCurrentPath.size - 1)
+            renderUsbCachedFolder()
+        }
+    }
+
+    private fun enterUsbFolderNode(node: UsbNode) {
+        usbCurrentPath.add(node.indexInParent to node.title)
+        renderUsbCachedFolder()
+        val n = usbTreeCache[node.pathKey]?.size
+        usbStatusText.text = if (n == null)
+            "⚠️ Obsah '${node.title}' nie je v pamäti — stlač 🔄 NAČÍTAŤ CELÉ USB."
+        else
+            "📂 '${node.title}' — $n položiek."
+    }
+
+    private fun toggleUsbSelection(node: UsbNode) {
+        usbSelectedPathKey = if (usbSelectedPathKey == node.pathKey) null else node.pathKey
+        updateUsbSelectionStyles()
+    }
+
+    // Klik na riadok: adresár sa otvorí, súbor sa označí.
+    private fun onUsbNodeClicked(node: UsbNode) {
+        if (node.isFolder) {
+            enterUsbFolderNode(node)
+        } else {
+            usbSelectedPathKey = node.pathKey
+            updateUsbSelectionStyles()
+            usbStatusText.text = "Označený súbor '${node.title}' — stlač ▶ PLAY."
+        }
+    }
+
+    private fun findUsbNodeByKey(pathKey: String?): UsbNode? {
+        if (pathKey.isNullOrBlank()) return null
+        usbTreeCache.values.forEach { list ->
+            list.firstOrNull { it.pathKey == pathKey }?.let { return it }
+        }
+        return null
+    }
+
+    // Prvý súbor v adresári (najprv priamo v ňom, potom v podadresároch).
+    private fun firstPlayableFile(node: UsbNode, depth: Int = 0): UsbNode? {
+        if (!node.isFolder) return node
+        if (depth > 8) return null
+        val children = usbTreeCache[node.pathKey].orEmpty()
+        children.firstOrNull { !it.isFolder }?.let { return it }
+        for (c in children) {
+            firstPlayableFile(c, depth + 1)?.let { return it }
+        }
+        return null
+    }
+
+    // ---------- ovládanie prehrávania ----------
+
+    // ▶ PLAY:
+    //  - pozastavené a označenie sa nezmenilo  -> pokračuje
+    //  - už hrá to isté označenie              -> nič
+    //  - iné označenie / zastavené             -> zastaví aktuálne a spustí označené
+    private fun onUsbPlayPressed() {
+        val sel = findUsbNodeByKey(usbSelectedPathKey)
+        if (sel == null) {
+            if (usbState == UsbState.PAUSED) resumeUsb()
+            else usbStatusText.text = "⚠️ Najprv označ adresár alebo súbor (☐)."
+            return
+        }
+        if (usbState == UsbState.PAUSED && sel.pathKey == usbStartedKey) {
+            resumeUsb()
+            return
+        }
+        if (usbState == UsbState.PLAYING && sel.pathKey == usbStartedKey) {
+            usbStatusText.text = "▶ '${sel.title}' už hrá. Pre iný výber ho označ a stlač ▶ PLAY."
+            return
+        }
+        startUsbSelection(sel)
+    }
+
+    private fun startUsbSelection(sel: UsbNode) {
+        val target = firstPlayableFile(sel)
+        if (target == null) {
+            usbStatusText.text = "⚠️ V '${sel.title}' som nenašiel žiadny súbor. Skús 🔄 NAČÍTAŤ CELÉ USB."
+            return
+        }
+        val steps = target.pathKey.trim('/').split('/').mapNotNull { it.toIntOrNull() }
+        if (steps.isEmpty()) return
+
+        logEv("PLAY: výber=${sel.pathKey} '${sel.title}' cieľový súbor=${target.pathKey} '${target.title}' kroky=$steps")
+        usbStartedKey = sel.pathKey
+        usbState = UsbState.PLAYING
+        updateUsbTransportUi()
+        activeStationName = sel.title
+        playMetaLines.clear()
+        playTimeText = ""
+        updateMainDisplayHeader()
+        usbStatusText.text = "⏳ Spúšťam '${sel.title}'…"
+
+        launchUsb {
+            isPlayingFavorite = false
+            exitUsbPlayScreenToRootList()          // zastaví staré prehrávanie, späť do koreňa
+            for (i in 0 until steps.size - 1) {
+                openUsbItemAtIndex(steps[i], isFolder = true)
+                delay(600)
+            }
+            isUsbPlayingNow = true
+            openUsbItemAtIndex(steps.last(), isFolder = false)
+            val what = if (sel.isFolder) "adresár ${sel.title} (od: ${target.title})" else sel.title
+            ui { usbStatusText.text = "▶ Hrá: $what" }
+            delay(1400)
+            sendSilent("?GAP")
+            sendSilent("?GAH")
+            sendSilent("?FL")
+        }
+    }
+
+    private fun resumeUsb() {
+        logEv("POKRAČOVAŤ (resume)")
+        usbState = UsbState.PLAYING
+        updateUsbTransportUi()
+        usbStatusText.text = "▶ Pokračujem v prehrávaní."
+        scope.launch(Dispatchers.IO) { usbCmd("00IP", "10NW") }
+    }
+
+    private fun onUsbPausePressed() {
+        if (usbBusy) {
+            usbStatusText.text = "⏳ Receiver ešte dokončuje predchádzajúcu operáciu…"
+            return
+        }
+        logEv("PAUZA stlačená (stav bol $usbState)")
+        when (usbState) {
+            UsbState.PLAYING -> {
+                usbState = UsbState.PAUSED
+                usbStatusText.text = "⏸ Pozastavené."
+                scope.launch(Dispatchers.IO) { usbCmd("01IP", "11NW") }
+            }
+            UsbState.PAUSED -> resumeUsb()
+            UsbState.STOPPED -> usbStatusText.text = "Nič nehrá — označ položku a stlač ▶ PLAY."
+        }
+        updateUsbTransportUi()
+    }
+
+    private fun usbSkip(ip: String, nw: String, msg: String) {
+        logEv("SKIP: $msg (stav $usbState, busy=$usbBusy)")
+        if (usbBusy) {
+            usbStatusText.text = "⏳ Receiver ešte dokončuje predchádzajúcu operáciu…"
+            return
+        }
+        if (usbState == UsbState.STOPPED) {
+            usbStatusText.text = "Nič nehrá — označ položku a stlač ▶ PLAY."
+            return
+        }
+        usbState = UsbState.PLAYING
+        updateUsbTransportUi()
+        usbStatusText.text = msg
+        scope.launch(Dispatchers.IO) {
+            usbCmd(ip, nw)
+            delay(1200)
+            sendSilent("?GAP")
+            sendSilent("?FL")
+        }
+    }
+
+    private fun onUsbNextPressed() = usbSkip("04IP", "13NW", "⏭ Ďalšia skladba…")
+    private fun onUsbPrevPressed() = usbSkip("03IP", "12NW", "⏮ Predchádzajúca skladba…")
+
+    private fun onUsbRepeatPressed() {
+        usbStatusText.text = "🔁 Repeat prepnutý."
+        scope.launch(Dispatchers.IO) { usbCmd("07IP", "34NW") }
+    }
+
+    // ⏹ STOP: okamžite zruší rozbehnutú navigáciu/sken a zastaví prehrávanie.
+    private fun stopUsbPlayback() {
+        logEv("STOP stlačené (stav bol $usbState)")
+        usbJob?.cancel()
+        isUsbPlayingNow = false
+        usbState = UsbState.STOPPED
+        updateUsbTransportUi()
+        playMetaLines.clear()
+        playTimeText = ""
+        activeStationName = ""
+        updateMainDisplayHeader()
+        usbStatusText.text = "⏳ Zastavujem prehrávanie…"
+
+        scope.launch(Dispatchers.IO) {
+            val mode = usbUseIp
+            if (mode == true) {
+                sendSilent("02IP")
+            } else if (mode == false) {
+                sendSilent("20NW")
+            } else {
+                sendSilent("02IP")
+                sendSilent("20NW")
+            }
+            delay(400)
+            sendSilent("?FL")
+            sendSilent("?GAP")
+            ui {
+                usbStatusText.text = "⏹ Zastavené. Označ iný adresár alebo súbor a stlač ▶ PLAY."
+            }
         }
     }
 
@@ -1209,7 +1878,6 @@ class MainActivity : AppCompatActivity() {
 
         val icon = if (activeInput == "IPOD/USB") "🔌" else "📻"
 
-        // 1. Horný výrazný nápis: Názov rádiovej stanice / USB skladby (alebo aktívny vstup / FL displej)
         val topTitle = when {
             !presetName.isNullOrBlank() -> "$icon  $presetName"
             activeStationName.isNotBlank() -> "$icon  $activeStationName"
@@ -1220,7 +1888,6 @@ class MainActivity : AppCompatActivity() {
         }
         mainStationBig.text = topTitle
 
-        // 2. Pod ním menším písmom: Názov relácie / skladby + bitrate
         val showParts = listOf(l1, l2, l3).filter {
             it.isNotBlank() &&
                 !it.equals(presetName, ignoreCase = true) &&
@@ -1799,6 +2466,7 @@ class MainActivity : AppCompatActivity() {
                 sock.keepAlive = true
                 outWriter = OutputStreamWriter(sock.getOutputStream(), Charsets.US_ASCII)
                 socketRef.set(sock)
+                logEv("pripojené $host:$port")
                 saveHostIp(host)
                 ui {
                     connLine.text = "●  Pripojené: $host:$port"
@@ -1833,6 +2501,7 @@ class MainActivity : AppCompatActivity() {
                     BufferedReader(InputStreamReader(sock.getInputStream(), Charsets.US_ASCII))
                 while (isActive && sock.isConnected) {
                     val line = reader.readLine() ?: break
+                    logRaw("RX", line.trim())
                     handleResponse(line.trim())
                 }
             } catch (e: Exception) {
@@ -1905,6 +2574,7 @@ class MainActivity : AppCompatActivity() {
                 line == "PWR0" -> { isOn = true; updatePowerButton() }
                 line == "PWR2" || line == "PWR1" -> { isOn = false; updatePowerButton() }
                 line.startsWith("E0") -> {
+                    lastErrAt = System.currentTimeMillis()
                     val errDesc = when (line) {
                         "E02" -> "Príkaz teraz nie je dostupný (E02)"
                         "E03" -> "Neplatný príkaz (E03)"
@@ -1921,44 +2591,29 @@ class MainActivity : AppCompatActivity() {
                         updateMainDisplayHeader()
                     }
                 }
-                line.startsWith("GBH") || line.startsWith("GBP") -> {
-                    val maxLine = line.substring(3).trim().toIntOrNull() ?: 0
-                    if (maxLine == 0 && activeInput == "IPOD/USB") {
-                        usbScreenItems.clear()
-                        renderUsbList()
-                    }
-                }
                 line.startsWith("GCH") || line.startsWith("GCP") -> {
                     if (line.length >= 5) {
                         nwScreenType = line.substring(3, 5)
                     }
                     nwScreenName = line.substringAfter("\"", "").substringBeforeLast("\"", "")
-                    if (nwScreenType == "01" || nwScreenType == "02") {
+                    if (nwScreenType == "01" || nwScreenType == "02" || nwScreenType == "00") {
                         listScreenReady = true
                         isPlayingFavorite = false
-                        if (activeInput == "IPOD/USB") {
-                            usbScreenItems.clear()
-                        }
+                        isUsbPlayingNow = false
                     } else if (nwScreenType == "04" || nwScreenType == "05") {
-                        isPlayingFavorite = true
-                    }
-                    if (activeInput == "IPOD/USB" && ::usbPathText.isInitialized) {
-                        val folderLabel = if (nwScreenName.isNotEmpty()) nwScreenName else "USB Kľúč"
-                        val rangeInfo = if (usbTotalItems > 0) " ($usbRangeStart–$usbRangeEnd z $usbTotalItems)" else ""
-                        usbPathText.text = "📂 $folderLabel$rangeInfo"
+                        listScreenReady = false
+                        if (activeInput == "FAVORITES") isPlayingFavorite = true
+                        if (activeInput == "IPOD/USB") isUsbPlayingNow = true
                     }
                 }
                 line.startsWith("GDH") || line.startsWith("GDP") -> {
                     listScreenReady = true
-                    // Formát: GDH + start(5) + end(5) + total(5), napr. GDH000010000800024
                     if (line.length >= 18) {
-                        usbRangeStart = line.substring(3, 8).toIntOrNull() ?: 0
-                        usbRangeEnd = line.substring(8, 13).toIntOrNull() ?: 0
-                        usbTotalItems = line.substring(13, 18).toIntOrNull() ?: 0
-                        if (activeInput == "IPOD/USB" && ::usbPathText.isInitialized) {
-                            val folderLabel = if (nwScreenName.isNotEmpty()) nwScreenName else "USB Kľúč"
-                            usbPathText.text = "📂 $folderLabel ($usbRangeStart–$usbRangeEnd z $usbTotalItems)"
-                        }
+                        rawRangeStart = line.substring(3, 8).toIntOrNull() ?: 1
+                        rawRangeEnd = line.substring(8, 13).toIntOrNull() ?: 0
+                        rawTotalItems = line.substring(13, 18).toIntOrNull() ?: 0
+                        rawGdhUpdatedAt = System.currentTimeMillis()
+                        rawPageUpdatedAt = rawGdhUpdatedAt
                     }
                 }
                 line.startsWith("GHH") || line.startsWith("GHP") || line.startsWith("GIH") || line.startsWith("GIP") -> {
@@ -1975,7 +2630,9 @@ class MainActivity : AppCompatActivity() {
                     val typeNum = typeCode.toIntOrNull() ?: 1
 
                     if (idx != null) {
-                        val isPlayScreen = nwScreenType == "04" || nwScreenType == "05"
+                        // VŽDY filtrujeme metadáta (typeNum >= 10 alebo Play Screen 04/05),
+                        // aby sa názov hrajúcej skladby z 1. adresára nikdy neuložil ako položka iného adresára!
+                        val isPlayScreen = nwScreenType == "04" || nwScreenType == "05" || isUsbPlayingNow || isPlayingFavorite
                         val isMetadataLine = typeNum >= 10 || isPlayScreen || looksLikeMetadata(title)
 
                         if (isMetadataLine) {
@@ -1985,20 +2642,21 @@ class MainActivity : AppCompatActivity() {
                                 playMetaLines.remove(idx)
                             }
                             updateMainDisplayHeader()
-                        } else if (activeInput == "IPOD/USB" || activeInput == "17FN") {
-                            // Položka zoznamu z predného USB kľúča (00 = priečinok, 01..04 = súbor)
-                            if (title.isNotEmpty()) {
-                                usbScreenItems[idx] = typeCode to title
-                            } else {
-                                usbScreenItems.remove(idx)
-                            }
-                            renderUsbList()
-                        } else if (isSyncingFavorites || (activeInput == "FAVORITES" && favStations.size < 8)) {
+                        } else {
                             listScreenReady = true
-                            if (title.isNotEmpty() && !title.startsWith("[")) {
-                                favStations[idx] = title
-                                saveCachedFavorites()
-                                renderFavoriteTable()
+                            if (title.isNotEmpty()) {
+                                rawPageLines[idx] = typeCode to title
+                            } else {
+                                rawPageLines.remove(idx)
+                            }
+                            rawPageUpdatedAt = System.currentTimeMillis()
+
+                            if (isSyncingFavorites || (activeInput == "FAVORITES" && favStations.size < 8)) {
+                                if (title.isNotEmpty() && !title.startsWith("[")) {
+                                    favStations[idx] = title
+                                    saveCachedFavorites()
+                                    renderFavoriteTable()
+                                }
                             }
                         }
                     }
@@ -2009,18 +2667,16 @@ class MainActivity : AppCompatActivity() {
 
     private fun send(cmd: String) = sendSilent(cmd)
 
+    // Všetky príkazy idú cez jedno vlákno => zachované poradie, žiadne prelínanie zápisov
     private fun sendSilent(cmd: String) {
-        // Zápis je krátky a synchronny. Pôvodná verzia spúšťala pre každý
-        // príkaz novú coroutine, čo mohlo zmeniť poradie GHP / ?GAP / ?GAH.
-        try {
-            synchronized(commandWriteLock) {
-                outWriter?.let {
-                    it.write(cmd + "\r\n")
-                    it.flush()
-                }
+        scope.launch(sendDispatcher) {
+            try {
+                logRaw("TX", cmd)
+                outWriter?.let { it.write(cmd + "\r\n"); it.flush() }
+                Thread.sleep(60) // receiver potrebuje odstup medzi príkazmi
+            } catch (e: Exception) {
+                ui { statusText.text = "Chyba odosielania: " + e.message }
             }
-        } catch (e: Exception) {
-            ui { statusText.text = "Chyba odosielania ($cmd): " + (e.message ?: "neznáma") }
         }
     }
 
