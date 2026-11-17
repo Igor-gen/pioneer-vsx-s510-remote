@@ -1,5 +1,5 @@
 // ============================================================================
-// Pioneer VSX-S510 Remote — verzia 20-log (v20 + diagnostický log)
+// Pioneer VSX-S510 Remote — verzia 20-log2 (v20 + diagnostický log + oprava navigácie podľa logu)
 // - USB (vstup 17FN) prepracované:
 //     1. Načíta sa CELÝ obsah kľúča (rekurzívne) do pamäte a uloží sa.
 //     2. Pohyb po strukture, otváranie adresárov a označovanie (☐/☑) ide len z pamäte.
@@ -9,6 +9,8 @@
 //     6. Pauza / ďalšia / predošlá sa neposielajú dvojito (IP aj NW naraz).
 //     7. DIAGNOSTICKÝ LOG: všetky odoslané (TX) a prijaté (RX) riadky + udalosti (EV)
 //        sa ukladajú do pioneer_log.txt; tlačidlo 📤 Odoslať LOG na karte MÉDIÁ / USB.
+//     8. Navigácia podľa skutočného logu: zoznam = GCP01/GBP08, prehrávanie = GCP02/06;
+//        GGP+GHP výber riadku v okne; Return sa overuje, inak sa ide od koreňa.
 // ============================================================================
 
 package com.example.pioneerremote
@@ -1169,219 +1171,245 @@ class MainActivity : AppCompatActivity() {
         return if (usbCurrentPath.isEmpty()) "/ (Koreň USB)" else "/" + usbCurrentPath.joinToString("/") { it.second }
     }
 
-    // Príkaz RETURN (o úroveň vyššie / návrat z Play obrazovky do zoznamu)
-    private suspend fun sendUsbReturnUp() {
-        sendSilent("31NW")
-        delay(100)
-        sendSilent("18IP")
+    // =====================================================================
+    // USB navigácia na receiveri (v20-log2) — podľa skutočného logu VSX-S510:
+    //  - GBP08 + GCP01 = zoznam (8 riadkov); GBP07 + GCP02/06 = obrazovka prehrávania
+    //  - GEP typ 01 = adresár, 02 = súbor, 2x = riadky prehrávania (metadáta)
+    //  - GDP = okno zoznamu (od, do, spolu); okno ide po 8 riadkoch (1-8, 9-16, ...)
+    //  - GGP n  = presun kurzora na položku n (okno sa prepne na jej stránku)
+    //  - GHP rr = výber riadku rr v okne (otvorí adresár / spustí súbor)
+    //  - Return (18IP / 31NW) receiver potvrdí ("R"), ale adresár nezmení -> overujeme
+    //    výsledok cez ?GAP, učíme sa funkčný príkaz a ak nič nezaberie, ideme od koreňa.
+    // =====================================================================
+
+    @Volatile private var rxGbp = 0
+    @Volatile private var rxScreenAt = 0L
+    private var recvPath: List<Int>? = null     // poloha receivera v strome (null = neznáma)
+    private var usbUpCmd: String? = null        // naučený príkaz "o úroveň vyššie"
+    private var usbUpFails = 0                  // koľkokrát zlyhali všetky kandidáti na "hore"
+
+    private fun usbOnList(): Boolean = nwScreenType == "01" || nwScreenType == "00"
+
+    private fun usbAtRoot(): Boolean =
+        usbOnList() && nwScreenName.trim().equals("USB", ignoreCase = true)
+
+    private fun usbStopBoth() {
+        sendSilent("02IP")
+        sendSilent("20NW")
     }
 
-    // Príkaz ENTER (otvoriť označený priečinok / spustiť označený súbor)
-    private suspend fun sendUsbEnter() {
-        sendSilent("30NW")
-        delay(100)
-        sendSilent("17IP")
+    // Vyžiada ?GAP a počká na čerstvú odpoveď (GCP) a dobehnutie riadkov zoznamu
+    private suspend fun usbSnapshot(timeoutMs: Long = 1200): Boolean {
+        val t0 = System.currentTimeMillis()
+        sendSilent("?GAP")
+        var waited = 0L
+        while (waited < timeoutMs) {
+            delay(60)
+            waited += 60
+            if (rxScreenAt >= t0) {
+                delay(150)
+                return true
+            }
+        }
+        return false
     }
 
-    // KRITICKÁ OPRAVA:
-    // Nikdy neprepíname 38FN -> 17FN, keď už sme na USB, pretože opätovné poslanie 17FN
-    // na Pioneer VSX-S510 automaticky spustí Auto-Play prvého adresára!
-    // Namiesto toho zastavíme prehrávanie (20NW / 02IP) a vrátime sa z Play obrazovky (04)
-    // do koreňového zoznamu adresárov (01) pomocou Top Menu / View / Return príkazov.
-    private suspend fun exitUsbPlayScreenToRootList() {
+    // Skúsi o úroveň vyššie. Overí to podľa zmeny názvu adresára v odpovedi receivera.
+    private suspend fun usbTryUp(): Boolean {
+        val titleBefore = nwScreenName
+        val candidates = (listOfNotNull(usbUpCmd) + listOf("18IP", "31NW", "15IP", "29NW")).distinct()
+        for (c in candidates) {
+            sendSilent(c)
+            delay(500)
+            usbSnapshot()
+            val changed = usbOnList() && nwScreenName != titleBefore
+            logEv("up: $c -> obrazovka=$nwScreenType názov='$nwScreenName' (pred: '$titleBefore') zmena=$changed")
+            if (changed) {
+                usbUpCmd = c
+                return true
+            }
+            if (!usbOnList()) return false
+        }
+        return false
+    }
+
+    // Dostane receiver do koreňového zoznamu USB (názov "USB")
+    private suspend fun usbGoRoot(): Boolean {
+        usbSnapshot()
+        logEv("goRoot: obrazovka=$nwScreenType gbp=$rxGbp názov='$nwScreenName'")
+        if (usbAtRoot()) return true
+
+        // Obrazovka prehrávania: zastaviť a skúsiť Top Menu / Return
+        if (!usbOnList()) {
+            usbStopBoth()
+            delay(300)
+            for (c in listOf("19IP", "18IP", "31NW")) {
+                sendSilent(c)
+                delay(500)
+                usbSnapshot()
+                logEv("goRoot: po $c obrazovka=$nwScreenType gbp=$rxGbp názov='$nwScreenName'")
+                if (usbOnList()) break
+            }
+        }
+
+        // Zoznam v podadresári: ísť hore, kým to funguje
+        var guard = 0
+        while (usbOnList() && !usbAtRoot() && guard < 8 && usbUpFails < 2) {
+            if (!usbTryUp()) {
+                usbUpFails++
+                break
+            }
+            guard++
+        }
+        if (usbAtRoot()) return true
+
+        // Núdzovo: prepneme vstup preč a späť — receiver ukáže koreň USB
+        logEv("goRoot: núdzové prepnutie vstupu (06FN -> 17FN)")
+        sendSilent("06FN")
+        delay(1200)
+        sendSilent("17FN")
+        delay(1800)
+        usbSnapshot()
+        if (!usbOnList()) {
+            usbStopBoth()
+            delay(300)
+            sendSilent("19IP")
+            delay(600)
+            usbSnapshot()
+        }
+        logEv("goRoot: po prepnutí obrazovka=$nwScreenType gbp=$rxGbp názov='$nwScreenName'")
+        return usbAtRoot()
+    }
+
+    // Zastaví prehrávanie a dostane receiver do koreňa USB (vstup 17FN)
+    private suspend fun exitUsbPlayScreenToRootList(): Boolean {
         logEv("exit→root: vstup=$activeInput obrazovka=$nwScreenType zapnuté=$isOn")
         isPlayingFavorite = false
         isUsbPlayingNow = false
+        recvPath = null
 
         if (!isOn) {
             sendSilent("PO")
             delay(2500)
         }
-
         if (activeInput != "IPOD/USB" && activeInput != "17FN") {
-            listScreenReady = false
-            sendSilent("17FN")
-            sendSilent("?F")
             ui {
                 activeInput = "IPOD/USB"
                 updateInfoLine()
                 styleInputButtons()
                 updateMainDisplayHeader()
             }
-            // Po prepnutí na 17FN počkáme 1.8 s (ak by VSX-S510 spustil Auto-Play 1. adresára,
-            // hneď ho zastavíme a vrátime do koreňového zoznamu!)
+            sendSilent("17FN")
+            sendSilent("?F")
             delay(1800)
         }
-
-        // 1. Zastavíme prehrávanie (Stop pre Network/USB aj iPod/USB modul)
-        sendSilent("20NW")
-        delay(120)
-        sendSilent("02IP")
-        delay(350)
-
-        // 2. Vyžiadame aktuálny stav obrazovky
-        listScreenReady = false
-        sendSilent("?GAP")
-        sendSilent("?GAH")
-        delay(350)
-
-        // 3. Ak je receiver na Play obrazovke (04/05) alebo ešte neukazuje zoznam (01/02),
-        // prepneme ho do List režimu cez Return (31NW / 18IP), Top Menu (28NW) a View Mode (19IP)
-        if (!listScreenReady || nwScreenType == "04" || nwScreenType == "05") {
-            sendUsbReturnUp()
-            delay(400)
-            sendSilent("?GAP")
-            delay(300)
-        }
-
-        if (!listScreenReady || nwScreenType == "04" || nwScreenType == "05") {
-            sendSilent("28NW") // Top Menu
-            delay(150)
-            sendSilent("19IP") // Switch View Mode (Play screen -> List screen)
-            delay(450)
-            sendSilent("?GAP")
-            delay(300)
-        }
-
-        // 4. Vystúpime zo všetkých podadresárov až do úplného koreňa USB kľúča "/"
-        repeat(5) {
-            sendUsbReturnUp()
-            delay(320)
-        }
-
-        // 5. Posunieme okno zoznamu na položku č. 1 v koreni USB
-        sendSilent("00001GGP")
-        delay(350)
-        sendSilent("?GAP")
-        sendSilent("?GAH")
-        delay(350)
+        val ok = usbGoRoot()
+        recvPath = if (ok) emptyList() else null
+        logEv("exit→root: výsledok=$ok")
+        return ok
     }
 
-    // Načíta všetky položky v aktuálne otvorenom adresári receivera (s podporou GGP stránkovania)
+    // Vyberie položku č. absIndex v aktuálnom zozname receivera (GGP + GHP na správny riadok okna)
+    private suspend fun usbSelectItem(absIndex: Int): Boolean {
+        val t0 = System.currentTimeMillis()
+        sendSilent(String.format("%05dGGP", absIndex))
+        var w = 0
+        while (w < 1000 && rawGdhUpdatedAt < t0) {
+            delay(60)
+            w += 60
+        }
+        delay(200)
+        val line = absIndex - rawRangeStart + 1
+        logEv("select: položka $absIndex okno=$rawRangeStart..$rawRangeEnd z $rawTotalItems -> riadok $line")
+        if (line !in 1..8) return false
+        sendSilent(String.format("%02dGHP", line))
+        delay(700)
+        return true
+    }
+
+    // Dostane receiver do adresára `target` (cesta = indexy od koreňa)
+    private suspend fun usbEnsureAt(target: List<Int>): Boolean {
+        val cur = recvPath
+        if (cur != null && cur == target) return true
+
+        // o jednu úroveň vyššie, ak to receiver vie
+        if (cur != null && cur.size == target.size + 1 &&
+            cur.subList(0, target.size) == target && usbUpFails < 2) {
+            if (usbTryUp()) {
+                recvPath = target
+                return true
+            }
+            usbUpFails++
+        }
+
+        // inak od koreňa
+        if (!usbGoRoot()) {
+            recvPath = null
+            return false
+        }
+        recvPath = emptyList()
+        val walked = mutableListOf<Int>()
+        for (idx in target) {
+            currentCoroutineContext().ensureActive()
+            if (!usbSelectItem(idx)) {
+                recvPath = null
+                return false
+            }
+            usbSnapshot()
+            if (!usbOnList()) {
+                recvPath = null
+                return false
+            }
+            walked.add(idx)
+            recvPath = walked.toList()
+        }
+        return true
+    }
+
+    // Načíta všetky položky v aktuálnom adresári receivera (po stránkach po 8 riadkov)
     private suspend fun fetchAllItemsInCurrentReceiverFolder(parentKey: String): MutableList<UsbNode> {
         val result = mutableListOf<UsbNode>()
         rawPageLines.clear()
-        rawTotalItems = 0
-        rawRangeStart = 1
-        rawRangeEnd = 0
-        val beforeTs = System.currentTimeMillis()
-
-        sendSilent("?GAP")
-        sendSilent("?GAH")
-
-        for (w in 0 until 16) {
-            delay(150)
-            if (rawPageUpdatedAt > beforeTs && rawPageLines.isNotEmpty()) break
+        usbSnapshot()
+        if (!usbOnList()) {
+            logEv("fetch: nie sme v zozname (obrazovka=$nwScreenType)")
+            return result
         }
-        delay(250)
-
-        // Ak sme stále na Play obrazovke, skúsime ešte raz vyskočiť do zoznamu
-        if (nwScreenType == "04" || nwScreenType == "05") {
-            sendUsbReturnUp()
-            delay(450)
-            rawPageLines.clear()
-            val ts2 = System.currentTimeMillis()
-            sendSilent("?GAP")
-            sendSilent("?GAH")
-            for (w in 0 until 12) {
-                delay(150)
-                if (rawPageUpdatedAt > ts2 && rawPageLines.isNotEmpty()) break
-            }
-        }
-
-        val total = if (rawTotalItems > 0) rawTotalItems else rawPageLines.size
+        val total = rawTotalItems
+        logEv("fetch: $parentKey celkom=$total")
         if (total <= 0) return result
 
         var pageStart = 1
         while (pageStart <= total) {
-            if (pageStart > 1) {
-                rawPageLines.clear()
-                val ts = System.currentTimeMillis()
-                val ggpCmd = String.format("%05dGGP", pageStart)
-                sendSilent(ggpCmd)
-                delay(400)
-                sendSilent("?GAP")
-                sendSilent("?GAH")
-                for (w in 0 until 14) {
-                    delay(150)
-                    if (rawPageUpdatedAt > ts && rawPageLines.isNotEmpty()) break
-                }
-                delay(200)
+            currentCoroutineContext().ensureActive()
+            rawPageLines.clear()
+            val t0 = System.currentTimeMillis()
+            sendSilent(String.format("%05dGGP", pageStart))
+            var w = 0
+            while (w < 1500 && !(rawPageUpdatedAt >= t0 && rawPageLines.isNotEmpty())) {
+                delay(60)
+                w += 60
             }
+            delay(250)
 
+            val start = rawRangeStart
             val snapshot = synchronized(rawPageLines) { LinkedHashMap(rawPageLines) }
             for (lineIdx in 1..8) {
                 val pair = snapshot[lineIdx] ?: continue
-                val absIdx = pageStart + lineIdx - 1
+                val absIdx = start + lineIdx - 1
                 if (absIdx > total) break
                 val typeCode = pair.first
                 val title = pair.second.trim()
-                if (title.isEmpty() || looksLikeMetadata(title)) continue
+                if (title.isEmpty()) continue
                 val isFolder = isLikelyUsbFolder(typeCode, title)
                 val nodeKey = if (parentKey == "/") "/$absIdx" else "$parentKey/$absIdx"
                 if (result.none { it.indexInParent == absIdx }) {
                     result.add(UsbNode(absIdx, title, isFolder, nodeKey))
                 }
             }
-
             pageStart += 8
         }
-
-        if (total > 8) {
-            sendSilent("00001GGP")
-            delay(300)
-        }
-
         return result
-    }
-
-    // VÝBER POLOŽKY Č. X V USB ZOZNAME:
-    // 1. Príkazom %05dGGP posunieme zoznam v receiveri tak, aby položka č. absIndex bola na 1. riadku
-    // 2. Ak sa okno neposunulo (napr. pri malom zozname <= 8 položiek), pošleme priamu voľbu %02dGHP
-    // 3. Potvrdíme otvorenie príkazom ENTER (30NW / 17IP)
-    private suspend fun openUsbItemAtIndex(absIndex: Int, isFolder: Boolean) {
-        logEv("open idx=$absIndex folder=$isFolder rangeStart=$rawRangeStart total=$rawTotalItems")
-        val beforeGdh = rawGdhUpdatedAt
-        val beforePage = rawPageUpdatedAt
-        rawPageLines.clear()
-
-        // 1. Skúsime priamu voľbu riadku cez GGP (nastaví cieľovú položku ako 1. v okne) + GHP
-        if (absIndex > 1) {
-            val ggpCmd = String.format("%05dGGP", absIndex)
-            sendSilent(ggpCmd)
-            delay(320)
-        }
-
-        val lineToSelect = if (absIndex <= 8 && rawRangeStart <= 1) absIndex else 1
-        val ghpCmd = String.format("%02dGHP", lineToSelect)
-        sendSilent(ghpCmd)
-        delay(450)
-
-        // 2. Skontrolujeme, či receiver na GHP zareagoval zmenou obrazovky/zoznamu.
-        // Ak nie, pohneme kurzorom od 1. položky šípkou DOLE (27NW / 14IP) presne (absIndex - 1)-krát a stlačíme ENTER!
-        sendSilent("?GAP")
-        delay(300)
-
-        val screenChanged = (rawGdhUpdatedAt > beforeGdh) || (rawPageUpdatedAt > beforePage && rawPageLines.isNotEmpty())
-        logEv("open idx=$absIndex: screenChanged=$screenChanged obrazovka=$nwScreenType rangeStart=$rawRangeStart")
-        if (!screenChanged) {
-            if (absIndex > 1 && rawRangeStart <= 1) {
-                repeat(absIndex - 1) {
-                    sendSilent("27NW") // Cursor Down (Network/USB)
-                    sendSilent("14IP") // Cursor Down (iPod/USB)
-                    delay(180)
-                }
-            }
-            sendUsbEnter()
-            delay(500)
-        }
-
-        if (!isFolder) {
-            // Ak ide o súbor, poistíme spustenie prehrávania príkazom Play
-            sendSilent("10NW")
-            sendSilent("00IP")
-            delay(250)
-        }
     }
 
     // =====================================================================
@@ -1449,9 +1477,10 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // Rekurzívne prejde celý kľúč. Receiver je pri volaní v zozname adresára parentKey.
+    // Rekurzívne prejde celý kľúč. Receiver je pri volaní v adresári `path`.
     private suspend fun scanUsbFolderRecursive(
         cache: MutableMap<String, MutableList<UsbNode>>,
+        path: List<Int>,
         parentKey: String,
         parentTitle: String,
         depth: Int,
@@ -1473,30 +1502,25 @@ class MainActivity : AppCompatActivity() {
             val node = items[i]
             if (!node.isFolder) continue
 
-            nwScreenType = ""
-            logEv("scan: otváram ${node.pathKey} '${node.title}'")
-            openUsbItemAtIndex(node.indexInParent, isFolder = true)
-            delay(500)
-            sendSilent("?GAP")
-            delay(400)
-
-            logEv("scan: po otvorení ${node.pathKey} obrazovka=$nwScreenType")
-            if (nwScreenType == "04" || nwScreenType == "05") {
-                // Nebol to adresár ale súbor (receiver ho začal hrať) -> opravíme typ a zastavíme
-                sendSilent("02IP")
-                sendSilent("20NW")
-                delay(250)
-                isUsbPlayingNow = false
-                items[i] = node.copy(isFolder = false)
-                sendUsbReturnUp()
-                delay(450)
+            if (!usbEnsureAt(path)) {
+                logEv("scan: nepodarilo sa vrátiť do $parentKey, preskakujem ${node.pathKey}")
                 continue
             }
-
+            logEv("scan: otváram ${node.pathKey} '${node.title}'")
+            if (!usbSelectItem(node.indexInParent)) continue
+            usbSnapshot()
+            logEv("scan: po otvorení ${node.pathKey} obrazovka=$nwScreenType názov='$nwScreenName'")
+            if (!usbOnList()) {
+                // Nebol to adresár ale súbor (receiver ho spustil) -> opravíme typ a zastavíme
+                usbStopBoth()
+                items[i] = node.copy(isFolder = false)
+                recvPath = null
+                continue
+            }
+            val childPath = path + node.indexInParent
+            recvPath = childPath
             counter[1]++
-            scanUsbFolderRecursive(cache, node.pathKey, node.title, depth + 1, counter)
-            sendUsbReturnUp()
-            delay(450)
+            scanUsbFolderRecursive(cache, childPath, node.pathKey, node.title, depth + 1, counter)
         }
     }
 
@@ -1510,10 +1534,14 @@ class MainActivity : AppCompatActivity() {
 
         launchUsb {
             try {
-                exitUsbPlayScreenToRootList()
+                val atRoot = exitUsbPlayScreenToRootList()
+                if (!atRoot) {
+                    ui { usbStatusText.text = "⚠️ Nepodarilo sa dostať do koreňa USB (pozri log). Skús znova." }
+                    return@launchUsb
+                }
                 val newCache = linkedMapOf<String, MutableList<UsbNode>>()
                 val counter = IntArray(2)
-                scanUsbFolderRecursive(newCache, "/", "koreň", 0, counter)
+                scanUsbFolderRecursive(newCache, emptyList(), "/", "koreň", 0, counter)
                 ui {
                     usbTreeCache.clear()
                     usbTreeCache.putAll(newCache)
@@ -1677,12 +1705,17 @@ class MainActivity : AppCompatActivity() {
         return null
     }
 
+    private fun isPlayableTitle(t: String): Boolean {
+        val l = t.lowercase()
+        return listOf(".m3u", ".pls", ".cue", ".jpg", ".jpeg", ".png", ".txt", ".nfo", ".log").none { l.endsWith(it) }
+    }
+
     // Prvý súbor v adresári (najprv priamo v ňom, potom v podadresároch).
     private fun firstPlayableFile(node: UsbNode, depth: Int = 0): UsbNode? {
         if (!node.isFolder) return node
         if (depth > 8) return null
         val children = usbTreeCache[node.pathKey].orEmpty()
-        children.firstOrNull { !it.isFolder }?.let { return it }
+        children.firstOrNull { !it.isFolder && isPlayableTitle(it.title) }?.let { return it }
         for (c in children) {
             firstPlayableFile(c, depth + 1)?.let { return it }
         }
@@ -1734,16 +1767,38 @@ class MainActivity : AppCompatActivity() {
 
         launchUsb {
             isPlayingFavorite = false
-            exitUsbPlayScreenToRootList()          // zastaví staré prehrávanie, späť do koreňa
-            for (i in 0 until steps.size - 1) {
-                openUsbItemAtIndex(steps[i], isFolder = true)
-                delay(600)
+            val atRoot = exitUsbPlayScreenToRootList()      // zastaví staré prehrávanie, späť do koreňa
+            if (!atRoot) {
+                ui {
+                    usbState = UsbState.STOPPED
+                    updateUsbTransportUi()
+                    usbStatusText.text = "⚠️ Nepodarilo sa dostať do koreňa USB (pozri log). Skús znova."
+                }
+                return@launchUsb
             }
-            isUsbPlayingNow = true
-            openUsbItemAtIndex(steps.last(), isFolder = false)
+            if (!usbEnsureAt(steps.dropLast(1))) {
+                ui {
+                    usbState = UsbState.STOPPED
+                    updateUsbTransportUi()
+                    usbStatusText.text = "⚠️ Nepodarilo sa otvoriť adresár na receiveri (pozri log)."
+                }
+                return@launchUsb
+            }
+            usbSelectItem(steps.last())
+            usbSnapshot()
+            logEv("PLAY: po výbere obrazovka=$nwScreenType gbp=$rxGbp názov='$nwScreenName'")
+            if (usbOnList()) {
+                // Výber riadku nespustil prehrávanie -> Enter na kurzore
+                logEv("PLAY: stále zoznam, posielam Enter (17IP)")
+                sendSilent("17IP")
+                delay(800)
+                usbSnapshot()
+                logEv("PLAY: po Enter obrazovka=$nwScreenType gbp=$rxGbp")
+            }
+            recvPath = null
             val what = if (sel.isFolder) "adresár ${sel.title} (od: ${target.title})" else sel.title
             ui { usbStatusText.text = "▶ Hrá: $what" }
-            delay(1400)
+            delay(1200)
             sendSilent("?GAP")
             sendSilent("?GAH")
             sendSilent("?FL")
@@ -1809,6 +1864,7 @@ class MainActivity : AppCompatActivity() {
     private fun stopUsbPlayback() {
         logEv("STOP stlačené (stav bol $usbState)")
         usbJob?.cancel()
+        recvPath = null
         isUsbPlayingNow = false
         usbState = UsbState.STOPPED
         updateUsbTransportUi()
@@ -2498,7 +2554,7 @@ class MainActivity : AppCompatActivity() {
         scope.launch(Dispatchers.IO) {
             try {
                 val reader =
-                    BufferedReader(InputStreamReader(sock.getInputStream(), Charsets.US_ASCII))
+                    BufferedReader(InputStreamReader(sock.getInputStream(), Charsets.UTF_8))
                 while (isActive && sock.isConnected) {
                     val line = reader.readLine() ?: break
                     logRaw("RX", line.trim())
@@ -2591,19 +2647,33 @@ class MainActivity : AppCompatActivity() {
                         updateMainDisplayHeader()
                     }
                 }
+                line.startsWith("GBP") -> {
+                    rxGbp = line.substring(3).trim().toIntOrNull() ?: 0
+                }
                 line.startsWith("GCH") || line.startsWith("GCP") -> {
                     if (line.length >= 5) {
                         nwScreenType = line.substring(3, 5)
                     }
                     nwScreenName = line.substringAfter("\"", "").substringBeforeLast("\"", "")
-                    if (nwScreenType == "01" || nwScreenType == "02" || nwScreenType == "00") {
+                    rxScreenAt = System.currentTimeMillis()
+                    val usbCtx = activeInput == "IPOD/USB" || usbBusy || usbState != UsbState.STOPPED
+                    if (usbCtx) {
+                        // VSX-S510 / USB: 01 = zoznam, 02 / 06 (a ostatné) = obrazovka prehrávania
+                        if (nwScreenType == "01" || nwScreenType == "00") {
+                            listScreenReady = true
+                            isPlayingFavorite = false
+                            isUsbPlayingNow = false
+                        } else {
+                            listScreenReady = false
+                            isUsbPlayingNow = true
+                        }
+                    } else if (nwScreenType == "01" || nwScreenType == "02" || nwScreenType == "00") {
                         listScreenReady = true
                         isPlayingFavorite = false
                         isUsbPlayingNow = false
                     } else if (nwScreenType == "04" || nwScreenType == "05") {
                         listScreenReady = false
                         if (activeInput == "FAVORITES") isPlayingFavorite = true
-                        if (activeInput == "IPOD/USB") isUsbPlayingNow = true
                     }
                 }
                 line.startsWith("GDH") || line.startsWith("GDP") -> {
