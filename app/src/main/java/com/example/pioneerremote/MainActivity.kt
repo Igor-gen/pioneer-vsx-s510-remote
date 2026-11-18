@@ -1,10 +1,11 @@
 // ============================================================================
-// Pioneer VSX-S510 Remote — verzia 29
+// Pioneer VSX-S510 Remote — verzia 30 (Kompletná)
 // Úpravy:
-// 1. Životný cyklus: Pri zhasnutí displeja (onStop) sa aplikácia korektne odpojí.
-// 2. Po rozsvietení displeja (onStart) sa automaticky pripojí späť.
-// 3. Ochrana: Ak používateľ vypne receiver cez tlačidlo OFF, automatické 
-//    pripájanie pri prebudení telefónu sa zakáže.
+// 1. Dynamické playlisty (Otvoriť / Uložiť) bez obmedzenia počtu slotov.
+// 2. Šetrenie batérie: Odpojenie pri uspaní telefónu a auto-pripojenie pri prebudení.
+// 3. Zobrazenie aktívneho kľúča (playlistu) na hlavnom displeji.
+// 4. Automatické prehrávanie ďalšieho adresára (Auto-Play Next Folder).
+// 5. Zjednotené tlačidlá hlasitosti do jedného riadka (bez tlačidla Vstup).
 // ============================================================================
 
 package com.example.pioneerremote
@@ -32,6 +33,8 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.recyclerview.widget.RecyclerView
 import androidx.viewpager2.widget.ViewPager2
 import kotlinx.coroutines.*
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.BufferedReader
@@ -127,7 +130,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun shareLog() {
-        val header = "Pioneer Remote v29 | host=$host | vstup=$activeInput | playlist='$activePlaylistName'" +
+        val header = "Pioneer Remote v30 | host=$host | vstup=$activeInput | playlist='$activePlaylistName'" +
             " | adresárov v pamäti=${usbTreeCache.size} | ${android.os.Build.MODEL}\n"
         val i = Intent(Intent.ACTION_SEND)
         i.type = "text/plain"
@@ -250,6 +253,8 @@ class MainActivity : AppCompatActivity() {
     @Volatile private var usbBusy = false
     @Volatile private var usbScanning = false
     @Volatile private var lastErrAt = 0L
+    private var usbUseIp: Boolean? = null
+    private val usbCmdMutex = Mutex()
 
     // ===== DLNA =====
     private data class MediaEntry(
@@ -273,7 +278,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var mediaList: LinearLayout
 
     // =====================================================================
-    // ŽIVOTNÝ CYKLUS A SPRÁVA PRIPOJENIA (USPANIE TELEFÓNU)
+    // ŽIVOTNÝ CYKLUS A SPRÁVA PRIPOJENIA
     // =====================================================================
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -284,7 +289,7 @@ class MainActivity : AppCompatActivity() {
         mediaServerDesc = p.getString("dlnaServer", null)
         mediaServerName = p.getString("dlnaName", "") ?: ""
         isUsbMediaMode = p.getBoolean("isUsbMediaMode", true)
-        logEv("=== štart aplikácie v29, host=$host ===")
+        logEv("=== štart aplikácie v30, host=$host ===")
         loadCachedFavorites()
         loadPlaylistsMetadata()
         buildUI()
@@ -301,17 +306,17 @@ class MainActivity : AppCompatActivity() {
 
     override fun onStart() {
         super.onStart()
-        // Ak sa telefón prebudí z uspania a používateľ predtým receiver manuálne nevypol
+        // Ak sa telefón prebudí a receiver nebol vypnutý cez aplikáciu, pripojíme sa automaticky
         if (autoReconnectAllowed && socketRef.get() == null) {
-            logEv("onStart: aplikácia prebudená, auto-reconnect povolený. Pripájam...")
+            logEv("onStart: aplikácia prebudená. Pripájam...")
             connect(silentFail = true)
         }
     }
 
     override fun onStop() {
         super.onStop()
-        // Pri zhasnutí displeja alebo minimalizovaní aplikácie korektne uzavrieme sieťový socket
-        logEv("onStop: aplikácia uspávaná/na pozadí. Odpájam socket, aby nepadal.")
+        // Pri zhasnutí displeja (alebo minimalizovaní appky) korektne uzavrieme sieťový socket
+        logEv("onStop: aplikácia uspávaná/na pozadí. Odpájam socket.")
         disconnectSocket()
     }
 
@@ -400,6 +405,7 @@ class MainActivity : AppCompatActivity() {
                 loadPlaylist(pl.first, pl.second)
             }
         } else {
+            // Migrácia z verzií 22-26
             val legacy = prefs().getString("usbTreeSlot_0", null) ?: prefs().getString("usbTreeJsonV22", null)
             if (legacy != null && savedPlaylists.isEmpty()) {
                 val id = "legacy_0"
@@ -537,6 +543,15 @@ class MainActivity : AppCompatActivity() {
             }
             .setNegativeButton(if (afterScan) "Neukladať" else "Zrušiť", null)
             .show()
+    }
+
+    private fun looksLikeMetadata(text: String): Boolean {
+        val t = text.trim()
+        if (t.isEmpty()) return true
+        if (Regex("(?i).*\\b(kbps|khz|wma|pcm|buffer)\\b.*").matches(t)) return true
+        if (Regex("^\\d{1,2}:\\d{2}(:\\d{2})?$").matches(t)) return true
+        if (Regex("^\\d+\\s*%$").matches(t)) return true
+        return false
     }
 
     private fun isLikelyUsbFolder(typeCode: String, title: String): Boolean {
@@ -1139,7 +1154,7 @@ class MainActivity : AppCompatActivity() {
         page.addView(switchRow, switchLp)
 
         // =================================================================
-        // KONTAJNER 1: 🔌 USB KĽÚČ
+        // KONTAJNER 1: 🔌 USB KĽÚČ (DYNAMICKÉ PLAYLISTY)
         // =================================================================
         usbContainer = LinearLayout(this)
         usbContainer.orientation = LinearLayout.VERTICAL
@@ -1153,6 +1168,7 @@ class MainActivity : AppCompatActivity() {
         
         usbContainer.addView(rowOf(listOf(openPlaylistBtn, savePlaylistBtn)))
 
+        // Hlavné tlačidlá: iba ▶ PLAY a ⏹ STOP
         usbPlayBtn = flatBtn("▶ PLAY") { onUsbPlayPressed() }
         usbPlayBtn.background = roundedBg(C_GREEN, 12, C_GREEN)
         usbPlayBtn.setTextColor(C_ON_ACCENT)
@@ -1614,7 +1630,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     // =====================================================================
-    // USB: SPRÁVA ÚLOH, SKENOVANIE A PREHRÁVANIE
+    // USB: SPRÁVA ÚLOH, SKENOVANIE A PREHRÁVANIE S AUTO-PLAY ĎALŠIEHO ALBUMU
     // =====================================================================
 
     private fun launchUsb(block: suspend CoroutineScope.() -> Unit) {
@@ -1922,6 +1938,41 @@ class MainActivity : AppCompatActivity() {
         return null
     }
 
+    // Automaticky nájde nasledujúci adresár v playliste po dohraní predchádzajúceho
+    private fun playNextFolderAutomatically(currentNode: UsbNode) {
+        val allItems = mutableListOf<UsbNode>()
+        usbTreeCache.values.forEach { allItems.addAll(it) }
+
+        var foundCurrent = false
+        var nextFolderToPlay: UsbNode? = null
+
+        for (node in allItems) {
+            if (foundCurrent) {
+                // Hľadáme ďalší adresár, ktorý nie je prázdny (má prehrávateľný súbor)
+                if (node.isFolder && firstPlayableFile(node) != null) {
+                    nextFolderToPlay = node
+                    break
+                }
+            }
+            if (node.pathKey == currentNode.pathKey) {
+                foundCurrent = true
+            }
+        }
+
+        if (nextFolderToPlay != null) {
+            logEv("Auto-Play: Adresár skončil, našiel sa ďalší -> '${nextFolderToPlay.title}'")
+            ui { usbStatusText.text = "⏭ Adresár skončil, automaticky spúšťam ďalší: ${nextFolderToPlay.title}" }
+            startUsbSelection(nextFolderToPlay)
+        } else {
+            logEv("Auto-Play: Koniec playlistu, nenašiel sa žiadny ďalší adresár.")
+            ui {
+                usbStatusText.text = "⏹ Koniec playlistu. Všetky adresáre boli prehrané."
+                usbState = UsbState.STOPPED
+                updateUsbTransportUi()
+            }
+        }
+    }
+
     private fun onUsbPlayPressed() {
         val sel = findUsbNodeByKey(usbSelectedPathKey)
         if (sel == null) {
@@ -1983,7 +2034,24 @@ class MainActivity : AppCompatActivity() {
             sendSilent("?GAP")
             sendSilent("?GAH")
             sendSilent("?FL")
+
+            // Kontrola ukončenia adresára pre automatický skok na ďalší
+            var wasPlayingScreen = false
+            while (isActive && usbState == UsbState.PLAYING && usbStartedKey == sel.pathKey) {
+                delay(2000)
+                if (isUsbPlayingNow) {
+                    wasPlayingScreen = true
+                } else if (wasPlayingScreen && !isUsbPlayingNow) {
+                    logEv("Auto-Play: Prehrávanie sa samo ukončilo. Hľadám ďalší adresár...")
+                    playNextFolderAutomatically(sel)
+                    break
+                }
+            }
         }
+    }
+
+    private fun updateUsbTransportUi() {
+        // Tlačidlo pauza už nie je prítomné, ale funkcia tu zostala pre konzistentnosť UI updatu
     }
 
     private fun stopUsbPlayback() {
@@ -2025,41 +2093,7 @@ class MainActivity : AppCompatActivity() {
             }
         }
     }
-    
-    private fun playNextFolderAutomatically(currentNode: UsbNode) {
-        val allItems = mutableListOf<UsbNode>()
-        usbTreeCache.values.forEach { allItems.addAll(it) }
 
-        var foundCurrent = false
-        var nextFolderToPlay: UsbNode? = null
-
-        for (node in allItems) {
-            if (foundCurrent) {
-                // Hľadáme ďalší adresár, ktorý nie je prázdny (má prehrávateľný súbor)
-                if (node.isFolder && firstPlayableFile(node) != null) {
-                    nextFolderToPlay = node
-                    break
-                }
-            }
-            if (node.pathKey == currentNode.pathKey) {
-                foundCurrent = true
-            }
-        }
-
-        if (nextFolderToPlay != null) {
-            logEv("Auto-Play: Adresár skončil, našiel sa ďalší -> '${nextFolderToPlay.title}'")
-            ui { usbStatusText.text = "⏭ Adresár skončil, automaticky spúšťam ďalší: ${nextFolderToPlay.title}" }
-            // Rekurzívne zavolá spustenie nového adresára
-            startUsbSelection(nextFolderToPlay)
-        } else {
-            logEv("Auto-Play: Koniec playlistu, nenašiel sa žiadny ďalší adresár.")
-            ui {
-                usbStatusText.text = "⏹ Koniec playlistu. Všetky adresáre boli prehrané."
-                usbState = UsbState.STOPPED
-                updateUsbTransportUi()
-            }
-        }
-    }
     // =====================================================================
     // AKTUALIZÁCIE HLAVNÉHO DISPLEJA
     // =====================================================================
