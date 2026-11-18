@@ -1,12 +1,9 @@
 // ============================================================================
-// Pioneer VSX-S510 Remote — verzia 23
+// Pioneer VSX-S510 Remote — verzia 28
 // Úpravy:
-// 1. Zjednodušené UI pre USB: ponechané iba funkčné tlačidlá ▶ PLAY a ⏹ STOP
-//    (odstránené nefunkčné Pauza, Predch., Ďalšia, Repeat).
-// 2. ▶ PLAY funguje okamžite na 1 kliknutie (vždy zastaví predchádzajúcu skladbu a spustí novú).
-// 3. ⏹ STOP opravené: vykoná garantované zastavenie prehrávania (prepnutie 06FN -> 17FN),
-//    pretože samotné 02IP/20NW firmware VSX-S510 pri FLAC/MP3 z USB ignoruje.
-// 4. Tlačidlo "🔄 Načítať USB" je zmenšené a chránené potvrdzovacím dialógom proti nechcenému kliknutiu.
+// 1. Zobrazenie názvu aktívneho USB kľúča (playlistu) priamo na displeji.
+//    (Napríklad "Vstup: USB: Môj kľúč" v malom riadku a "🔌 USB: Môj kľúč" na veľkom).
+// 2. Okamžitá aktualizácia informačného displeja pri načítaní alebo uložení playlistu.
 // ============================================================================
 
 package com.example.pioneerremote
@@ -126,7 +123,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun shareLog() {
-        val header = "Pioneer Remote v23 | host=$host | vstup=$activeInput" +
+        val header = "Pioneer Remote v28 | host=$host | vstup=$activeInput | playlist='$activePlaylistName'" +
             " | adresárov v pamäti=${usbTreeCache.size} | ${android.os.Build.MODEL}\n"
         val i = Intent(Intent.ACTION_SEND)
         i.type = "text/plain"
@@ -207,13 +204,17 @@ class MainActivity : AppCompatActivity() {
     private lateinit var usbContainer: LinearLayout
     private lateinit var dlnaContainer: LinearLayout
 
-    // ===== STROMOVÁ PAMÄŤ (CACHE) USB KĽÚČA + OZNAČENIE =====
+    // ===== DYNAMICKÉ PLAYLISTY PRE USB KĽÚČE =====
     private data class UsbNode(
         val indexInParent: Int,
         val title: String,
         val isFolder: Boolean,
         val pathKey: String
     )
+
+    private var savedPlaylists = mutableListOf<Pair<String, String>>() // <ID, Názov>
+    private var activePlaylistId: String? = null
+    private var activePlaylistName: String = "Neuložený kľúč"
 
     private val usbTreeCache = linkedMapOf<String, MutableList<UsbNode>>()
     private val usbCurrentPath = mutableListOf<Pair<Int, String>>()
@@ -280,9 +281,9 @@ class MainActivity : AppCompatActivity() {
         mediaServerDesc = p.getString("dlnaServer", null)
         mediaServerName = p.getString("dlnaName", "") ?: ""
         isUsbMediaMode = p.getBoolean("isUsbMediaMode", true)
-        logEv("=== štart aplikácie v23, host=$host ===")
+        logEv("=== štart aplikácie v28, host=$host ===")
         loadCachedFavorites()
-        loadCachedUsbTree()
+        loadPlaylistsMetadata()
         buildUI()
 
         val wifi = applicationContext.getSystemService(WIFI_SERVICE) as WifiManager
@@ -346,11 +347,68 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun loadCachedUsbTree() {
-        val raw = prefs().getString("usbTreeJsonV22", null) ?: return
-        runCatching {
+    // =====================================================================
+    // DYNAMICKÁ SPRÁVA PLAYLISTOV
+    // =====================================================================
+
+    private fun loadPlaylistsMetadata() {
+        val raw = prefs().getString("playlists_metadata", "[]") ?: "[]"
+        savedPlaylists.clear()
+        try {
+            val arr = JSONArray(raw)
+            for (i in 0 until arr.length()) {
+                val obj = arr.getJSONObject(i)
+                savedPlaylists.add(obj.getString("id") to obj.getString("name"))
+            }
+        } catch (_: Exception) {}
+
+        val activeId = prefs().getString("active_playlist_id", null)
+        if (activeId != null) {
+            val pl = savedPlaylists.find { it.first == activeId }
+            if (pl != null) {
+                loadPlaylist(pl.first, pl.second)
+            }
+        } else {
+            val legacy = prefs().getString("usbTreeSlot_0", null) ?: prefs().getString("usbTreeJsonV22", null)
+            if (legacy != null && savedPlaylists.isEmpty()) {
+                val id = "legacy_0"
+                prefs().edit().putString("playlist_$id", legacy).apply()
+                savedPlaylists.add(id to "Môj prvý kľúč")
+                savePlaylistsMetadata()
+                loadPlaylist(id, "Môj prvý kľúč")
+            }
+        }
+    }
+
+    private fun savePlaylistsMetadata() {
+        val arr = JSONArray()
+        savedPlaylists.forEach {
+            val obj = JSONObject()
+            obj.put("id", it.first)
+            obj.put("name", it.second)
+            arr.put(obj)
+        }
+        prefs().edit().putString("playlists_metadata", arr.toString()).apply()
+    }
+
+    private fun loadPlaylist(id: String, name: String) {
+        if (usbScanning) {
+            if (::usbStatusText.isInitialized) {
+                usbStatusText.text = "⚠️ Počkaj na dokončenie alebo zruš prebiehajúce skenovanie."
+            }
+            return
+        }
+        activePlaylistId = id
+        activePlaylistName = name
+        prefs().edit().putString("active_playlist_id", id).apply()
+
+        usbTreeCache.clear()
+        usbCurrentPath.clear()
+        usbSelectedPathKey = null
+
+        val raw = prefs().getString("playlist_$id", null) ?: return
+        try {
             val rootObj = JSONObject(raw)
-            usbTreeCache.clear()
             val keys = rootObj.keys()
             while (keys.hasNext()) {
                 val k = keys.next()
@@ -358,37 +416,96 @@ class MainActivity : AppCompatActivity() {
                 val list = mutableListOf<UsbNode>()
                 for (i in 0 until arr.length()) {
                     val o = arr.getJSONObject(i)
-                    list.add(
-                        UsbNode(
-                            indexInParent = o.getInt("idx"),
-                            title = o.getString("title"),
-                            isFolder = o.getBoolean("isFolder"),
-                            pathKey = o.getString("pathKey")
-                        )
-                    )
+                    list.add(UsbNode(o.getInt("idx"), o.getString("title"), o.getBoolean("isFolder"), o.getString("pathKey")))
                 }
                 usbTreeCache[k] = list
             }
+        } catch (_: Exception) {}
+
+        if (::usbStatusText.isInitialized) {
+            renderUsbCachedFolder()
+            val totalItems = usbTreeCache.values.sumOf { it.size }
+            usbStatusText.text = "💾 Playlist '$name': načítaných ${usbTreeCache.size} adresárov ($totalItems položiek)."
+            logEv("Otvorený playlist '$name' ($totalItems položiek).")
+
+            updateInfoLine()
+            updateMainDisplayHeader()
         }
     }
 
-    private fun saveCachedUsbTree() {
-        runCatching {
-            val rootObj = JSONObject()
-            usbTreeCache.forEach { (k, list) ->
-                val arr = JSONArray()
-                list.forEach { node ->
-                    val o = JSONObject()
-                    o.put("idx", node.indexInParent)
-                    o.put("title", node.title)
-                    o.put("isFolder", node.isFolder)
-                    o.put("pathKey", node.pathKey)
-                    arr.put(o)
-                }
-                rootObj.put(k, arr)
-            }
-            prefs().edit().putString("usbTreeJsonV22", rootObj.toString()).apply()
+    private fun showOpenPlaylistDialog() {
+        if (savedPlaylists.isEmpty()) {
+            AlertDialog.Builder(this)
+                .setTitle("Žiadne playlisty")
+                .setMessage("Zatiaľ nemáte uložený žiadny obsah USB kľúča. Najprv naskenujte kľúč a uložte ho.")
+                .setPositiveButton("OK", null)
+                .show()
+            return
         }
+
+        val names = savedPlaylists.map { it.second }.toTypedArray()
+        AlertDialog.Builder(this)
+            .setTitle("Otvoriť playlist (USB kľúč)")
+            .setItems(names) { _, which ->
+                val pl = savedPlaylists[which]
+                loadPlaylist(pl.first, pl.second)
+            }
+            .setNegativeButton("Zrušiť", null)
+            .show()
+    }
+
+    private fun showSavePlaylistDialog(afterScan: Boolean = false) {
+        if (usbTreeCache.isEmpty()) {
+            usbStatusText.text = "⚠️ Nie je načítaný žiadny obsah na uloženie."
+            return
+        }
+        val input = EditText(this).apply {
+            hint = "Napr. Rock 32GB, Vianoce, Detské piesne..."
+            if (activePlaylistName != "Neuložený kľúč") setText(activePlaylistName)
+            setSelection(text.length)
+            setPadding(dp(16), dp(12), dp(16), dp(12))
+        }
+        AlertDialog.Builder(this)
+            .setTitle(if (afterScan) "Nové USB načítané — uložiť ako playlist?" else "Uložiť obsah USB ako playlist")
+            .setMessage("Zadaj názov, pod ktorým sa tento obsah uloží do pamäte telefónu pre okamžité prehrávanie:")
+            .setView(input)
+            .setPositiveButton("Uložiť") { _, _ ->
+                val name = input.text.toString().trim().ifEmpty { "Môj playlist ${savedPlaylists.size + 1}" }
+
+                var id = savedPlaylists.find { it.second == name }?.first
+                if (id == null) {
+                    id = System.currentTimeMillis().toString()
+                    savedPlaylists.add(id to name)
+                    savePlaylistsMetadata()
+                }
+
+                val rootObj = JSONObject()
+                usbTreeCache.forEach { (k, list) ->
+                    val arr = JSONArray()
+                    list.forEach { node ->
+                        val o = JSONObject()
+                        o.put("idx", node.indexInParent)
+                        o.put("title", node.title)
+                        o.put("isFolder", node.isFolder)
+                        o.put("pathKey", node.pathKey)
+                        arr.put(o)
+                    }
+                    rootObj.put(k, arr)
+                }
+                prefs().edit().putString("playlist_$id", rootObj.toString()).apply()
+
+                activePlaylistId = id
+                activePlaylistName = name
+                prefs().edit().putString("active_playlist_id", id).apply()
+                renderUsbCachedFolder()
+                updateInfoLine()
+                updateMainDisplayHeader()
+                
+                usbStatusText.text = "✓ Playlist uložený ako '$name'."
+                logEv("Uložený playlist '$name' (id=$id)")
+            }
+            .setNegativeButton(if (afterScan) "Neukladať" else "Zrušiť", null)
+            .show()
     }
 
     private fun looksLikeMetadata(text: String): Boolean {
@@ -664,6 +781,20 @@ class MainActivity : AppCompatActivity() {
         tabsLp.topMargin = dp(6)
         root.addView(tabs, tabsLp)
 
+        // Globálne ovládanie hlasitosti v jednom riadku pod prepínačmi kariet
+        muteBtn = flatBtn("🔇 MUTE") { toggleMute() }
+        val volMinus = flatBtn("VOL −") { send("VD"); sendSilent("?V") }
+        val volPlus = flatBtn("VOL +") { send("VU"); sendSilent("?V") }
+        muteBtn.textSize = 13f
+        volMinus.textSize = 13f
+        volPlus.textSize = 13f
+
+        val globalVolLp = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+        globalVolLp.topMargin = dp(6)
+        globalVolLp.bottomMargin = dp(2)
+        root.addView(rowOf(listOf(volMinus, muteBtn, volPlus)), globalVolLp)
+
         val pager = ViewPager2(this)
         pager.layoutParams = LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
@@ -694,19 +825,6 @@ class MainActivity : AppCompatActivity() {
             b.setOnClickListener { pager.currentItem = i }
         }
         styleTab(tabBtns[0], true)
-
-        muteBtn = flatBtn("🔇 MUTE") { toggleMute() }
-        val vstupBtn = flatBtn("VSTUP ▶") { send("FU"); sendSilent("?F") }
-        muteBtn.textSize = 13f; vstupBtn.textSize = 13f
-        val muteLp = LinearLayout.LayoutParams(
-            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
-        muteLp.topMargin = dp(6)
-        root.addView(rowOf(listOf(muteBtn, vstupBtn)), muteLp)
-
-        val volMinus = flatBtn("VOL −") { send("VD"); sendSilent("?V") }
-        val volPlus = flatBtn("VOL +") { send("VU"); sendSilent("?V") }
-        volMinus.textSize = 13f; volPlus.textSize = 13f
-        root.addView(rowOf(listOf(volMinus, volPlus)))
 
         root.addView(pager)
         setContentView(root)
@@ -998,10 +1116,19 @@ class MainActivity : AppCompatActivity() {
         page.addView(switchRow, switchLp)
 
         // =================================================================
-        // KONTAJNER 1: 🔌 USB KĽÚČ (IBA PLAY, STOP A MENŠIE TLAČIDLÁ NÁSTROJOV)
+        // KONTAJNER 1: 🔌 USB KĽÚČ (DYNAMICKÉ PLAYLISTY)
         // =================================================================
         usbContainer = LinearLayout(this)
         usbContainer.orientation = LinearLayout.VERTICAL
+
+        val openPlaylistBtn = flatBtn("📂 Otvor playlist") { showOpenPlaylistDialog() }
+        val savePlaylistBtn = flatBtn("💾 Ulož playlist") { showSavePlaylistDialog(afterScan = false) }
+        openPlaylistBtn.textSize = 13f
+        savePlaylistBtn.textSize = 13f
+        openPlaylistBtn.background = roundedBg(C_CARD2, 12, C_CYAN)
+        savePlaylistBtn.background = roundedBg(C_CARD2, 12, C_ORANGE)
+        
+        usbContainer.addView(rowOf(listOf(openPlaylistBtn, savePlaylistBtn)))
 
         // Hlavné tlačidlá: iba ▶ PLAY a ⏹ STOP
         usbPlayBtn = flatBtn("▶ PLAY") { onUsbPlayPressed() }
@@ -1018,33 +1145,36 @@ class MainActivity : AppCompatActivity() {
         usbStopBtn.textSize = 14f
         usbStopBtn.setPadding(dp(8), dp(12), dp(8), dp(12))
 
-        usbContainer.addView(rowOf(listOf(usbPlayBtn, usbStopBtn)))
+        val playRowLp = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+        playRowLp.topMargin = dp(6)
+        usbContainer.addView(rowOf(listOf(usbPlayBtn, usbStopBtn)), playRowLp)
 
-        // Kompaktný riadok nástrojov: menšie tlačidlo "🔄 Načítať USB" (s potvrdením) + Log tlačidlá
+        // Kompaktný riadok nástrojov: 🔄 Načítať USB | 📤 LOG | 🗑 LOG
         usbScanAllBtn = flatBtn("🔄 Načítať USB") {
             onUsbScanButton()
         }
-        usbScanAllBtn.textSize = 11f
+        usbScanAllBtn.textSize = 10f
         usbScanAllBtn.setTextColor(C_SLATE)
         usbScanAllBtn.background = roundedBg(C_CARD2, 10, C_STROKE)
-        usbScanAllBtn.setPadding(dp(4), dp(6), dp(4), dp(6))
+        usbScanAllBtn.setPadding(dp(2), dp(6), dp(2), dp(6))
 
-        val logShareBtn = flatBtn("📤 Odoslať LOG") { shareLog() }
-        logShareBtn.textSize = 11f
+        val logShareBtn = flatBtn("📤 LOG") { shareLog() }
+        logShareBtn.textSize = 10f
         logShareBtn.setTextColor(C_SLATE)
         logShareBtn.background = roundedBg(C_CARD2, 10, C_STROKE)
-        logShareBtn.setPadding(dp(4), dp(6), dp(4), dp(6))
+        logShareBtn.setPadding(dp(2), dp(6), dp(2), dp(6))
 
-        val logClearBtn = flatBtn("🗑 Vymazať LOG") { clearLog() }
-        logClearBtn.textSize = 11f
+        val logClearBtn = flatBtn("🗑 LOG") { clearLog() }
+        logClearBtn.textSize = 10f
         logClearBtn.setTextColor(C_SLATE)
         logClearBtn.background = roundedBg(C_CARD2, 10, C_STROKE)
-        logClearBtn.setPadding(dp(4), dp(6), dp(4), dp(6))
+        logClearBtn.setPadding(dp(2), dp(6), dp(2), dp(6))
 
         usbContainer.addView(rowOf(listOf(usbScanAllBtn, logShareBtn, logClearBtn)))
 
         usbPathText = TextView(this)
-        usbPathText.text = "📂 Adresár: / (Koreň USB)"
+        usbPathText.text = "📂 [$activePlaylistName] Adresár: / (Koreň USB)"
         usbPathText.textSize = 12f
         usbPathText.typeface = Typeface.DEFAULT_BOLD
         usbPathText.setTextColor(C_CYAN)
@@ -1060,9 +1190,9 @@ class MainActivity : AppCompatActivity() {
 
         usbStatusText = TextView(this)
         usbStatusText.text = if (usbTreeCache.isNotEmpty())
-            "Obsah USB je načítaný v pamäti (${usbTreeCache.values.sumOf { it.size }} položiek)."
+            "💾 Playlist '$activePlaylistName': ${usbTreeCache.size} adresárov (${usbTreeCache.values.sumOf { it.size }} položiek) v pamäti."
         else
-            "Klikni na 🔄 Načítať USB pre zoskenovanie kľúča."
+            "💾 Žiadny playlist. Klikni na 📂 Otvor playlist alebo vlož kľúč a daj 🔄 Načítať USB."
         usbStatusText.textSize = 11f
         usbStatusText.setTextColor(C_SLATE)
         usbStatusText.setPadding(dp(4), 0, dp(4), dp(6))
@@ -1096,8 +1226,8 @@ class MainActivity : AppCompatActivity() {
 
         mediaPathText = TextView(this)
         mediaPathText.text = "📚 /"
-        mediaPathText.textSize = 12f
         mediaPathText.setTextColor(C_SLATE)
+        mediaPathText.textSize = 12f
         dlnaContainer.addView(mediaPathText)
 
         mediaStatusText = TextView(this)
@@ -1227,7 +1357,6 @@ class MainActivity : AppCompatActivity() {
         }
         if (usbAtRoot()) return true
 
-        // Prepnutie vstupu (06FN -> 17FN), ktoré 100% spoľahlivo zastaví prehrávanie a vráti do koreňa "USB"
         logEv("goRoot: núdzové prepnutie vstupu (06FN -> 17FN)")
         sendSilent("06FN")
         delay(1000)
@@ -1398,6 +1527,11 @@ class MainActivity : AppCompatActivity() {
                 recvPath = null
                 return false
             }
+            if (expectedNode != null && !nwScreenName.trim().equals(expectedNode.title.trim(), ignoreCase = true)) {
+                logEv("ensureAt: NESÚLAD KĽÚČA! Očakávaný '${expectedNode.title}', na receiveri je '$nwScreenName'")
+                recvPath = null
+                return false
+            }
             walked.add(idx)
             recvPath = walked.toList()
         }
@@ -1458,7 +1592,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     // =====================================================================
-    // USB: SPRÁVA ÚLOH, SKENOVANIE (S POTVRDENÍM) A PREHRÁVANIE (PLAY / STOP)
+    // USB: SPRÁVA ÚLOH, SKENOVANIE A PREHRÁVANIE
     // =====================================================================
 
     private fun launchUsb(block: suspend CoroutineScope.() -> Unit) {
@@ -1485,29 +1619,23 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // Kliknutie na menšie tlačidlo "🔄 Načítať USB" — vždy si vypýta potvrdenie
     private fun onUsbScanButton() {
         if (usbScanning) {
             AlertDialog.Builder(this)
                 .setTitle("Zrušiť načítavanie USB?")
-                .setMessage("Naozaj chcete prerušiť prebiehajúce načítavanie USB kľúča?")
+                .setMessage("Naozaj chcete prerušiť prebiehajúce načítavanie aktuálneho USB kľúča?")
                 .setPositiveButton("Áno, zrušiť") { _, _ ->
                     usbJob?.cancel()
                     usbScanning = false
                     updateScanButtonUi()
-                    usbStatusText.text = "Načítavanie zrušené. Pôvodný obsah v pamäti ostal nezmenený."
+                    usbStatusText.text = "Načítavanie zrušené."
                 }
                 .setNegativeButton("Pokračovať", null)
                 .show()
         } else {
-            val msg = if (usbTreeCache.isNotEmpty()) {
-                "V pamäti je už uložených ${usbTreeCache.size} adresárov. Naozaj chcete znova načítať celý USB kľúč? (Prehrávanie sa zastaví a sken potrvá cca 1–2 minúty.)"
-            } else {
-                "Chcete spustiť načítanie celého obsahu USB kľúča do pamäte?"
-            }
             AlertDialog.Builder(this)
-                .setTitle("Načítať USB kľúč nanovo?")
-                .setMessage(msg)
+                .setTitle("Načítať aktuálny USB kľúč?")
+                .setMessage("Chcete načítať obsah aktuálne vloženého USB kľúča z receivera? Sken potrvá cca 1-2 minúty a po jeho dokončení si ho budete môcť uložiť ako nový playlist.")
                 .setPositiveButton("Áno, načítať") { _, _ ->
                     scanEntireUsbTree()
                 }
@@ -1530,7 +1658,7 @@ class MainActivity : AppCompatActivity() {
         cache[parentKey] = items
         counter[0] += items.size
         ui {
-            usbStatusText.text = "⏳ Načítavam USB… adresárov: ${counter[1] + 1}, položiek: ${counter[0]}" +
+            usbStatusText.text = "⏳ Načítavam… adresárov: ${counter[1] + 1}, položiek: ${counter[0]}" +
                 "  (teraz: $parentTitle)"
         }
         if (depth >= 8) return
@@ -1574,11 +1702,11 @@ class MainActivity : AppCompatActivity() {
 
     private fun scanEntireUsbTree() {
         if (usbScanning) return
-        logEv("SCAN štart")
+        logEv("SCAN štart nového kľúča")
         usbScanning = true
         usbState = UsbState.STOPPED
         updateScanButtonUi()
-        usbStatusText.text = "⏳ Zastavujem prehrávanie a načítavam celý USB kľúč…"
+        usbStatusText.text = "⏳ Zastavujem prehrávanie a načítavam USB kľúč…"
 
         launchUsb {
             try {
@@ -1595,9 +1723,14 @@ class MainActivity : AppCompatActivity() {
                     usbTreeCache.putAll(newCache)
                     usbCurrentPath.clear()
                     usbSelectedPathKey = null
-                    saveCachedUsbTree()
+                    activePlaylistId = null
+                    activePlaylistName = "Neuložený kľúč"
+                    prefs().edit().remove("active_playlist_id").apply()
                     renderUsbCachedFolder()
-                    usbStatusText.text = "✓ USB načítaný: ${counter[1] + 1} adresárov, ${counter[0]} položiek."
+                    updateInfoLine()
+                    updateMainDisplayHeader()
+                    usbStatusText.text = "✓ Načítané: ${counter[1] + 1} adresárov, ${counter[0]} položiek. Nezabudnite si tento kľúč uložiť (💾 Ulož playlist)."
+                    showSavePlaylistDialog(afterScan = true)
                 }
             } catch (e: CancellationException) {
                 throw e
@@ -1658,7 +1791,7 @@ class MainActivity : AppCompatActivity() {
         usbNodeButtons.clear()
         usbCheckButtons.clear()
 
-        usbPathText.text = "📂 Adresár: ${currentUsbPathDisplay()}"
+        usbPathText.text = "📂 [$activePlaylistName] Adresár: ${currentUsbPathDisplay()}"
 
         if (usbCurrentPath.isNotEmpty()) {
             val upBtn = flatBtn("📁  ..  (o úroveň vyššie)") { navigateUpOneUsbFolder() }
@@ -1675,7 +1808,7 @@ class MainActivity : AppCompatActivity() {
         val items = usbTreeCache[currentUsbPathKey()]
         if (items.isNullOrEmpty()) {
             val emptyTv = TextView(this)
-            emptyTv.text = "(Adresár nie je v pamäti alebo je prázdny — stlač 🔄 Načítať USB)"
+            emptyTv.text = "(Playlist '$activePlaylistName' nemá načítaný tento adresár — vlož kľúč a stlač 🔄 Načítať USB, alebo otvor iný uložený playlist)"
             emptyTv.textSize = 11f
             emptyTv.setTextColor(C_DIM)
             emptyTv.setPadding(dp(4), dp(8), dp(4), dp(8))
@@ -1725,7 +1858,7 @@ class MainActivity : AppCompatActivity() {
         usbStatusText.text = if (n == null)
             "⚠️ Obsah '${node.title}' nie je v pamäti — stlač 🔄 Načítať USB."
         else
-            "📂 '${node.title}' — $n položiek."
+            "📂 [$activePlaylistName] '${node.title}' — $n položiek."
     }
 
     private fun toggleUsbSelection(node: UsbNode) {
@@ -1767,7 +1900,6 @@ class MainActivity : AppCompatActivity() {
         return null
     }
 
-    // ▶ PLAY: okamžite na prvé kliknutie zastaví predchádzajúce prehrávanie a spustí označenú položku
     private fun onUsbPlayPressed() {
         val sel = findUsbNodeByKey(usbSelectedPathKey)
         if (sel == null) {
@@ -1786,14 +1918,14 @@ class MainActivity : AppCompatActivity() {
         val steps = target.pathKey.trim('/').split('/').mapNotNull { it.toIntOrNull() }
         if (steps.isEmpty()) return
 
-        logEv("PLAY: výber=${sel.pathKey} '${sel.title}' cieľový súbor=${target.pathKey} '${target.title}' kroky=$steps")
+        logEv("PLAY [$activePlaylistName]: výber=${sel.pathKey} '${sel.title}' cieľový súbor=${target.pathKey} '${target.title}' kroky=$steps")
         usbStartedKey = sel.pathKey
         usbState = UsbState.PLAYING
         activeStationName = sel.title
         playMetaLines.clear()
         playTimeText = ""
         updateMainDisplayHeader()
-        usbStatusText.text = "⏳ Spúšťam '${sel.title}'…"
+        usbStatusText.text = "⏳ [$activePlaylistName] Spúšťam '${sel.title}'…"
 
         launchUsb {
             isPlayingFavorite = false
@@ -1801,14 +1933,14 @@ class MainActivity : AppCompatActivity() {
             if (!atRoot) {
                 ui {
                     usbState = UsbState.STOPPED
-                    usbStatusText.text = "⚠️ Nepodarilo sa dostať do koreňa USB (pozri log). Skús znova."
+                    usbStatusText.text = "⚠️ Nepodarilo sa dostať do koreňa USB (skontroluj, či je kľúč vložený v receiveri)."
                 }
                 return@launchUsb
             }
             if (!usbEnsureAt(steps.dropLast(1))) {
                 ui {
                     usbState = UsbState.STOPPED
-                    usbStatusText.text = "⚠️ Nepodarilo sa otvoriť adresár na receiveri (pozri log)."
+                    usbStatusText.text = "⚠️ Adresár na USB nezodpovedá playlistu '$activePlaylistName'! Skontroluj, či je v receiveri vložený správny USB kľúč."
                 }
                 return@launchUsb
             }
@@ -1824,7 +1956,7 @@ class MainActivity : AppCompatActivity() {
             }
             recvPath = null
             val what = if (sel.isFolder) "adresár ${sel.title} (od: ${target.title})" else sel.title
-            ui { usbStatusText.text = "▶ Hrá: $what" }
+            ui { usbStatusText.text = "▶ [$activePlaylistName] Hrá: $what" }
             delay(1200)
             sendSilent("?GAP")
             sendSilent("?GAH")
@@ -1832,8 +1964,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // ⏹ STOP: Opravené! Keďže VSX-S510 ignoruje 02IP/20NW počas prehrávania USB súboru,
-    // vykonáme garantovaný návrat do koreňa (06FN -> 17FN), ktorý prehrávanie okamžite zastaví.
     private fun stopUsbPlayback() {
         logEv("STOP stlačené (stav bol $usbState)")
         usbScanning = false
@@ -1851,7 +1981,6 @@ class MainActivity : AppCompatActivity() {
         launchUsb {
             usbStopBoth()
             delay(200)
-            // Garantované zastavenie prehrávania rovnakým spôsobom, akým ho prerušuje PLAY:
             sendSilent("06FN")
             delay(900)
             val tSwitch = System.currentTimeMillis()
@@ -1899,7 +2028,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun updateInfoLine() {
-        val i = activeInput ?: "—"
+        val i = if (activeInput == "IPOD/USB") "USB: $activePlaylistName" else (activeInput ?: "—")
         val m = activeMode ?: "—"
         infoLine.text = "Vstup: $i   ·   Režim: $m"
     }
@@ -1921,7 +2050,10 @@ class MainActivity : AppCompatActivity() {
             activeStationName.isNotBlank() -> "$icon  $activeStationName"
             l1.isNotBlank() -> "$icon  $l1"
             lastFlText.isNotBlank() -> "📟  $lastFlText"
-            !activeInput.isNullOrBlank() -> "🎚  ${activeInput!!}"
+            !activeInput.isNullOrBlank() -> {
+                if (activeInput == "IPOD/USB") "🔌  USB: $activePlaylistName"
+                else "🎚  ${activeInput!!}"
+            }
             else -> "📻  —"
         }
         mainStationBig.text = topTitle
