@@ -17,7 +17,14 @@
 
 package com.example.pioneerremote
 
+import android.content.ContentValues
+import android.content.Context
+import android.content.Intent
 import android.content.res.ColorStateList
+import android.content.res.Configuration
+import android.database.sqlite.SQLiteDatabase
+import android.database.sqlite.SQLiteOpenHelper
+import android.net.Uri
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.net.wifi.WifiManager
@@ -32,6 +39,7 @@ import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.GridLayout
 import android.widget.LinearLayout
+import android.widget.PopupMenu
 import android.widget.ProgressBar
 import android.widget.ScrollView
 import android.widget.TextView
@@ -42,7 +50,13 @@ import androidx.viewpager2.widget.ViewPager2
 import kotlinx.coroutines.*
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.BufferedInputStream
 import java.io.BufferedReader
+import java.io.File
+import java.io.FileInputStream
+import java.io.FileOutputStream
+import java.io.InputStream
+import java.io.OutputStream
 import java.io.InputStreamReader
 import java.io.OutputStreamWriter
 import java.net.DatagramPacket
@@ -52,9 +66,11 @@ import java.net.InetAddress
 import java.net.InetSocketAddress
 import java.net.MulticastSocket
 import java.net.NetworkInterface
+import java.net.ServerSocket
 import java.net.Socket
 import java.net.URL
 import java.util.Collections
+import java.util.UUID
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
@@ -115,6 +131,9 @@ class MainActivity : AppCompatActivity() {
     private lateinit var volBar: ProgressBar
     private lateinit var powerBtn: Button
     private lateinit var muteBtn: Button
+    private lateinit var rootLayout: LinearLayout
+    private lateinit var topScroll: ScrollView
+    private lateinit var mainPager: ViewPager2
 
     private val inputButtons = mutableMapOf<String, Button>()
     private val modeButtons = mutableMapOf<String, Button>()
@@ -248,6 +267,152 @@ class MainActivity : AppCompatActivity() {
     private lateinit var mediaList: LinearLayout
 
     // =====================================================================
+    // SQLite DATABÁZA USB KĽÚČOV (jeden súbor pioneer_usb.db pre všetky kľúče)
+    // =====================================================================
+
+    companion object {
+        const val DB_NAME = "pioneer_usb.db"
+        const val REQ_EXPORT_DB = 4101
+        const val REQ_IMPORT_DB = 4102
+    }
+
+    private lateinit var usbDb: UsbDatabase
+
+    private class UsbDatabase(context: Context) :
+        SQLiteOpenHelper(context, MainActivity.DB_NAME, null, 2) {
+
+        override fun onConfigure(db: SQLiteDatabase) {
+            super.onConfigure(db)
+            db.disableWriteAheadLogging()   // jeden samostatný súbor bez -wal / -shm
+        }
+
+        override fun onCreate(db: SQLiteDatabase) {
+            db.execSQL("CREATE TABLE usb (id INTEGER PRIMARY KEY AUTOINCREMENT, " +
+                "name TEXT NOT NULL UNIQUE, saved_at INTEGER NOT NULL)")
+            db.execSQL("CREATE TABLE node (usb_id INTEGER NOT NULL, parent_key TEXT NOT NULL, " +
+                "idx INTEGER NOT NULL, title TEXT NOT NULL, is_folder INTEGER NOT NULL, " +
+                "path_key TEXT NOT NULL, PRIMARY KEY (usb_id, path_key))")
+            db.execSQL("CREATE INDEX node_parent ON node (usb_id, parent_key, idx)")
+            db.execSQL("CREATE TABLE IF NOT EXISTS station (id INTEGER PRIMARY KEY AUTOINCREMENT, " +
+                "name TEXT NOT NULL, url TEXT NOT NULL)")
+        }
+
+        override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
+            if (oldVersion < 2) {
+                db.execSQL("CREATE TABLE IF NOT EXISTS station (id INTEGER PRIMARY KEY AUTOINCREMENT, " +
+                    "name TEXT NOT NULL, url TEXT NOT NULL)")
+            }
+        }
+
+        fun listStations(): List<RadioStation> {
+            val out = mutableListOf<RadioStation>()
+            readableDatabase.rawQuery("SELECT id, name, url FROM station ORDER BY name COLLATE NOCASE", null).use { c ->
+                while (c.moveToNext()) out.add(RadioStation(c.getLong(0), c.getString(1), c.getString(2)))
+            }
+            return out
+        }
+
+        fun saveStation(id: Long?, name: String, url: String) {
+            val cv = ContentValues()
+            cv.put("name", name)
+            cv.put("url", url)
+            if (id == null) {
+                writableDatabase.insertOrThrow("station", null, cv)
+            } else {
+                writableDatabase.update("station", cv, "id = ?", arrayOf(id.toString()))
+            }
+        }
+
+        fun deleteStation(id: Long) {
+            writableDatabase.delete("station", "id = ?", arrayOf(id.toString()))
+        }
+
+        fun listSticks(): List<Pair<Long, String>> {
+            val out = mutableListOf<Pair<Long, String>>()
+            readableDatabase.rawQuery("SELECT id, name FROM usb ORDER BY name COLLATE NOCASE", null).use { c ->
+                while (c.moveToNext()) out.add(c.getLong(0) to c.getString(1))
+            }
+            return out
+        }
+
+        fun hasStick(name: String): Boolean {
+            var found = false
+            readableDatabase.rawQuery("SELECT 1 FROM usb WHERE name = ?", arrayOf(name)).use { c ->
+                found = c.moveToFirst()
+            }
+            return found
+        }
+
+        fun deleteStick(id: Long) {
+            val db = writableDatabase
+            db.beginTransaction()
+            try {
+                db.delete("node", "usb_id = ?", arrayOf(id.toString()))
+                db.delete("usb", "id = ?", arrayOf(id.toString()))
+                db.setTransactionSuccessful()
+            } finally {
+                db.endTransaction()
+            }
+        }
+
+        // Uloží (alebo prepíše) kľúč s daným názvom; vráti jeho id
+        fun saveStick(name: String, tree: Map<String, List<UsbNode>>): Long {
+            val db = writableDatabase
+            db.beginTransaction()
+            try {
+                var id = -1L
+                db.rawQuery("SELECT id FROM usb WHERE name = ?", arrayOf(name)).use { c ->
+                    if (c.moveToFirst()) id = c.getLong(0)
+                }
+                val cv = ContentValues()
+                cv.put("saved_at", System.currentTimeMillis())
+                if (id >= 0) {
+                    db.delete("node", "usb_id = ?", arrayOf(id.toString()))
+                    db.update("usb", cv, "id = ?", arrayOf(id.toString()))
+                } else {
+                    cv.put("name", name)
+                    id = db.insertOrThrow("usb", null, cv)
+                }
+                val stmt = db.compileStatement(
+                    "INSERT OR REPLACE INTO node (usb_id, parent_key, idx, title, is_folder, path_key) " +
+                        "VALUES (?, ?, ?, ?, ?, ?)")
+                tree.forEach { (parentKey, list) ->
+                    list.forEach { n ->
+                        stmt.clearBindings()
+                        stmt.bindLong(1, id)
+                        stmt.bindString(2, parentKey)
+                        stmt.bindLong(3, n.indexInParent.toLong())
+                        stmt.bindString(4, n.title)
+                        stmt.bindLong(5, if (n.isFolder) 1L else 0L)
+                        stmt.bindString(6, n.pathKey)
+                        stmt.executeInsert()
+                    }
+                }
+                db.setTransactionSuccessful()
+                return id
+            } finally {
+                db.endTransaction()
+            }
+        }
+
+        fun loadTree(usbId: Long): LinkedHashMap<String, MutableList<UsbNode>> {
+            val out = linkedMapOf<String, MutableList<UsbNode>>()
+            readableDatabase.rawQuery(
+                "SELECT parent_key, idx, title, is_folder, path_key FROM node " +
+                    "WHERE usb_id = ? ORDER BY parent_key, idx", arrayOf(usbId.toString())).use { c ->
+                while (c.moveToNext()) {
+                    out.getOrPut(c.getString(0)) { mutableListOf() }
+                        .add(UsbNode(c.getInt(1), c.getString(2), c.getInt(3) == 1, c.getString(4)))
+                }
+            }
+            // prázdne adresáre dostanú prázdny zoznam (aby sa líšili od "neznámych")
+            val folderKeys = out.values.flatten().filter { it.isFolder }.map { it.pathKey }
+            folderKeys.forEach { out.getOrPut(it) { mutableListOf() } }
+            return out
+        }
+    }
+
+    // =====================================================================
     // ŽIVOTNÝ CYKLUS A SPRÁVA PRIPOJENIA
     // =====================================================================
 
@@ -259,6 +424,8 @@ class MainActivity : AppCompatActivity() {
         mediaServerDesc = p.getString("dlnaServer", null)
         mediaServerName = p.getString("dlnaName", "") ?: ""
         isUsbMediaMode = p.getBoolean("isUsbMediaMode", true)
+        usbDb = UsbDatabase(applicationContext)
+        refreshRadioStations()
         loadCachedFavorites()
         loadPlaylistsMetadata()
         buildUI()
@@ -296,6 +463,11 @@ class MainActivity : AppCompatActivity() {
         disconnectSocket()
         multicastLock?.release()
         sendDispatcher.close()
+        // zastavenie servera posiela sieťové pakety -> nesmie bežať na hlavnom vlákne
+        val srv = radioServer
+        radioServer = null
+        if (srv != null) Thread { srv.stop() }.start()
+        if (::usbDb.isInitialized) usbDb.close()
     }
 
     private fun disconnectSocket() {
@@ -365,43 +537,66 @@ class MainActivity : AppCompatActivity() {
     // =====================================================================
 
     private fun loadPlaylistsMetadata() {
-        val raw = prefs().getString("playlists_metadata", "[]") ?: "[]"
-        savedPlaylists.clear()
-        try {
-            val arr = JSONArray(raw)
-            for (i in 0 until arr.length()) {
-                val obj = arr.getJSONObject(i)
-                savedPlaylists.add(obj.getString("id") to obj.getString("name"))
-            }
-        } catch (_: Exception) {}
-
-        val activeId = prefs().getString("active_playlist_id", null)
-        if (activeId != null) {
-            val pl = savedPlaylists.find { it.first == activeId }
+        migrateLegacyPlaylistsToDb()
+        refreshPlaylistList()
+        val activeName = prefs().getString("active_playlist_name", null)
+        if (activeName != null) {
+            val pl = savedPlaylists.find { it.second == activeName }
             if (pl != null) {
                 loadPlaylist(pl.first, pl.second)
-            }
-        } else {
-            val legacy = prefs().getString("usbTreeSlot_0", null) ?: prefs().getString("usbTreeJsonV22", null)
-            if (legacy != null && savedPlaylists.isEmpty()) {
-                val id = "legacy_0"
-                prefs().edit().putString("playlist_$id", legacy).apply()
-                savedPlaylists.add(id to "Môj prvý kľúč")
-                savePlaylistsMetadata()
-                loadPlaylist(id, "Môj prvý kľúč")
             }
         }
     }
 
-    private fun savePlaylistsMetadata() {
-        val arr = JSONArray()
-        savedPlaylists.forEach {
-            val obj = JSONObject()
-            obj.put("id", it.first)
-            obj.put("name", it.second)
-            arr.put(obj)
-        }
-        prefs().edit().putString("playlists_metadata", arr.toString()).apply()
+    // Zoznam uložených USB kľúčov z databázy (id = id riadku v tabuľke usb)
+    private fun refreshPlaylistList() {
+        savedPlaylists.clear()
+        try {
+            usbDb.listSticks().forEach { savedPlaylists.add(it.first.toString() to it.second) }
+        } catch (_: Exception) {}
+    }
+
+    private fun parseTreeJson(raw: String): LinkedHashMap<String, MutableList<UsbNode>> {
+        val out = linkedMapOf<String, MutableList<UsbNode>>()
+        try {
+            val rootObj = JSONObject(raw)
+            val keys = rootObj.keys()
+            while (keys.hasNext()) {
+                val k = keys.next()
+                val arr = rootObj.getJSONArray(k)
+                val list = mutableListOf<UsbNode>()
+                for (i in 0 until arr.length()) {
+                    val o = arr.getJSONObject(i)
+                    list.add(UsbNode(o.getInt("idx"), o.getString("title"), o.getBoolean("isFolder"), o.getString("pathKey")))
+                }
+                out[k] = list
+            }
+        } catch (_: Exception) {}
+        return out
+    }
+
+    // Jednorazový prenos starých playlistov z SharedPreferences do databázy
+    private fun migrateLegacyPlaylistsToDb() {
+        if (prefs().getBoolean("playlists_migrated_to_db", false)) return
+        try {
+            val oldActiveId = prefs().getString("active_playlist_id", null)
+            val arr = JSONArray(prefs().getString("playlists_metadata", "[]") ?: "[]")
+            for (i in 0 until arr.length()) {
+                val obj = arr.getJSONObject(i)
+                val id = obj.getString("id")
+                val name = obj.getString("name")
+                val raw = prefs().getString("playlist_$id", null) ?: continue
+                val tree = parseTreeJson(raw)
+                if (tree.isNotEmpty() && !usbDb.hasStick(name)) usbDb.saveStick(name, tree)
+                if (id == oldActiveId) prefs().edit().putString("active_playlist_name", name).apply()
+            }
+            val legacy = prefs().getString("usbTreeSlot_0", null) ?: prefs().getString("usbTreeJsonV22", null)
+            if (legacy != null && !usbDb.hasStick("Môj prvý kľúč")) {
+                val tree = parseTreeJson(legacy)
+                if (tree.isNotEmpty()) usbDb.saveStick("Môj prvý kľúč", tree)
+            }
+        } catch (_: Exception) {}
+        prefs().edit().putBoolean("playlists_migrated_to_db", true).apply()
     }
 
     private fun loadPlaylist(id: String, name: String) {
@@ -413,39 +608,140 @@ class MainActivity : AppCompatActivity() {
         }
         activePlaylistId = id
         activePlaylistName = name
-        prefs().edit().putString("active_playlist_id", id).apply()
+        prefs().edit().putString("active_playlist_name", name).apply()
 
         usbTreeCache.clear()
         usbCurrentPath.clear()
         usbSelectedPathKeys.clear()
 
-        val raw = prefs().getString("playlist_$id", null)
-        if (raw != null) {
-            try {
-                val rootObj = JSONObject(raw)
-                val keys = rootObj.keys()
-                while (keys.hasNext()) {
-                    val k = keys.next()
-                    val arr = rootObj.getJSONArray(k)
-                    val list = mutableListOf<UsbNode>()
-                    for (i in 0 until arr.length()) {
-                        val o = arr.getJSONObject(i)
-                        list.add(UsbNode(o.getInt("idx"), o.getString("title"), o.getBoolean("isFolder"), o.getString("pathKey")))
-                    }
-                    usbTreeCache[k] = list
-                }
-            } catch (_: Exception) {}
-        }
+        val tree = try { usbDb.loadTree(id.toLong()) } catch (_: Exception) { null }
+        if (tree != null) usbTreeCache.putAll(tree)
 
         if (::usbStatusText.isInitialized) {
             renderUsbCachedFolder()
             val totalItems = usbTreeCache.values.sumOf { it.size }
-            usbStatusText.text = if (raw != null)
-                "💾 Playlist '$name': načítaných ${usbTreeCache.size} adresárov ($totalItems položiek)."
+            usbStatusText.text = if (tree != null && tree.isNotEmpty())
+                "💾 Kľúč '$name' z databázy: ${usbTreeCache.size} adresárov ($totalItems položiek)."
             else
-                "⚠️ Playlist '$name' nemá uložené dáta."
+                "⚠️ Kľúč '$name' sa nepodarilo načítať z databázy."
             updateInfoLine()
             updateMainDisplayHeader()
+        }
+    }
+
+    // ---------- záloha / obnova súboru databázy (prežije aj odinštalovanie aplikácie) ----------
+
+    private fun startExportDb() {
+        val i = Intent(Intent.ACTION_CREATE_DOCUMENT)
+        i.addCategory(Intent.CATEGORY_OPENABLE)
+        i.type = "application/octet-stream"
+        i.putExtra(Intent.EXTRA_TITLE, MainActivity.DB_NAME)
+        i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION or
+            Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
+        @Suppress("DEPRECATION")
+        startActivityForResult(i, MainActivity.REQ_EXPORT_DB)
+    }
+
+    private fun startImportDb() {
+        val i = Intent(Intent.ACTION_OPEN_DOCUMENT)
+        i.addCategory(Intent.CATEGORY_OPENABLE)
+        i.type = "*/*"
+        i.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION or
+            Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
+        @Suppress("DEPRECATION")
+        startActivityForResult(i, MainActivity.REQ_IMPORT_DB)
+    }
+
+    @Suppress("DEPRECATION", "OVERRIDE_DEPRECATION")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (resultCode != RESULT_OK || data == null) return
+        val uri = data.data ?: return
+        if (requestCode == MainActivity.REQ_EXPORT_DB || requestCode == MainActivity.REQ_IMPORT_DB) {
+            val takeFlags = data.flags and
+                (Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+            runCatching { contentResolver.takePersistableUriPermission(uri, takeFlags) }
+            prefs().edit().putString("db_backup_uri", uri.toString()).apply()
+        }
+        when (requestCode) {
+            MainActivity.REQ_EXPORT_DB -> backupDbNow(showStatus = true)
+            MainActivity.REQ_IMPORT_DB -> importDbFrom(uri)
+        }
+    }
+
+    // Skopíruje databázu do zvoleného súboru (volá sa aj automaticky po každom uložení kľúča)
+    private fun backupDbNow(showStatus: Boolean) {
+        val uriStr = prefs().getString("db_backup_uri", null) ?: return
+        val uri = Uri.parse(uriStr)
+        scope.launch(Dispatchers.IO) {
+            val ok = runCatching {
+                val dbFile = applicationContext.getDatabasePath(MainActivity.DB_NAME)
+                contentResolver.openOutputStream(uri, "wt")!!.use { out ->
+                    FileInputStream(dbFile).use { it.copyTo(out) }
+                }
+            }.isSuccess
+            ui {
+                if (::usbStatusText.isInitialized && (showStatus || !ok)) {
+                    usbStatusText.text = if (ok)
+                        "💾 Databáza zálohovaná do súboru (${savedPlaylists.size} kľúčov)."
+                    else
+                        "⚠️ Zálohu databázy sa nepodarilo zapísať — vyber súbor znova (⬆ Export databázy)."
+                }
+            }
+        }
+    }
+
+    private fun importDbFrom(uri: Uri) {
+        if (usbScanning) {
+            usbStatusText.text = "⚠️ Počkaj na dokončenie skenovania."
+            return
+        }
+        usbStatusText.text = "⏳ Importujem databázu…"
+        scope.launch(Dispatchers.IO) {
+            var err: String? = null
+            val tmp = File(cacheDir, "import_usb.db")
+            try {
+                contentResolver.openInputStream(uri)!!.use { inp ->
+                    FileOutputStream(tmp).use { inp.copyTo(it) }
+                }
+                val head = ByteArray(16)
+                FileInputStream(tmp).use { it.read(head) }
+                if (String(head, Charsets.US_ASCII) != "SQLite format 3\u0000") {
+                    throw IllegalStateException("súbor nie je SQLite databáza")
+                }
+                // kontrola, že obsahuje očakávané tabuľky
+                val check = SQLiteDatabase.openDatabase(tmp.path, null, SQLiteDatabase.OPEN_READONLY)
+                try {
+                    check.rawQuery("SELECT COUNT(*) FROM usb", null).use { it.moveToFirst() }
+                    check.rawQuery("SELECT COUNT(*) FROM node", null).use { it.moveToFirst() }
+                } finally {
+                    check.close()
+                }
+                usbDb.close()
+                val dest = applicationContext.getDatabasePath(MainActivity.DB_NAME)
+                dest.parentFile?.mkdirs()
+                tmp.copyTo(dest, overwrite = true)
+                File(dest.path + "-journal").delete()
+                File(dest.path + "-wal").delete()
+                File(dest.path + "-shm").delete()
+            } catch (e: Exception) {
+                err = e.message ?: "neznáma chyba"
+            } finally {
+                tmp.delete()
+            }
+            ui {
+                if (err != null) {
+                    usbStatusText.text = "⚠️ Import databázy zlyhal: $err"
+                } else {
+                    refreshPlaylistList()
+                    refreshRadioStations()
+                    renderRadioStations()
+                    val activeName = prefs().getString("active_playlist_name", null)
+                    val pl = savedPlaylists.find { it.second == activeName }
+                    if (pl != null) loadPlaylist(pl.first, pl.second)
+                    usbStatusText.text = "✓ Databáza importovaná: ${savedPlaylists.size} kľúčov. Otvor ho cez 📂 Otvor playlist."
+                }
+            }
         }
     }
 
@@ -487,40 +783,783 @@ class MainActivity : AppCompatActivity() {
             .setView(input)
             .setPositiveButton("Uložiť") { _, _ ->
                 val name = input.text.toString().trim().ifEmpty { "Môj playlist ${savedPlaylists.size + 1}" }
-
-                var id = savedPlaylists.find { it.second == name }?.first
-                if (id == null) {
-                    id = System.currentTimeMillis().toString()
-                    savedPlaylists.add(id to name)
-                    savePlaylistsMetadata()
+                val id = try { usbDb.saveStick(name, usbTreeCache) } catch (_: Exception) { -1L }
+                if (id < 0) {
+                    usbStatusText.text = "⚠️ Uloženie do databázy zlyhalo."
+                } else {
+                    refreshPlaylistList()
+                    activePlaylistId = id.toString()
+                    activePlaylistName = name
+                    prefs().edit().putString("active_playlist_name", name).apply()
+                    renderUsbCachedFolder()
+                    updateInfoLine()
+                    updateMainDisplayHeader()
+                    usbStatusText.text = "✓ Uložené do databázy ako '$name' (${savedPlaylists.size} kľúčov v databáze)."
+                    backupDbNow(showStatus = false)
                 }
-
-                val rootObj = JSONObject()
-                usbTreeCache.forEach { (k, list) ->
-                    val arr = JSONArray()
-                    list.forEach { node ->
-                        val o = JSONObject()
-                        o.put("idx", node.indexInParent)
-                        o.put("title", node.title)
-                        o.put("isFolder", node.isFolder)
-                        o.put("pathKey", node.pathKey)
-                        arr.put(o)
-                    }
-                    rootObj.put(k, arr)
-                }
-                prefs().edit().putString("playlist_$id", rootObj.toString()).apply()
-
-                activePlaylistId = id
-                activePlaylistName = name
-                prefs().edit().putString("active_playlist_id", id).apply()
-                renderUsbCachedFolder()
-                updateInfoLine()
-                updateMainDisplayHeader()
-
-                usbStatusText.text = "✓ Playlist uložený ako '$name'."
             }
             .setNegativeButton(if (afterScan) "Neukladať" else "Zrušiť", null)
             .show()
+    }
+
+    // ---------- rozbaľovacie ponuky ----------
+
+    private fun showPlaylistMenu(anchor: View) {
+        val pm = PopupMenu(this, anchor)
+        pm.menu.add(0, 1, 0, "Načítať playlist")
+        pm.menu.add(0, 2, 1, "Uložiť playlist")
+        pm.setOnMenuItemClickListener { item ->
+            when (item.itemId) {
+                1 -> showOpenPlaylistDialog()
+                2 -> showSavePlaylistDialog(afterScan = false)
+            }
+            true
+        }
+        pm.show()
+    }
+
+    private fun showDatabaseMenu(anchor: View) {
+        val pm = PopupMenu(this, anchor)
+        pm.menu.add(0, 1, 0, "Načítať databázu (zo súboru)")
+        pm.menu.add(0, 2, 1, "Uložiť USB do databázy")
+        pm.menu.add(0, 3, 2, "Vymazať USB z databázy")
+        pm.menu.add(0, 4, 3, "Zálohovať databázu do súboru")
+        pm.setOnMenuItemClickListener { item ->
+            when (item.itemId) {
+                1 -> confirmImportDb()
+                2 -> showAddUsbToDbDialog(afterScan = false)
+                3 -> showDeleteUsbDialog()
+                4 -> startExportDb()
+            }
+            true
+        }
+        pm.show()
+    }
+
+    private fun confirmImportDb() {
+        AlertDialog.Builder(this)
+            .setTitle("Načítať databázu zo súboru?")
+            .setMessage("Databáza v aplikácii (všetky uložené USB kľúče) sa nahradí obsahom vybraného súboru. Pokračovať?")
+            .setPositiveButton("Vybrať súbor") { _, _ -> startImportDb() }
+            .setNegativeButton("Zrušiť", null)
+            .show()
+    }
+
+    // Názov, ktorý v databáze ešte neexistuje (pri zhode sa pridá " (2)", " (3)", ...)
+    private fun uniqueUsbName(base: String): String {
+        var name = base
+        var n = 2
+        while (savedPlaylists.any { it.second.equals(name, ignoreCase = true) }) {
+            name = "$base ($n)"
+            n++
+        }
+        return name
+    }
+
+    // Pridá práve načítané USB do databázy ako NOVÝ záznam (existujúce kľúče sa neprepíšu)
+    private fun showAddUsbToDbDialog(afterScan: Boolean) {
+        if (usbTreeCache.isEmpty()) {
+            usbStatusText.text = "⚠️ Nie je načítaný žiadny USB kľúč na uloženie."
+            return
+        }
+        val input = EditText(this).apply {
+            hint = "Názov USB kľúča"
+            setText(uniqueUsbName("USB kľúč ${savedPlaylists.size + 1}"))
+            setSelection(text.length)
+            setPadding(dp(16), dp(12), dp(16), dp(12))
+        }
+        AlertDialog.Builder(this)
+            .setTitle(if (afterScan) "Nové USB načítané — pridať do databázy?" else "Uložiť USB do databázy")
+            .setMessage("USB sa pridá do databázy ako nový záznam. Už uložené kľúče sa neprepíšu.")
+            .setView(input)
+            .setPositiveButton("Pridať") { _, _ ->
+                val base = input.text.toString().trim().ifEmpty { "USB kľúč ${savedPlaylists.size + 1}" }
+                val name = uniqueUsbName(base)
+                val id = try { usbDb.saveStick(name, usbTreeCache) } catch (_: Exception) { -1L }
+                if (id < 0) {
+                    usbStatusText.text = "⚠️ Uloženie do databázy zlyhalo."
+                } else {
+                    refreshPlaylistList()
+                    activePlaylistId = id.toString()
+                    activePlaylistName = name
+                    prefs().edit().putString("active_playlist_name", name).apply()
+                    renderUsbCachedFolder()
+                    updateInfoLine()
+                    updateMainDisplayHeader()
+                    usbStatusText.text = "✓ USB pridané do databázy ako '$name' (${savedPlaylists.size} kľúčov v databáze)."
+                    backupDbNow(showStatus = false)
+                }
+            }
+            .setNegativeButton(if (afterScan) "Neukladať" else "Zrušiť", null)
+            .show()
+    }
+
+    // Vymaže konkrétny USB kľúč z databázy
+    private fun showDeleteUsbDialog() {
+        if (savedPlaylists.isEmpty()) {
+            AlertDialog.Builder(this)
+                .setTitle("Databáza je prázdna")
+                .setMessage("Nie je čo vymazať — v databáze nie je uložený žiadny USB kľúč.")
+                .setPositiveButton("OK", null)
+                .show()
+            return
+        }
+        val names = savedPlaylists.map { it.second }.toTypedArray()
+        AlertDialog.Builder(this)
+            .setTitle("Vymazať USB z databázy")
+            .setItems(names) { _, which ->
+                val pl = savedPlaylists[which]
+                AlertDialog.Builder(this)
+                    .setTitle("Vymazať '${pl.second}'?")
+                    .setMessage("USB kľúč sa natrvalo odstráni z databázy.")
+                    .setPositiveButton("Vymazať") { _, _ -> deleteUsbFromDb(pl.first.toLong(), pl.second) }
+                    .setNegativeButton("Zrušiť", null)
+                    .show()
+            }
+            .setNegativeButton("Zrušiť", null)
+            .show()
+    }
+
+    private fun deleteUsbFromDb(id: Long, name: String) {
+        if (usbScanning) {
+            usbStatusText.text = "⚠️ Počkaj na dokončenie skenovania."
+            return
+        }
+        val ok = try { usbDb.deleteStick(id); true } catch (_: Exception) { false }
+        if (!ok) {
+            usbStatusText.text = "⚠️ Vymazanie z databázy zlyhalo."
+            return
+        }
+        refreshPlaylistList()
+        if (activePlaylistName == name) {
+            usbTreeCache.clear()
+            usbCurrentPath.clear()
+            usbSelectedPathKeys.clear()
+            activePlaylistId = null
+            activePlaylistName = "Neuložený kľúč"
+            prefs().edit().remove("active_playlist_name").apply()
+            renderUsbCachedFolder()
+            updateInfoLine()
+            updateMainDisplayHeader()
+        }
+        usbStatusText.text = "🗑 USB '$name' vymazané z databázy (v databáze ostáva ${savedPlaylists.size})."
+        backupDbNow(showStatus = false)
+    }
+
+    // =====================================================================
+    // VLASTNÝ DLNA SERVER S RÁDIOSTANICAMI (na pridanie staníc do Favorites na receiveri)
+    // =====================================================================
+
+    private data class RadioStation(val id: Long, val name: String, val url: String)
+
+    @Volatile private var radioStations = listOf<RadioStation>()
+    @Volatile private var radioServer: RadioDlnaServer? = null
+    private lateinit var radioServerBtn: Button
+    private lateinit var radioServerStatus: TextView
+    private lateinit var radioListLayout: LinearLayout
+
+    // IP adresa telefónu vo Wi-Fi / Ethernet sieti (mobilné dáta sa neberú, ak je Wi-Fi k dispozícii)
+    private fun wifiIp(): String? {
+        return try {
+            val nets = NetworkInterface.getNetworkInterfaces() ?: return null
+            var fallback: String? = null
+            for (n in nets) {
+                if (n.isLoopback || !n.isUp) continue
+                for (a in n.inetAddresses) {
+                    if (a is Inet4Address && !a.isLoopbackAddress) {
+                        if (n.name.startsWith("wlan") || n.name.startsWith("eth")) return a.hostAddress
+                        if (fallback == null) fallback = a.hostAddress
+                    }
+                }
+            }
+            fallback
+        } catch (_: Exception) { null }
+    }
+
+    private fun refreshRadioStations() {
+        radioStations = try { usbDb.listStations() } catch (_: Exception) { emptyList() }
+    }
+
+    private fun buildRadioServerSection(page: LinearLayout) {
+        page.addView(sectionLabel("VLASTNÉ STANICE (DLNA SERVER)"))
+
+        radioServerBtn = flatBtn("📡 Server: VYP") { toggleRadioServer() }
+        val addBtn = flatBtn("➕ Pridať stanicu") { showStationDialog(null) }
+        radioServerBtn.textSize = 13f
+        addBtn.textSize = 13f
+        page.addView(rowOf(listOf(radioServerBtn, addBtn)))
+
+        radioServerStatus = TextView(this)
+        radioServerStatus.textSize = 11f
+        radioServerStatus.setTextColor(C_SLATE)
+        radioServerStatus.setPadding(dp(4), dp(4), dp(4), dp(4))
+        page.addView(radioServerStatus)
+
+        val toMediaBtn = flatBtn("↪ Prepnúť receiver na MEDIA SERVER") {
+            send("44FN")
+            sendSilent("?F")
+            activeInput = "MEDIA SRV"
+            updateInfoLine()
+            styleInputButtons()
+            updateMainDisplayHeader()
+        }
+        toMediaBtn.textSize = 12f
+        page.addView(rowOf(listOf(toMediaBtn)))
+
+        radioListLayout = LinearLayout(this)
+        radioListLayout.orientation = LinearLayout.VERTICAL
+        page.addView(radioListLayout)
+
+        updateRadioServerUi()
+        renderRadioStations()
+    }
+
+    private fun updateRadioServerUi() {
+        if (!::radioServerBtn.isInitialized) return
+        val srv = radioServer
+        radioServerBtn.text = if (srv != null) "📡 Server: ZAP" else "📡 Server: VYP"
+        highlightBtn(radioServerBtn, srv != null, C_GREEN)
+        radioServerStatus.text = if (srv != null)
+            "Server beží (${srv.ip}:${srv.port}). Na receiveri: vstup MEDIA SERVER → „Pioneer Remote Radio“ → stanica → tlačidlo FAV. Apku nechaj otvorenú."
+        else
+            "Server je vypnutý. Zapni ho, na receiveri vyber stanicu (MEDIA SERVER) a stlač FAV."
+    }
+
+    private fun renderRadioStations() {
+        if (!::radioListLayout.isInitialized) return
+        radioListLayout.removeAllViews()
+        if (radioStations.isEmpty()) {
+            val t = TextView(this)
+            t.text = "(Zatiaľ žiadne stanice — pridaj ich tlačidlom ➕ Pridať stanicu)"
+            t.textSize = 11f
+            t.setTextColor(C_DIM)
+            t.setPadding(dp(4), dp(8), dp(4), dp(8))
+            radioListLayout.addView(t)
+            return
+        }
+        radioStations.forEach { st ->
+            val b = flatBtn("📻  ${st.name}\n${st.url}") { }
+            b.gravity = Gravity.START or Gravity.CENTER_VERTICAL
+            b.textSize = 12f
+            b.ellipsize = TextUtils.TruncateAt.END
+            b.setPadding(dp(14), dp(8), dp(14), dp(8))
+            b.setOnClickListener { showStationMenu(b, st) }
+            val lp = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+            lp.topMargin = dp(4)
+            radioListLayout.addView(b, lp)
+        }
+    }
+
+    private fun showStationMenu(anchor: View, st: RadioStation) {
+        val pm = PopupMenu(this, anchor)
+        pm.menu.add(0, 1, 0, "Upraviť")
+        pm.menu.add(0, 2, 1, "Zmazať")
+        pm.setOnMenuItemClickListener { item ->
+            when (item.itemId) {
+                1 -> showStationDialog(st)
+                2 -> AlertDialog.Builder(this)
+                    .setTitle("Zmazať '${st.name}'?")
+                    .setPositiveButton("Zmazať") { _, _ ->
+                        runCatching { usbDb.deleteStation(st.id) }
+                        refreshRadioStations()
+                        renderRadioStations()
+                        backupDbNow(showStatus = false)
+                    }
+                    .setNegativeButton("Zrušiť", null)
+                    .show()
+            }
+            true
+        }
+        pm.show()
+    }
+
+    private fun showStationDialog(existing: RadioStation?) {
+        val nameIn = EditText(this).apply {
+            hint = "Názov stanice"
+            setText(existing?.name ?: "")
+        }
+        val urlIn = EditText(this).apply {
+            hint = "URL streamu (http://…)"
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_URI
+            setText(existing?.url ?: "http://")
+        }
+        val box = LinearLayout(this)
+        box.orientation = LinearLayout.VERTICAL
+        box.setPadding(dp(16), dp(8), dp(16), 0)
+        box.addView(nameIn)
+        box.addView(urlIn)
+        AlertDialog.Builder(this)
+            .setTitle(if (existing == null) "Pridať stanicu" else "Upraviť stanicu")
+            .setMessage("Receiver od Pioneer spoľahlivo prehrá HTTP streamy (MP3 / AAC). HTTPS streamy pravdepodobne nie.")
+            .setView(box)
+            .setPositiveButton("Uložiť") { _, _ ->
+                val name = nameIn.text.toString().trim()
+                val url = urlIn.text.toString().trim()
+                if (name.isEmpty() || !(url.startsWith("http://", true) || url.startsWith("https://", true))) {
+                    if (::radioServerStatus.isInitialized) {
+                        radioServerStatus.text = "⚠️ Zadaj názov a URL začínajúce na http://"
+                    }
+                } else {
+                    try { usbDb.saveStation(existing?.id, name, url) } catch (_: Exception) {}
+                    refreshRadioStations()
+                    renderRadioStations()
+                    backupDbNow(showStatus = false)
+                }
+            }
+            .setNegativeButton("Zrušiť", null)
+            .show()
+    }
+
+    private fun toggleRadioServer() {
+        if (radioServer != null) {
+            val old = radioServer
+            radioServer = null
+            scope.launch(Dispatchers.IO) { old?.stop() }
+            updateRadioServerUi()
+            return
+        }
+        val ip = wifiIp()
+        if (ip == null) {
+            radioServerStatus.text = "⚠️ Telefón nie je pripojený do Wi-Fi siete."
+            return
+        }
+        radioServerStatus.text = "⏳ Spúšťam server…"
+        scope.launch(Dispatchers.IO) {
+            try {
+                var uuid = prefs().getString("radio_server_uuid", null)
+                if (uuid == null) {
+                    uuid = UUID.randomUUID().toString()
+                    prefs().edit().putString("radio_server_uuid", uuid).apply()
+                }
+                val server = RadioDlnaServer(ip, uuid)
+                server.start()
+                radioServer = server
+                ui { updateRadioServerUi() }
+            } catch (e: Exception) {
+                ui { radioServerStatus.text = "⚠️ Server sa nepodarilo spustiť: ${e.message ?: "neznáma chyba"}" }
+            }
+        }
+    }
+
+    // Minimálny DLNA MediaServer: SSDP + popis zariadenia + ContentDirectory + ConnectionManager.
+    // Ponúka stanice dvojako: ako m3u súbor (overený spôsob) a ako priamy stream.
+    private inner class RadioDlnaServer(val ip: String, uuid: String) {
+        private val usn = "uuid:$uuid"
+        private val pool = Executors.newCachedThreadPool()
+        private var httpSock: ServerSocket? = null
+        private var recvSock: MulticastSocket? = null
+        private var sendSock: MulticastSocket? = null
+        @Volatile private var running = false
+        var port = 0
+            private set
+        private val groupAddr = InetAddress.getByName("239.255.255.250")
+        private val serverHeader = "Linux/3.0 UPnP/1.0 PioneerRemote/1.0"
+        private val xmlType = "text/xml; charset=\"utf-8\""
+        private val targets = listOf(
+            "upnp:rootdevice",
+            "urn:schemas-upnp-org:device:MediaServer:1",
+            "urn:schemas-upnp-org:service:ContentDirectory:1",
+            "urn:schemas-upnp-org:service:ConnectionManager:1",
+            usn
+        )
+
+        private fun usnFor(nt: String) = if (nt == usn) usn else "$usn::$nt"
+        private fun location() = "http://$ip:$port/desc.xml"
+
+        @Suppress("DEPRECATION")
+        fun start() {
+            val ss = ServerSocket(0)
+            httpSock = ss
+            port = ss.localPort
+            running = true
+            pool.execute { acceptLoop(ss) }
+            try {
+                val rs = MulticastSocket(null)
+                rs.reuseAddress = true
+                rs.bind(InetSocketAddress(1900))
+                rs.setInterface(InetAddress.getByName(ip))
+                rs.joinGroup(groupAddr)
+                recvSock = rs
+                pool.execute { ssdpListen(rs) }
+            } catch (_: Exception) {
+                recvSock = null   // bez odpovedí na M-SEARCH; stále posielame NOTIFY
+            }
+            try {
+                val ms = MulticastSocket()
+                ms.setInterface(InetAddress.getByName(ip))
+                ms.timeToLive = 4
+                sendSock = ms
+            } catch (_: Exception) {
+                sendSock = null
+            }
+            pool.execute { notifyLoop() }
+        }
+
+        fun stop() {
+            running = false
+            sendNotify("ssdp:byebye")
+            runCatching { httpSock?.close() }
+            runCatching { recvSock?.close() }
+            runCatching { sendSock?.close() }
+            pool.shutdownNow()
+        }
+
+        // ---------- SSDP ----------
+
+        private fun sendNotify(nts: String) {
+            val s = sendSock ?: return
+            targets.forEach { nt ->
+                val msg = "NOTIFY * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nCACHE-CONTROL: max-age=1800\r\n" +
+                    (if (nts == "ssdp:alive") "LOCATION: ${location()}\r\n" else "") +
+                    "NT: $nt\r\nNTS: $nts\r\nSERVER: $serverHeader\r\nUSN: ${usnFor(nt)}\r\n\r\n"
+                val b = msg.toByteArray(Charsets.US_ASCII)
+                try { s.send(DatagramPacket(b, b.size, groupAddr, 1900)) } catch (_: Exception) {}
+            }
+        }
+
+        private fun notifyLoop() {
+            try {
+                repeat(3) {
+                    if (running) {
+                        sendNotify("ssdp:alive")
+                        Thread.sleep(300)
+                    }
+                }
+                while (running) {
+                    Thread.sleep(30000)
+                    if (running) sendNotify("ssdp:alive")
+                }
+            } catch (_: InterruptedException) {}
+        }
+
+        private fun ssdpListen(rs: MulticastSocket) {
+            val buf = ByteArray(2048)
+            while (running) {
+                try {
+                    val pkt = DatagramPacket(buf, buf.size)
+                    rs.receive(pkt)
+                    val text = String(pkt.data, 0, pkt.length, Charsets.US_ASCII)
+                    if (!text.startsWith("M-SEARCH")) continue
+                    val st = Regex("(?im)^ST:\\s*(.+?)\\s*$").find(text)?.groupValues?.get(1) ?: continue
+                    val answers = if (st.equals("ssdp:all", true)) targets else targets.filter { it.equals(st, true) }
+                    for (nt in answers) {
+                        val msg = "HTTP/1.1 200 OK\r\nCACHE-CONTROL: max-age=1800\r\nEXT:\r\n" +
+                            "LOCATION: ${location()}\r\nSERVER: $serverHeader\r\nST: $nt\r\nUSN: ${usnFor(nt)}\r\n\r\n"
+                        val b = msg.toByteArray(Charsets.US_ASCII)
+                        (sendSock ?: rs).send(DatagramPacket(b, b.size, pkt.address, pkt.port))
+                    }
+                } catch (_: Exception) {
+                    if (!running) break
+                }
+            }
+        }
+
+        // ---------- HTTP ----------
+
+        private fun acceptLoop(ss: ServerSocket) {
+            while (running) {
+                try {
+                    val c = ss.accept()
+                    pool.execute { handle(c) }
+                } catch (_: Exception) {
+                    if (!running) break
+                }
+            }
+        }
+
+        private fun readHttpLine(inp: InputStream): String? {
+            val sb = StringBuilder()
+            while (true) {
+                val b = inp.read()
+                if (b < 0) return if (sb.isEmpty()) null else sb.toString()
+                if (b == 10) break
+                if (b != 13) sb.append(b.toChar())
+            }
+            return sb.toString()
+        }
+
+        private fun handle(sock: Socket) {
+            sock.use { s ->
+                try {
+                    s.soTimeout = 8000
+                    val inp = BufferedInputStream(s.getInputStream())
+                    val out = s.getOutputStream()
+                    val reqLine = readHttpLine(inp) ?: return
+                    val parts = reqLine.split(" ")
+                    if (parts.size < 2) return
+                    val method = parts[0].uppercase()
+                    val path = parts[1].substringBefore('?')
+                    val headers = HashMap<String, String>()
+                    while (true) {
+                        val l = readHttpLine(inp) ?: break
+                        if (l.isEmpty()) break
+                        val i = l.indexOf(':')
+                        if (i > 0) headers[l.substring(0, i).trim().lowercase()] = l.substring(i + 1).trim()
+                    }
+                    val len = headers["content-length"]?.toIntOrNull() ?: 0
+                    var body = ""
+                    if (len > 0) {
+                        val bytes = ByteArray(len)
+                        var off = 0
+                        while (off < len) {
+                            val r = inp.read(bytes, off, len - off)
+                            if (r < 0) break
+                            off += r
+                        }
+                        body = String(bytes, 0, off, Charsets.UTF_8)
+                    }
+                    route(method, path, headers, body, out)
+                } catch (_: Exception) {}
+            }
+        }
+
+        private fun reply(out: OutputStream, method: String, code: Int, type: String, body: String,
+                          extra: Map<String, String> = emptyMap()) {
+            val bytes = body.toByteArray(Charsets.UTF_8)
+            val status = when (code) {
+                200 -> "OK"
+                404 -> "Not Found"
+                500 -> "Internal Server Error"
+                else -> "OK"
+            }
+            val sb = StringBuilder()
+            sb.append("HTTP/1.1 $code $status\r\n")
+            sb.append("CONTENT-TYPE: $type\r\n")
+            sb.append("CONTENT-LENGTH: ${bytes.size}\r\n")
+            sb.append("SERVER: $serverHeader\r\n")
+            sb.append("EXT:\r\n")
+            extra.forEach { (k, v) -> sb.append("$k: $v\r\n") }
+            sb.append("Connection: close\r\n\r\n")
+            out.write(sb.toString().toByteArray(Charsets.UTF_8))
+            if (method != "HEAD") out.write(bytes)
+            out.flush()
+        }
+
+        private fun route(method: String, path: String, headers: Map<String, String>, body: String, out: OutputStream) {
+            when {
+                path == "/desc.xml" -> reply(out, method, 200, xmlType, descXml())
+                path == "/cds.xml" -> reply(out, method, 200, xmlType, cdsScpd())
+                path == "/cm.xml" -> reply(out, method, 200, xmlType, cmScpd())
+                path == "/cds/control" && method == "POST" -> soapCds(out, headers, body)
+                path == "/cm/control" && method == "POST" -> soapCm(out, headers)
+                path == "/cds/event" || path == "/cm/event" -> {
+                    if (method == "SUBSCRIBE") {
+                        reply(out, method, 200, "text/plain", "",
+                            mapOf("SID" to "uuid:${UUID.randomUUID()}", "TIMEOUT" to "Second-1800"))
+                    } else {
+                        reply(out, method, 200, "text/plain", "")
+                    }
+                }
+                path.startsWith("/radio/") && path.endsWith(".m3u") -> {
+                    val id = path.removePrefix("/radio/").removeSuffix(".m3u").toLongOrNull()
+                    val st = radioStations.firstOrNull { it.id == id }
+                    if (st == null) {
+                        reply(out, method, 404, "text/plain", "Not found")
+                    } else {
+                        reply(out, method, 200, "audio/x-mpegurl", "#EXTM3U\r\n#EXTINF:-1,${st.name}\r\n${st.url}\r\n")
+                    }
+                }
+                else -> reply(out, method, 404, "text/plain", "Not found")
+            }
+        }
+
+        // ---------- popis zariadenia a služieb ----------
+
+        private fun descXml(): String =
+            "<?xml version=\"1.0\"?>" +
+            "<root xmlns=\"urn:schemas-upnp-org:device-1-0\" xmlns:dlna=\"urn:schemas-dlna-org:device-1-0\">" +
+            "<specVersion><major>1</major><minor>0</minor></specVersion><device>" +
+            "<dlna:X_DLNADOC>DMS-1.50</dlna:X_DLNADOC>" +
+            "<deviceType>urn:schemas-upnp-org:device:MediaServer:1</deviceType>" +
+            "<friendlyName>Pioneer Remote Radio</friendlyName>" +
+            "<manufacturer>Pioneer Remote</manufacturer><modelName>Radio Server</modelName>" +
+            "<UDN>$usn</UDN><serviceList>" +
+            "<service><serviceType>urn:schemas-upnp-org:service:ContentDirectory:1</serviceType>" +
+            "<serviceId>urn:upnp-org:serviceId:ContentDirectory</serviceId><SCPDURL>/cds.xml</SCPDURL>" +
+            "<controlURL>/cds/control</controlURL><eventSubURL>/cds/event</eventSubURL></service>" +
+            "<service><serviceType>urn:schemas-upnp-org:service:ConnectionManager:1</serviceType>" +
+            "<serviceId>urn:upnp-org:serviceId:ConnectionManager</serviceId><SCPDURL>/cm.xml</SCPDURL>" +
+            "<controlURL>/cm/control</controlURL><eventSubURL>/cm/event</eventSubURL></service>" +
+            "</serviceList></device></root>"
+
+        private fun arg(n: String, d: String, r: String) =
+            "<argument><name>$n</name><direction>$d</direction><relatedStateVariable>$r</relatedStateVariable></argument>"
+
+        private fun act(n: String, args: String) =
+            "<action><name>$n</name><argumentList>$args</argumentList></action>"
+
+        private fun sv(n: String, t: String, ev: Boolean = false, allowed: List<String> = emptyList()) =
+            "<stateVariable sendEvents=\"" + (if (ev) "yes" else "no") + "\"><name>$n</name><dataType>$t</dataType>" +
+                (if (allowed.isEmpty()) "" else "<allowedValueList>" +
+                    allowed.joinToString("") { "<allowedValue>$it</allowedValue>" } + "</allowedValueList>") +
+                "</stateVariable>"
+
+        private fun scpd(actions: String, vars: String) =
+            "<?xml version=\"1.0\"?><scpd xmlns=\"urn:schemas-upnp-org:service-1-0\">" +
+                "<specVersion><major>1</major><minor>0</minor></specVersion>" +
+                "<actionList>$actions</actionList><serviceStateTable>$vars</serviceStateTable></scpd>"
+
+        private fun cdsScpd(): String = scpd(
+            act("GetSearchCapabilities", arg("SearchCaps", "out", "SearchCapabilities")) +
+                act("GetSortCapabilities", arg("SortCaps", "out", "SortCapabilities")) +
+                act("GetSystemUpdateID", arg("Id", "out", "SystemUpdateID")) +
+                act("Browse",
+                    arg("ObjectID", "in", "A_ARG_TYPE_ObjectID") +
+                        arg("BrowseFlag", "in", "A_ARG_TYPE_BrowseFlag") +
+                        arg("Filter", "in", "A_ARG_TYPE_Filter") +
+                        arg("StartingIndex", "in", "A_ARG_TYPE_Index") +
+                        arg("RequestedCount", "in", "A_ARG_TYPE_Count") +
+                        arg("SortCriteria", "in", "A_ARG_TYPE_SortCriteria") +
+                        arg("Result", "out", "A_ARG_TYPE_Result") +
+                        arg("NumberReturned", "out", "A_ARG_TYPE_Count") +
+                        arg("TotalMatches", "out", "A_ARG_TYPE_Count") +
+                        arg("UpdateID", "out", "A_ARG_TYPE_UpdateID")),
+            sv("A_ARG_TYPE_ObjectID", "string") +
+                sv("A_ARG_TYPE_Result", "string") +
+                sv("A_ARG_TYPE_BrowseFlag", "string", false, listOf("BrowseMetadata", "BrowseDirectChildren")) +
+                sv("A_ARG_TYPE_Filter", "string") +
+                sv("A_ARG_TYPE_SortCriteria", "string") +
+                sv("A_ARG_TYPE_Index", "ui4") +
+                sv("A_ARG_TYPE_Count", "ui4") +
+                sv("A_ARG_TYPE_UpdateID", "ui4") +
+                sv("SearchCapabilities", "string") +
+                sv("SortCapabilities", "string") +
+                sv("SystemUpdateID", "ui4", true))
+
+        private fun cmScpd(): String = scpd(
+            act("GetProtocolInfo", arg("Source", "out", "SourceProtocolInfo") + arg("Sink", "out", "SinkProtocolInfo")) +
+                act("GetCurrentConnectionIDs", arg("ConnectionIDs", "out", "CurrentConnectionIDs")) +
+                act("GetCurrentConnectionInfo",
+                    arg("ConnectionID", "in", "A_ARG_TYPE_ConnectionID") +
+                        arg("RcsID", "out", "A_ARG_TYPE_RcsID") +
+                        arg("AVTransportID", "out", "A_ARG_TYPE_AVTransportID") +
+                        arg("ProtocolInfo", "out", "A_ARG_TYPE_ProtocolInfo") +
+                        arg("PeerConnectionManager", "out", "A_ARG_TYPE_ConnectionManager") +
+                        arg("PeerConnectionID", "out", "A_ARG_TYPE_ConnectionID") +
+                        arg("Direction", "out", "A_ARG_TYPE_Direction") +
+                        arg("Status", "out", "A_ARG_TYPE_ConnectionStatus")),
+            sv("SourceProtocolInfo", "string", true) +
+                sv("SinkProtocolInfo", "string", true) +
+                sv("CurrentConnectionIDs", "string", true) +
+                sv("A_ARG_TYPE_ConnectionStatus", "string", false, listOf("OK", "ContentFormatMismatch", "InsufficientBandwidth", "UnreliableChannel", "Unknown")) +
+                sv("A_ARG_TYPE_ConnectionManager", "string") +
+                sv("A_ARG_TYPE_Direction", "string", false, listOf("Input", "Output")) +
+                sv("A_ARG_TYPE_ProtocolInfo", "string") +
+                sv("A_ARG_TYPE_ConnectionID", "i4") +
+                sv("A_ARG_TYPE_AVTransportID", "i4") +
+                sv("A_ARG_TYPE_RcsID", "i4"))
+
+        // ---------- SOAP ----------
+
+        private fun xmlEsc(s: String): String = s.replace("&", "&amp;").replace("<", "&lt;")
+            .replace(">", "&gt;").replace("\"", "&quot;").replace("'", "&apos;")
+
+        private fun tag(body: String, name: String): String =
+            Regex("<$name>(.*?)</$name>", RegexOption.DOT_MATCHES_ALL).find(body)?.groupValues?.get(1)?.trim() ?: ""
+
+        private fun soapActionOf(headers: Map<String, String>): String =
+            headers["soapaction"]?.trim()?.trim('"')?.substringAfter('#') ?: ""
+
+        private fun envelope(service: String, action: String, inner: String): String =
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>" +
+                "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" " +
+                "s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\"><s:Body>" +
+                "<u:${action}Response xmlns:u=\"urn:schemas-upnp-org:service:$service:1\">$inner" +
+                "</u:${action}Response></s:Body></s:Envelope>"
+
+        private fun fault(out: OutputStream, code: Int, msg: String) {
+            val xml = "<?xml version=\"1.0\" encoding=\"utf-8\"?>" +
+                "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" " +
+                "s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\"><s:Body><s:Fault>" +
+                "<faultcode>s:Client</faultcode><faultstring>UPnPError</faultstring><detail>" +
+                "<UPnPError xmlns=\"urn:schemas-upnp-org:control-1-0\"><errorCode>$code</errorCode>" +
+                "<errorDescription>$msg</errorDescription></UPnPError></detail></s:Fault></s:Body></s:Envelope>"
+            reply(out, "POST", 500, xmlType, xml)
+        }
+
+        private fun didl(inner: String): String =
+            "<DIDL-Lite xmlns=\"urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/\" " +
+                "xmlns:dc=\"http://purl.org/dc/elements/1.1/\" " +
+                "xmlns:upnp=\"urn:schemas-upnp-org:metadata-1-0/upnp/\">$inner</DIDL-Lite>"
+
+        private fun itemXml(id: String, title: String, cls: String, proto: String, url: String): String =
+            "<item id=\"$id\" parentID=\"0\" restricted=\"1\"><dc:title>${xmlEsc(title)}</dc:title>" +
+                "<upnp:class>$cls</upnp:class><res protocolInfo=\"$proto\">${xmlEsc(url)}</res></item>"
+
+        // Každá stanica sa ponúka dvakrát: ako m3u súbor a ako priamy stream
+        private fun allItems(): List<Pair<String, String>> {
+            val list = mutableListOf<Pair<String, String>>()
+            radioStations.forEach { st ->
+                val mime = if (st.url.lowercase().contains("aac")) "audio/aac" else "audio/mpeg"
+                list.add("m${st.id}" to itemXml("m${st.id}", st.name, "object.item.audioItem",
+                    "http-get:*:audio/x-mpegurl:*", "http://$ip:$port/radio/${st.id}.m3u"))
+                list.add("d${st.id}" to itemXml("d${st.id}", "${st.name} (priamy stream)",
+                    "object.item.audioItem.audioBroadcast", "http-get:*:$mime:*", st.url))
+            }
+            return list
+        }
+
+        private fun soapCds(out: OutputStream, headers: Map<String, String>, body: String) {
+            val action = soapActionOf(headers)
+            when (action) {
+                "Browse" -> {
+                    val objectId = tag(body, "ObjectID")
+                    val flag = tag(body, "BrowseFlag")
+                    val start = tag(body, "StartingIndex").toIntOrNull() ?: 0
+                    val req = tag(body, "RequestedCount").toIntOrNull() ?: 0
+                    val items = allItems()
+                    if (flag == "BrowseMetadata") {
+                        val frag = if (objectId == "0")
+                            "<container id=\"0\" parentID=\"-1\" restricted=\"1\" childCount=\"${items.size}\">" +
+                                "<dc:title>Radia</dc:title><upnp:class>object.container</upnp:class></container>"
+                        else items.firstOrNull { it.first == objectId }?.second
+                        if (frag == null) {
+                            fault(out, 701, "No such object")
+                        } else {
+                            reply(out, "POST", 200, xmlType, envelope("ContentDirectory", action,
+                                "<Result>${xmlEsc(didl(frag))}</Result><NumberReturned>1</NumberReturned>" +
+                                    "<TotalMatches>1</TotalMatches><UpdateID>1</UpdateID>"))
+                        }
+                    } else if (objectId != "0") {
+                        fault(out, 701, "No such object")
+                    } else {
+                        val total = items.size
+                        val from = start.coerceIn(0, total)
+                        val to = if (req <= 0) total else (from + req).coerceAtMost(total)
+                        val slice = items.subList(from, to)
+                        reply(out, "POST", 200, xmlType, envelope("ContentDirectory", action,
+                            "<Result>${xmlEsc(didl(slice.joinToString("") { it.second }))}</Result>" +
+                                "<NumberReturned>${slice.size}</NumberReturned><TotalMatches>$total</TotalMatches>" +
+                                "<UpdateID>1</UpdateID>"))
+                    }
+                }
+                "GetSearchCapabilities" -> reply(out, "POST", 200, xmlType,
+                    envelope("ContentDirectory", action, "<SearchCaps></SearchCaps>"))
+                "GetSortCapabilities" -> reply(out, "POST", 200, xmlType,
+                    envelope("ContentDirectory", action, "<SortCaps></SortCaps>"))
+                "GetSystemUpdateID" -> reply(out, "POST", 200, xmlType,
+                    envelope("ContentDirectory", action, "<Id>1</Id>"))
+                else -> fault(out, 401, "Invalid Action")
+            }
+        }
+
+        private fun soapCm(out: OutputStream, headers: Map<String, String>) {
+            val action = soapActionOf(headers)
+            val inner = when (action) {
+                "GetProtocolInfo" -> "<Source>http-get:*:audio/x-mpegurl:*,http-get:*:audio/mpeg:*,http-get:*:audio/aac:*</Source><Sink></Sink>"
+                "GetCurrentConnectionIDs" -> "<ConnectionIDs>0</ConnectionIDs>"
+                "GetCurrentConnectionInfo" -> "<RcsID>-1</RcsID><AVTransportID>-1</AVTransportID>" +
+                    "<ProtocolInfo></ProtocolInfo><PeerConnectionManager></PeerConnectionManager>" +
+                    "<PeerConnectionID>-1</PeerConnectionID><Direction>Output</Direction><Status>OK</Status>"
+                else -> null
+            }
+            if (inner == null) {
+                fault(out, 401, "Invalid Action")
+            } else {
+                reply(out, "POST", 200, xmlType, envelope("ConnectionManager", action, inner))
+            }
+        }
     }
 
     private fun looksLikeMetadata(text: String): Boolean {
@@ -641,6 +1680,11 @@ class MainActivity : AppCompatActivity() {
         root.setBackgroundColor(C_BG)
         root.setPadding(pad, dp(8), pad, 0)
 
+        // Horná časť (hlavička, IP, displej, karty, hlasitosť) je v jednom paneli.
+        // Na výšku je nad obsahom kariet, na šírku vľavo od neho.
+        val topPanel = LinearLayout(this)
+        topPanel.orientation = LinearLayout.VERTICAL
+
         val header = FrameLayout(this)
         header.setPadding(0, 0, 0, dp(6))
 
@@ -687,7 +1731,7 @@ class MainActivity : AppCompatActivity() {
             Gravity.END or Gravity.CENTER_VERTICAL
         ))
 
-        root.addView(header)
+        topPanel.addView(header)
 
         val top = LinearLayout(this)
         top.orientation = LinearLayout.HORIZONTAL
@@ -707,7 +1751,7 @@ class MainActivity : AppCompatActivity() {
         val connBtn = pillBtn("Pripoj", C_CYAN, C_ON_ACCENT) { connectPressed() }
         top.addView(connBtn, LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
-        root.addView(top)
+        topPanel.addView(top)
 
         // Kompaktný displej: hore väčším písmom čo hrá / vstup, pod tým riadky s ďalšími údajmi
         val card = LinearLayout(this)
@@ -804,7 +1848,7 @@ class MainActivity : AppCompatActivity() {
         val cardLp = LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
         cardLp.topMargin = dp(4)
-        root.addView(card, cardLp)
+        topPanel.addView(card, cardLp)
 
         // Úzke informačné štítky kariet (prepínanie je swipeom; klik funguje tiež)
         val tabDefs = listOf("🎚 OVLÁDANIE", "📻 RÁDIO", "💽 MÉDIÁ")
@@ -821,7 +1865,7 @@ class MainActivity : AppCompatActivity() {
         val tabsLp = LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
         tabsLp.topMargin = dp(4)
-        root.addView(tabs, tabsLp)
+        topPanel.addView(tabs, tabsLp)
 
         // Globálne ovládanie hlasitosti v jednom riadku pod prepínačmi kariet
         muteBtn = flatBtn("🔇 MUTE") { toggleMute() }
@@ -837,7 +1881,7 @@ class MainActivity : AppCompatActivity() {
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
         globalVolLp.topMargin = dp(4)
         globalVolLp.bottomMargin = dp(2)
-        root.addView(rowOf(listOf(volMinus, muteBtn, volPlus)), globalVolLp)
+        topPanel.addView(rowOf(listOf(volMinus, muteBtn, volPlus)), globalVolLp)
 
         val pager = ViewPager2(this)
         pager.layoutParams = LinearLayout.LayoutParams(
@@ -870,8 +1914,48 @@ class MainActivity : AppCompatActivity() {
         }
         styleTab(tabBtns[0], true)
 
+        // Zloženie: panel s displejom (v ScrollView pre malé obrazovky) + obsah kariet (ViewPager2)
+        val scroll = ScrollView(this)
+        scroll.isVerticalScrollBarEnabled = false
+        scroll.addView(topPanel, ViewGroup.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        rootLayout = root
+        topScroll = scroll
+        mainPager = pager
+        root.addView(scroll)
         root.addView(pager)
+        applyOrientationLayout()
         setContentView(root)
+    }
+
+    // Na výšku: displej hore, obsah kariet dole. Na šírku: displej a hlasitosť vľavo,
+    // obsah kariet (swipe) vpravo, aby sa dalo ovládať palcami z oboch strán.
+    private fun applyOrientationLayout() {
+        if (!::rootLayout.isInitialized) return
+        val landscape = resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
+        if (landscape) {
+            rootLayout.orientation = LinearLayout.HORIZONTAL
+            rootLayout.setPadding(dp(12), dp(4), dp(12), 0)
+            val leftLp = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 0.42f)
+            leftLp.rightMargin = dp(10)
+            topScroll.layoutParams = leftLp
+            mainPager.layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.MATCH_PARENT, 0.58f)
+        } else {
+            rootLayout.orientation = LinearLayout.VERTICAL
+            rootLayout.setPadding(dp(12), dp(8), dp(12), 0)
+            topScroll.layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+            mainPager.layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f)
+        }
+        rootLayout.requestLayout()
+    }
+
+    // Funguje, ak je v AndroidManifest.xml pri aktivite nastavené android:configChanges (stav sa zachová).
+    // Bez toho sa aktivita pri otočení vytvorí znova a rozloženie sa nastaví v buildUI().
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        applyOrientationLayout()
     }
 
     private fun styleTab(btn: Button, active: Boolean) {
@@ -995,6 +2079,8 @@ class MainActivity : AppCompatActivity() {
 
         page.addView(favDrawerCard)
         renderFavoriteTable()
+
+        buildRadioServerSection(page)
 
         page.addView(hint("← swipe na ovládanie / médiá →"))
         return sv
@@ -1165,14 +2251,16 @@ class MainActivity : AppCompatActivity() {
         usbContainer = LinearLayout(this)
         usbContainer.orientation = LinearLayout.VERTICAL
 
-        val openPlaylistBtn = flatBtn("📂 Otvor playlist") { showOpenPlaylistDialog() }
-        val savePlaylistBtn = flatBtn("💾 Ulož playlist") { showSavePlaylistDialog(afterScan = false) }
-        openPlaylistBtn.textSize = 13f
-        savePlaylistBtn.textSize = 13f
-        openPlaylistBtn.background = roundedBg(C_CARD2, 12, C_CYAN)
-        savePlaylistBtn.background = roundedBg(C_CARD2, 12, C_ORANGE)
-
-        usbContainer.addView(rowOf(listOf(openPlaylistBtn, savePlaylistBtn)))
+        // Dve tlačidlá s rozbaľovacou ponukou (šetria miesto na obrazovke)
+        val playlistMenuBtn = flatBtn("📂 Playlist ▾") { }
+        val dbMenuBtn = flatBtn("🗄 Databáza ▾") { }
+        playlistMenuBtn.setOnClickListener { showPlaylistMenu(it) }
+        dbMenuBtn.setOnClickListener { showDatabaseMenu(it) }
+        playlistMenuBtn.textSize = 13f
+        dbMenuBtn.textSize = 13f
+        playlistMenuBtn.background = roundedBg(C_CARD2, 12, C_CYAN)
+        dbMenuBtn.background = roundedBg(C_CARD2, 12, C_ORANGE)
+        usbContainer.addView(rowOf(listOf(playlistMenuBtn, dbMenuBtn)))
 
         // Tlačidlá ▶ PLAY a ⏹ STOP (umiestnené v pevnej dolnej lište, pozri nižšie)
         usbPlayBtn = flatBtn("▶ PLAY") { onMediaPlayPressed() }
@@ -1749,12 +2837,12 @@ class MainActivity : AppCompatActivity() {
                     usbSelectedPathKeys.clear()
                     activePlaylistId = null
                     activePlaylistName = "Neuložený kľúč"
-                    prefs().edit().remove("active_playlist_id").apply()
+                    prefs().edit().remove("active_playlist_name").apply()
                     renderUsbCachedFolder()
                     updateInfoLine()
                     updateMainDisplayHeader()
                     usbStatusText.text = "✓ Načítané: ${counter[1] + 1} adresárov, ${counter[0]} položiek. Nezabudnite si tento kľúč uložiť (💾 Ulož playlist)."
-                    showSavePlaylistDialog(afterScan = true)
+                    showAddUsbToDbDialog(afterScan = true)
                 }
             } catch (e: CancellationException) {
                 throw e
