@@ -1,13 +1,23 @@
 // ============================================================================
 // Pioneer VSX-S510 Remote — verzia 34
-// Novinky oproti v33:
-// 1. Karta RÁDIO / DLNA server: možnosť vybrať a trvalo si zapamätať adresár
-//    s médiami v telefóne (SAF + trvalé oprávnenie čítania).
-// 2. Pri zapnutí servera (Server: VYP -> ZAP) ponúkne výber adresára, ak ešte
-//    nie je zvolený. Ak už zvolený je, použije sa bez pýtania.
-// 3. Zapamätaný adresár ostáva uložený aj po vypnutí DLNA servera a reštarte appky.
-// 4. Vstavaný DLNA server sprístupňuje aj obsah zvoleného adresára (vrátane
-//    podadresárov a streamovania audio súborov s podporou HTTP Range).
+// Opravy oproti v33:
+// 1. Karta Rádio: DLNA server ponúka M3U/M3U8 súbory z vybraného adresára.
+// 2. Výber adresára používa Android SAF a trvalé oprávnenie; voľba ostáva uložená po vypnutí servera.
+// 3. Pri ďalšom zapnutí sa výber neopakuje; adresár možno zmeniť tlačidlom Vybrať adresár M3U.
+// Predchádzajúce opravy verzie 33 ostávajú zachované.
+// Opravy oproti v32:
+// 1. Pád pri prechode na ďalší označený adresár: úpravy UI sa už nerobia
+//    z IO vlákna (playNextInUsbQueue / stopUsbPlayback idú cez ui { }).
+// 2. Spojenie s receiverom sa v onStop() nezatvára počas skenovania USB
+//    a počas prehrávania z USB (sken a fronta sa inak prerušia po zhasnutí obrazovky).
+// 3. Dvojité pripojenie pri štarte: platí len posledný pokus o pripojenie
+//    a vlákno zatvoreného / nahradeného socketu už nepíše falošné "Spojenie prerušené".
+// 4. Označený adresár s podadresármi sa rozbalí na všetky adresáre so skladbami (v poradí).
+// 5. Fronta sa prehráva v poradí označovania (nie podľa stromu).
+// 6. Detekcia konca adresára: okrem návratu na zoznam sa sleduje aj zamrznutý čas
+//    prehrávania (iba ak je vo fronte ďalší adresár).
+// 7. Drobnosti: odstránený nespoľahlivý záložný krok (27NW) pri adresároch nad 99 položiek,
+//    loadPlaylist vždy obnoví zobrazenie.
 // ============================================================================
 
 package com.example.pioneerremote
@@ -19,15 +29,15 @@ import android.content.res.ColorStateList
 import android.content.res.Configuration
 import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
+import android.net.Uri
+import android.provider.DocumentsContract
+import android.util.Base64
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
-import android.net.Uri
 import android.net.wifi.WifiManager
 import android.os.Bundle
-import android.provider.DocumentsContract
 import android.text.InputType
 import android.text.TextUtils
-import android.util.Base64
 import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
@@ -48,13 +58,14 @@ import kotlinx.coroutines.*
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.BufferedInputStream
+import java.io.ByteArrayOutputStream
 import java.io.BufferedReader
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.InputStream
-import java.io.InputStreamReader
 import java.io.OutputStream
+import java.io.InputStreamReader
 import java.io.OutputStreamWriter
 import java.net.DatagramPacket
 import java.net.HttpURLConnection
@@ -222,7 +233,6 @@ class MainActivity : AppCompatActivity() {
     private lateinit var usbPlayBtn: Button
     private lateinit var usbStopBtn: Button
     private lateinit var usbTransportBar: LinearLayout
-
     // DLNA: označovanie (albumy viacnásobne, súbor iba jeden)
     private val dlnaSelectedContainers = linkedMapOf<String, MediaEntry>()
     private var dlnaSelectedFile: MediaEntry? = null
@@ -272,7 +282,6 @@ class MainActivity : AppCompatActivity() {
         const val DB_NAME = "pioneer_usb.db"
         const val REQ_EXPORT_DB = 4101
         const val REQ_IMPORT_DB = 4102
-        const val REQ_PICK_MEDIA_DIR = 4103
     }
 
     private lateinit var usbDb: UsbDatabase
@@ -404,6 +413,7 @@ class MainActivity : AppCompatActivity() {
                         .add(UsbNode(c.getInt(1), c.getString(2), c.getInt(3) == 1, c.getString(4)))
                 }
             }
+            // prázdne adresáre dostanú prázdny zoznam (aby sa líšili od "neznámych")
             val folderKeys = out.values.flatten().filter { it.isFolder }.map { it.pathKey }
             folderKeys.forEach { out.getOrPut(it) { mutableListOf() } }
             return out
@@ -424,7 +434,6 @@ class MainActivity : AppCompatActivity() {
         isUsbMediaMode = p.getBoolean("isUsbMediaMode", true)
         usbDb = UsbDatabase(applicationContext)
         refreshRadioStations()
-        loadSavedMediaDir()
         loadCachedFavorites()
         loadPlaylistsMetadata()
         buildUI()
@@ -450,6 +459,8 @@ class MainActivity : AppCompatActivity() {
     override fun onStop() {
         super.onStop()
         appInForeground = false
+        // Počas skenovania USB a prehrávania z USB (fronta) spojenie nezatvárame,
+        // inak by sa po zhasnutí obrazovky sken prerušil a fronta by nepostúpila.
         if (usbScanning || usbState == UsbState.PLAYING) return
         disconnectSocket()
     }
@@ -460,6 +471,7 @@ class MainActivity : AppCompatActivity() {
         disconnectSocket()
         multicastLock?.release()
         sendDispatcher.close()
+        // zastavenie servera posiela sieťové pakety -> nesmie bežať na hlavnom vlákne
         val srv = radioServer
         radioServer = null
         if (srv != null) Thread { srv.stop() }.start()
@@ -478,6 +490,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    // Po skončení skenu / prehrávania v pozadí spojenie zatvoríme
     private fun disconnectIfBackground() {
         if (!appInForeground && !usbScanning && usbState != UsbState.PLAYING) {
             disconnectSocket()
@@ -543,6 +556,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    // Zoznam uložených USB kľúčov z databázy (id = id riadku v tabuľke usb)
     private fun refreshPlaylistList() {
         savedPlaylists.clear()
         try {
@@ -569,6 +583,7 @@ class MainActivity : AppCompatActivity() {
         return out
     }
 
+    // Jednorazový prenos starých playlistov z SharedPreferences do databázy
     private fun migrateLegacyPlaylistsToDb() {
         if (prefs().getBoolean("playlists_migrated_to_db", false)) return
         try {
@@ -622,7 +637,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // ---------- záloha / obnova súboru databázy + výber adresára médií ----------
+    // ---------- záloha / obnova súboru databázy (prežije aj odinštalovanie aplikácie) ----------
 
     private fun startExportDb() {
         val i = Intent(Intent.ACTION_CREATE_DOCUMENT)
@@ -645,53 +660,13 @@ class MainActivity : AppCompatActivity() {
         startActivityForResult(i, MainActivity.REQ_IMPORT_DB)
     }
 
-    private fun startPickMediaDir() {
-        val i = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
-            addFlags(
-                Intent.FLAG_GRANT_READ_URI_PERMISSION or
-                    Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION or
-                    Intent.FLAG_GRANT_PREFIX_URI_PERMISSION
-            )
-        }
-        @Suppress("DEPRECATION")
-        startActivityForResult(i, MainActivity.REQ_PICK_MEDIA_DIR)
-    }
-
     @Suppress("DEPRECATION", "OVERRIDE_DEPRECATION")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode == MainActivity.REQ_PICK_MEDIA_DIR) {
-            val shouldStart = pendingStartRadioServerAfterDirPick
-            pendingStartRadioServerAfterDirPick = false
-            if (resultCode == RESULT_OK && data?.data != null) {
-                val uri = data.data!!
-                val takeFlags = data.flags and Intent.FLAG_GRANT_READ_URI_PERMISSION
-                runCatching {
-                    contentResolver.takePersistableUriPermission(
-                        uri,
-                        if (takeFlags != 0) takeFlags else Intent.FLAG_GRANT_READ_URI_PERMISSION
-                    )
-                }
-                val name = resolveTreeDisplayName(uri)
-                mediaDirUri = uri
-                mediaDirName = name
-                dlnaUpdateId++
-                prefs().edit()
-                    .putString("dlna_media_dir_uri", uri.toString())
-                    .putString("dlna_media_dir_name", name)
-                    .apply()
-                updateRadioServerUi()
-                if (shouldStart) {
-                    startRadioServerNow()
-                }
-            } else if (shouldStart) {
-                if (::radioServerStatus.isInitialized) {
-                    radioServerStatus.text = "Výber adresára zrušený. Server ostal vypnutý."
-                }
-            }
+        if (requestCode == requestM3uFolder) {
+            handleM3uFolderResult(resultCode, data)
             return
         }
-
         if (resultCode != RESULT_OK || data == null) return
         val uri = data.data ?: return
         if (requestCode == MainActivity.REQ_EXPORT_DB || requestCode == MainActivity.REQ_IMPORT_DB) {
@@ -706,6 +681,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    // Skopíruje databázu do zvoleného súboru (volá sa aj automaticky po každom uložení kľúča)
     private fun backupDbNow(showStatus: Boolean) {
         val uriStr = prefs().getString("db_backup_uri", null) ?: return
         val uri = Uri.parse(uriStr)
@@ -745,6 +721,7 @@ class MainActivity : AppCompatActivity() {
                 if (String(head, Charsets.US_ASCII) != "SQLite format 3\u0000") {
                     throw IllegalStateException("súbor nie je SQLite databáza")
                 }
+                // kontrola, že obsahuje očakávané tabuľky
                 val check = SQLiteDatabase.openDatabase(tmp.path, null, SQLiteDatabase.OPEN_READONLY)
                 try {
                     check.rawQuery("SELECT COUNT(*) FROM usb", null).use { it.moveToFirst() }
@@ -880,6 +857,7 @@ class MainActivity : AppCompatActivity() {
             .show()
     }
 
+    // Názov, ktorý v databáze ešte neexistuje (pri zhode sa pridá " (2)", " (3)", ...)
     private fun uniqueUsbName(base: String): String {
         var name = base
         var n = 2
@@ -890,6 +868,7 @@ class MainActivity : AppCompatActivity() {
         return name
     }
 
+    // Pridá práve načítané USB do databázy ako NOVÝ záznam (existujúce kľúče sa neprepíšu)
     private fun showAddUsbToDbDialog(afterScan: Boolean) {
         if (usbTreeCache.isEmpty()) {
             usbStatusText.text = "⚠️ Nie je načítaný žiadny USB kľúč na uloženie."
@@ -927,6 +906,7 @@ class MainActivity : AppCompatActivity() {
             .show()
     }
 
+    // Vymaže konkrétny USB kľúč z databázy
     private fun showDeleteUsbDialog() {
         if (savedPlaylists.isEmpty()) {
             AlertDialog.Builder(this)
@@ -979,31 +959,23 @@ class MainActivity : AppCompatActivity() {
     }
 
     // =====================================================================
-    // VLASTNÝ DLNA SERVER (RÁDIOSTANICE + ZVOLENÝ ADRESÁR S MÉDIAMI)
+    // VLASTNÝ DLNA SERVER S RÁDIOSTANICAMI (na pridanie staníc do Favorites na receiveri)
     // =====================================================================
 
     private data class RadioStation(val id: Long, val name: String, val url: String)
-    private data class LocalDocEntry(
-        val docId: String,
-        val name: String,
-        val mime: String,
-        val size: Long,
-        val isDir: Boolean
-    )
 
     @Volatile private var radioStations = listOf<RadioStation>()
     @Volatile private var radioServer: RadioDlnaServer? = null
-    @Volatile private var mediaDirUri: Uri? = null
-    @Volatile private var mediaDirName: String = ""
-    @Volatile private var dlnaUpdateId: Int = 1
-    private var pendingStartRadioServerAfterDirPick = false
-
     private lateinit var radioServerBtn: Button
-    private lateinit var radioMediaDirBtn: Button
-    private lateinit var radioMediaDirText: TextView
     private lateinit var radioServerStatus: TextView
+    private lateinit var radioFolderStatus: TextView
     private lateinit var radioListLayout: LinearLayout
+    private var pendingRadioServerStart = false
+    private val requestM3uFolder = 3401
 
+    private data class M3uMediaFile(val id: String, val name: String, val uri: Uri)
+
+    // IP adresa telefónu vo Wi-Fi / Ethernet sieti (mobilné dáta sa neberú, ak je Wi-Fi k dispozícii)
     private fun wifiIp(): String? {
         return try {
             val nets = NetworkInterface.getNetworkInterfaces() ?: return null
@@ -1023,168 +995,33 @@ class MainActivity : AppCompatActivity() {
 
     private fun refreshRadioStations() {
         radioStations = try { usbDb.listStations() } catch (_: Exception) { emptyList() }
-        dlnaUpdateId++
-    }
-
-    private fun resolveTreeDisplayName(treeUri: Uri): String {
-        val docId = runCatching { DocumentsContract.getTreeDocumentId(treeUri) }.getOrNull()
-        if (docId != null) {
-            val docUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, docId)
-            val queried = runCatching {
-                contentResolver.query(
-                    docUri,
-                    arrayOf(DocumentsContract.Document.COLUMN_DISPLAY_NAME),
-                    null,
-                    null,
-                    null
-                )?.use { c ->
-                    if (c.moveToFirst()) c.getString(0) else null
-                }
-            }.getOrNull()
-            if (!queried.isNullOrBlank()) return queried
-            val fallback = docId.substringAfterLast(':').substringAfterLast('/')
-            if (fallback.isNotBlank()) return fallback
-        }
-        return "Médiá"
-    }
-
-    private fun loadSavedMediaDir() {
-        val uriStr = prefs().getString("dlna_media_dir_uri", null) ?: return
-        val uri = runCatching { Uri.parse(uriStr) }.getOrNull() ?: return
-        val hasPerm = contentResolver.persistedUriPermissions.any {
-            it.uri == uri && it.isReadPermission
-        }
-        if (hasPerm) {
-            mediaDirUri = uri
-            mediaDirName = prefs().getString("dlna_media_dir_name", null)
-                ?.takeIf { it.isNotBlank() }
-                ?: resolveTreeDisplayName(uri)
-        } else {
-            mediaDirUri = null
-            mediaDirName = ""
-            prefs().edit().remove("dlna_media_dir_uri").remove("dlna_media_dir_name").apply()
-        }
-    }
-
-    private fun clearSavedMediaDir() {
-        val old = mediaDirUri
-        mediaDirUri = null
-        mediaDirName = ""
-        dlnaUpdateId++
-        prefs().edit().remove("dlna_media_dir_uri").remove("dlna_media_dir_name").apply()
-        if (old != null) {
-            runCatching {
-                contentResolver.releasePersistableUriPermission(old, Intent.FLAG_GRANT_READ_URI_PERMISSION)
-            }
-        }
-        updateRadioServerUi()
-    }
-
-    private fun onMediaDirButtonClicked() {
-        if (mediaDirUri == null) {
-            pendingStartRadioServerAfterDirPick = false
-            startPickMediaDir()
-            return
-        }
-        AlertDialog.Builder(this)
-            .setTitle("Adresár s médiami")
-            .setMessage("Aktuálne zapamätaný adresár: $mediaDirName")
-            .setPositiveButton("Zmeniť adresár") { _, _ ->
-                pendingStartRadioServerAfterDirPick = false
-                startPickMediaDir()
-            }
-            .setNeutralButton("Odobrať adresár") { _, _ ->
-                clearSavedMediaDir()
-            }
-            .setNegativeButton("Zrušiť", null)
-            .show()
-    }
-
-    private fun isSupportedDlnaAudio(name: String, mime: String): Boolean {
-        val l = name.lowercase()
-        val exts = listOf(".mp3", ".flac", ".wav", ".m4a", ".aac", ".wma", ".ogg", ".alac", ".aif", ".aiff")
-        if (exts.any { l.endsWith(it) }) return true
-        return mime.startsWith("audio/", ignoreCase = true)
-    }
-
-    private fun resolveAudioMime(name: String, mime: String): String {
-        val l = name.lowercase()
-        return when {
-            l.endsWith(".mp3") -> "audio/mpeg"
-            l.endsWith(".flac") -> "audio/flac"
-            l.endsWith(".wav") -> "audio/wav"
-            l.endsWith(".m4a") || l.endsWith(".alac") -> "audio/mp4"
-            l.endsWith(".aac") -> "audio/aac"
-            l.endsWith(".wma") -> "audio/x-ms-wma"
-            l.endsWith(".ogg") -> "audio/ogg"
-            l.endsWith(".aif") || l.endsWith(".aiff") -> "audio/aiff"
-            mime.startsWith("audio/", ignoreCase = true) -> mime
-            else -> "audio/mpeg"
-        }
-    }
-
-    private fun listMediaDirChildren(treeUri: Uri, parentDocId: String): List<LocalDocEntry> {
-        val out = mutableListOf<LocalDocEntry>()
-        val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, parentDocId)
-        val cols = arrayOf(
-            DocumentsContract.Document.COLUMN_DOCUMENT_ID,
-            DocumentsContract.Document.COLUMN_DISPLAY_NAME,
-            DocumentsContract.Document.COLUMN_MIME_TYPE,
-            DocumentsContract.Document.COLUMN_SIZE
-        )
-        runCatching {
-            contentResolver.query(childrenUri, cols, null, null, null)?.use { c ->
-                val iId = c.getColumnIndex(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
-                val iName = c.getColumnIndex(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
-                val iMime = c.getColumnIndex(DocumentsContract.Document.COLUMN_MIME_TYPE)
-                val iSize = c.getColumnIndex(DocumentsContract.Document.COLUMN_SIZE)
-                while (c.moveToNext()) {
-                    val docId = if (iId >= 0) c.getString(iId) else continue
-                    val name = if (iName >= 0) (c.getString(iName) ?: "") else ""
-                    if (name.isEmpty() || name.startsWith(".")) continue
-                    val mime = if (iMime >= 0) (c.getString(iMime) ?: "") else ""
-                    val size = if (iSize >= 0 && !c.isNull(iSize)) c.getLong(iSize) else -1L
-                    val isDir = mime == DocumentsContract.Document.MIME_TYPE_DIR
-                    if (isDir || isSupportedDlnaAudio(name, mime)) {
-                        out.add(LocalDocEntry(docId, name, resolveAudioMime(name, mime), size, isDir))
-                    }
-                }
-            }
-        }
-        return out.sortedWith(compareBy<LocalDocEntry> { !it.isDir }.thenBy { it.name.lowercase() })
-    }
-
-    private fun queryMediaDoc(treeUri: Uri, docId: String): LocalDocEntry? {
-        val docUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, docId)
-        val cols = arrayOf(
-            DocumentsContract.Document.COLUMN_DISPLAY_NAME,
-            DocumentsContract.Document.COLUMN_MIME_TYPE,
-            DocumentsContract.Document.COLUMN_SIZE
-        )
-        return runCatching {
-            contentResolver.query(docUri, cols, null, null, null)?.use { c ->
-                if (!c.moveToFirst()) return@use null
-                val name = c.getString(0) ?: docId.substringAfterLast('/')
-                val mime = c.getString(1) ?: ""
-                val size = if (!c.isNull(2)) c.getLong(2) else -1L
-                val isDir = mime == DocumentsContract.Document.MIME_TYPE_DIR
-                LocalDocEntry(docId, name, resolveAudioMime(name, mime), size, isDir)
-            }
-        }.getOrNull()
     }
 
     private fun buildRadioServerSection(page: LinearLayout) {
-        page.addView(sectionLabel("VLASTNÉ STANICE A MÉDIÁ (DLNA SERVER)"))
+        page.addView(sectionLabel("VLASTNÉ STANICE (DLNA SERVER)"))
 
         radioServerBtn = flatBtn("📡 Server: VYP") { toggleRadioServer() }
         val addBtn = flatBtn("➕ Pridať stanicu") { showStationDialog(null) }
         radioServerBtn.textSize = 13f
         addBtn.textSize = 13f
+        val folderBtn = flatBtn("📁 Vybrať adresár M3U") { chooseM3uFolder() }
+        folderBtn.textSize = 12f
         page.addView(rowOf(listOf(radioServerBtn, addBtn)))
+        page.addView(rowOf(listOf(folderBtn)))
 
-        radioMediaDirBtn = flatBtn("📁 Adresár médií") { onMediaDirButtonClicked() }
-        radioMediaDirBtn.textSize = 12f
-        val toMediaBtn = flatBtn("↪ Prepnúť na MEDIA SRV") {
+        radioFolderStatus = TextView(this)
+        radioFolderStatus.textSize = 11f
+        radioFolderStatus.setTextColor(C_SLATE)
+        radioFolderStatus.setPadding(dp(4), dp(2), dp(4), dp(4))
+        page.addView(radioFolderStatus)
+
+        radioServerStatus = TextView(this)
+        radioServerStatus.textSize = 11f
+        radioServerStatus.setTextColor(C_SLATE)
+        radioServerStatus.setPadding(dp(4), dp(4), dp(4), dp(4))
+        page.addView(radioServerStatus)
+
+        val toMediaBtn = flatBtn("↪ Prepnúť receiver na MEDIA SERVER") {
             abandonUsbPlayback()
             send("44FN")
             sendSilent("?F")
@@ -1194,51 +1031,100 @@ class MainActivity : AppCompatActivity() {
             updateMainDisplayHeader()
         }
         toMediaBtn.textSize = 12f
-        page.addView(rowOf(listOf(radioMediaDirBtn, toMediaBtn)))
-
-        radioMediaDirText = TextView(this)
-        radioMediaDirText.textSize = 11f
-        radioMediaDirText.setTextColor(C_CYAN)
-        radioMediaDirText.setPadding(dp(4), dp(4), dp(4), dp(2))
-        page.addView(radioMediaDirText)
-
-        radioServerStatus = TextView(this)
-        radioServerStatus.textSize = 11f
-        radioServerStatus.setTextColor(C_SLATE)
-        radioServerStatus.setPadding(dp(4), dp(2), dp(4), dp(4))
-        page.addView(radioServerStatus)
+        page.addView(rowOf(listOf(toMediaBtn)))
 
         radioListLayout = LinearLayout(this)
         radioListLayout.orientation = LinearLayout.VERTICAL
         page.addView(radioListLayout)
 
+        updateRadioFolderUi()
         updateRadioServerUi()
         renderRadioStations()
+    }
+
+    private fun savedM3uTreeUri(): Uri? =
+        prefs().getString("radio_m3u_tree_uri", null)?.let { runCatching { Uri.parse(it) }.getOrNull() }
+
+    private fun updateRadioFolderUi() {
+        if (!::radioFolderStatus.isInitialized) return
+        val uri = savedM3uTreeUri()
+        radioFolderStatus.text = if (uri == null) {
+            "Adresár M3U: nevybraný (voliteľný)"
+        } else {
+            val name = runCatching {
+                val documentId = DocumentsContract.getTreeDocumentId(uri)
+                val documentUri = DocumentsContract.buildDocumentUriUsingTree(uri, documentId)
+                contentResolver.query(documentUri, arrayOf(DocumentsContract.Document.COLUMN_DISPLAY_NAME),
+                    null, null, null)?.use { c -> if (c.moveToFirst()) c.getString(0) else null }
+            }.getOrNull()
+            "Adresár M3U: ${name ?: uri.lastPathSegment ?: "vybraný"}"
+        }
+    }
+
+    private fun chooseM3uFolder() {
+        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                Intent.FLAG_GRANT_WRITE_URI_PERMISSION or
+                Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
+        }
+        startActivityForResult(intent, requestM3uFolder)
+    }
+
+    private fun handleM3uFolderResult(resultCode: Int, data: Intent?) {
+        if (resultCode != RESULT_OK) {
+            pendingRadioServerStart = false
+            return
+        }
+        val uri = data?.data ?: run { pendingRadioServerStart = false; return }
+        val flags = data.flags and (Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+        try {
+            val readFlag = flags and Intent.FLAG_GRANT_READ_URI_PERMISSION
+            if (readFlag != 0) contentResolver.takePersistableUriPermission(uri, readFlag)
+        } catch (_: Exception) {
+            // Ak poskytovateľ nepodporuje trvalé oprávnenie, po reštarte bude treba adresár vybrať znova.
+        }
+        prefs().edit().putString("radio_m3u_tree_uri", uri.toString()).apply()
+        updateRadioFolderUi()
+        updateRadioServerUi()
+        val startAfterPick = pendingRadioServerStart
+        pendingRadioServerStart = false
+        if (startAfterPick) startRadioServerNow()
+    }
+
+    private fun listM3uMediaFiles(): List<M3uMediaFile> {
+        val tree = savedM3uTreeUri() ?: return emptyList()
+        return runCatching {
+            val treeId = DocumentsContract.getTreeDocumentId(tree)
+            val children = DocumentsContract.buildChildDocumentsUriUsingTree(tree, treeId)
+            val projection = arrayOf(DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+            val result = mutableListOf<M3uMediaFile>()
+            contentResolver.query(children, projection, null, null, null)?.use { c ->
+                val idCol = c.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
+                val nameCol = c.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+                while (c.moveToNext()) {
+                    val docId = c.getString(idCol) ?: continue
+                    val name = c.getString(nameCol) ?: continue
+                    if (!name.endsWith(".m3u", true) && !name.endsWith(".m3u8", true)) continue
+                    val docUri = DocumentsContract.buildDocumentUriUsingTree(tree, docId)
+                    val key = Base64.encodeToString(docId.toByteArray(Charsets.UTF_8),
+                        Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING)
+                    result.add(M3uMediaFile(key, name, docUri))
+                }
+            }
+            result.sortedBy { it.name.lowercase() }
+        }.getOrElse { emptyList() }
     }
 
     private fun updateRadioServerUi() {
         if (!::radioServerBtn.isInitialized) return
         val srv = radioServer
-        val hasDir = mediaDirUri != null
         radioServerBtn.text = if (srv != null) "📡 Server: ZAP" else "📡 Server: VYP"
         highlightBtn(radioServerBtn, srv != null, C_GREEN)
-
-        if (::radioMediaDirBtn.isInitialized) {
-            radioMediaDirBtn.text = if (hasDir) "📁 Adresár: $mediaDirName" else "📁 Vybrať adresár médií"
-            highlightBtn(radioMediaDirBtn, hasDir, C_CYAN)
-        }
-        if (::radioMediaDirText.isInitialized) {
-            radioMediaDirText.text = if (hasDir)
-                "📁 Zapamätaný adresár médií: $mediaDirName"
-            else
-                "📁 Adresár médií: (nevybraný)"
-        }
-        radioServerStatus.text = if (srv != null) {
-            val extra = if (hasDir) " + adresár „$mediaDirName“" else ""
-            "Server beží (${srv.ip}:${srv.port})$extra. Na receiveri: vstup MEDIA SERVER → „Pioneer Remote Radio“. Apku nechaj otvorenú."
-        } else {
-            "Server je vypnutý. Zapni ho — na receiveri (MEDIA SERVER) sa zobrazia stanice aj zvolený adresár médií."
-        }
+        radioServerStatus.text = if (srv != null)
+            "Server beží (${srv.ip}:${srv.port}). Ponúka ${radioStations.size} vlastných staníc a ${listM3uMediaFiles().size} playlistov M3U. Na receiveri otvor MEDIA SERVER → Pioneer Remote Radio."
+        else
+            "Server je vypnutý. Vybraný adresár M3U zostáva zapamätaný aj po vypnutí servera."
     }
 
     private fun renderRadioStations() {
@@ -1335,28 +1221,17 @@ class MainActivity : AppCompatActivity() {
             updateRadioServerUi()
             return
         }
-        // Ak ešte nie je vybraný adresár s médiami, ponúkneme jeho výber.
-        // Ak už vybraný je, zapamätaný adresár sa použije automaticky bez pýtania.
-        if (mediaDirUri == null) {
-            AlertDialog.Builder(this)
-                .setTitle("Adresár s médiami pre DLNA server")
-                .setMessage("Chceš vybrať adresár s médiami (hudbou), ktorý sa sprístupní cez DLNA server? Aplikácia si ho zapamätá aj po vypnutí servera a nabudúce sa už pýtať nebude.")
-                .setPositiveButton("Vybrať adresár") { _, _ ->
-                    pendingStartRadioServerAfterDirPick = true
-                    startPickMediaDir()
-                }
-                .setNeutralButton("Len rádiá") { _, _ ->
-                    startRadioServerNow()
-                }
-                .setNegativeButton("Zrušiť", null)
-                .show()
-            return
+        // Pri prvom zapnutí ponúkni výber adresára. Po jeho uložení sa už
+        // pri ďalších štartoch nepýta; voľba ostáva uložená aj po vypnutí servera.
+        if (savedM3uTreeUri() == null) {
+            pendingRadioServerStart = true
+            chooseM3uFolder()
+        } else {
+            startRadioServerNow()
         }
-        startRadioServerNow()
     }
 
     private fun startRadioServerNow() {
-        if (radioServer != null) return
         val ip = wifiIp()
         if (ip == null) {
             radioServerStatus.text = "⚠️ Telefón nie je pripojený do Wi-Fi siete."
@@ -1380,8 +1255,8 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // DLNA MediaServer: SSDP + popis zariadenia + ContentDirectory + ConnectionManager.
-    // Ponúka vlastné rádiostanice (m3u + priamy stream) a zvolený lokálny adresár s médiami.
+    // Minimálny DLNA MediaServer: SSDP + popis zariadenia + ContentDirectory + ConnectionManager.
+    // Ponúka stanice dvojako: ako m3u súbor (overený spôsob) a ako priamy stream.
     private inner class RadioDlnaServer(val ip: String, uuid: String) {
         private val usn = "uuid:$uuid"
         private val pool = Executors.newCachedThreadPool()
@@ -1405,19 +1280,6 @@ class MainActivity : AppCompatActivity() {
         private fun usnFor(nt: String) = if (nt == usn) usn else "$usn::$nt"
         private fun location() = "http://$ip:$port/desc.xml"
 
-        private fun b64Enc(s: String): String =
-            Base64.encodeToString(s.toByteArray(Charsets.UTF_8), Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING)
-
-        private fun b64Dec(s: String): String? = runCatching {
-            String(Base64.decode(s, Base64.URL_SAFE or Base64.NO_WRAP), Charsets.UTF_8)
-        }.getOrNull()
-
-        private fun dlnaProtocolInfo(mime: String): String = when (mime) {
-            "audio/mpeg" -> "http-get:*:audio/mpeg:DLNA.ORG_PN=MP3;DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01500000000000000000000000000000"
-            "audio/aac" -> "http-get:*:audio/aac:DLNA.ORG_PN=AAC_ISO;DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01500000000000000000000000000000"
-            else -> "http-get:*:$mime:DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01500000000000000000000000000000"
-        }
-
         @Suppress("DEPRECATION")
         fun start() {
             val ss = ServerSocket(0)
@@ -1434,7 +1296,7 @@ class MainActivity : AppCompatActivity() {
                 recvSock = rs
                 pool.execute { ssdpListen(rs) }
             } catch (_: Exception) {
-                recvSock = null
+                recvSock = null   // bez odpovedí na M-SEARCH; stále posielame NOTIFY
             }
             try {
                 val ms = MulticastSocket()
@@ -1560,7 +1422,7 @@ class MainActivity : AppCompatActivity() {
                         }
                         body = String(bytes, 0, off, Charsets.UTF_8)
                     }
-                    route(s, method, path, headers, body, out)
+                    route(method, path, headers, body, out)
                 } catch (_: Exception) {}
             }
         }
@@ -1571,7 +1433,6 @@ class MainActivity : AppCompatActivity() {
             val status = when (code) {
                 200 -> "OK"
                 404 -> "Not Found"
-                416 -> "Range Not Satisfiable"
                 500 -> "Internal Server Error"
                 else -> "OK"
             }
@@ -1588,116 +1449,7 @@ class MainActivity : AppCompatActivity() {
             out.flush()
         }
 
-        private fun skipFully(inp: InputStream, bytesToSkip: Long) {
-            var rem = bytesToSkip
-            val buf = ByteArray(8192)
-            while (rem > 0) {
-                val skipped = inp.skip(rem)
-                if (skipped > 0) {
-                    rem -= skipped
-                } else {
-                    val r = inp.read(buf, 0, minOf(buf.size.toLong(), rem).toInt())
-                    if (r < 0) break
-                    rem -= r
-                }
-            }
-        }
-
-        private fun streamMediaFile(sock: Socket, method: String, path: String, headers: Map<String, String>, out: OutputStream) {
-            val treeUri = mediaDirUri
-            if (treeUri == null) {
-                reply(out, method, 404, "text/plain", "No media directory")
-                return
-            }
-            val token = path.removePrefix("/media/").substringBeforeLast('.')
-            val docId = b64Dec(token)
-            if (docId == null) {
-                reply(out, method, 404, "text/plain", "Invalid id")
-                return
-            }
-            val meta = queryMediaDoc(treeUri, docId)
-            if (meta == null || meta.isDir) {
-                reply(out, method, 404, "text/plain", "File not found")
-                return
-            }
-            val docUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, docId)
-            val fileSize = if (meta.size > 0) meta.size else runCatching {
-                contentResolver.openAssetFileDescriptor(docUri, "r")?.use { it.length } ?: -1L
-            }.getOrDefault(-1L)
-
-            var start = 0L
-            var end = if (fileSize > 0) fileSize - 1 else -1L
-            var partial = false
-
-            val rangeHdr = headers["range"]
-            if (fileSize > 0 && rangeHdr != null && rangeHdr.startsWith("bytes=", ignoreCase = true)) {
-                val spec = rangeHdr.substring(6).substringBefore(',').trim()
-                val dash = spec.indexOf('-')
-                if (dash >= 0) {
-                    val sStr = spec.substring(0, dash).trim()
-                    val eStr = spec.substring(dash + 1).trim()
-                    val parsedStart = sStr.toLongOrNull()
-                    val parsedEnd = eStr.toLongOrNull()
-                    if (parsedStart != null) {
-                        start = parsedStart
-                        end = if (parsedEnd != null) parsedEnd.coerceAtMost(fileSize - 1) else fileSize - 1
-                        if (start >= fileSize || start > end) {
-                            reply(out, method, 416, "text/plain", "",
-                                mapOf("Content-Range" to "bytes */$fileSize"))
-                            return
-                        }
-                        partial = true
-                    }
-                }
-            }
-
-            val sb = StringBuilder()
-            if (partial) {
-                val contentLen = end - start + 1
-                sb.append("HTTP/1.1 206 Partial Content\r\n")
-                sb.append("Content-Range: bytes $start-$end/$fileSize\r\n")
-                sb.append("Content-Length: $contentLen\r\n")
-                sb.append("Accept-Ranges: bytes\r\n")
-            } else {
-                sb.append("HTTP/1.1 200 OK\r\n")
-                if (fileSize > 0) {
-                    sb.append("Content-Length: $fileSize\r\n")
-                    sb.append("Accept-Ranges: bytes\r\n")
-                }
-            }
-            sb.append("Content-Type: ${meta.mime}\r\n")
-            sb.append("transferMode.dlna.org: Streaming\r\n")
-            sb.append("SERVER: $serverHeader\r\n")
-            sb.append("Connection: close\r\n\r\n")
-            out.write(sb.toString().toByteArray(Charsets.UTF_8))
-            out.flush()
-
-            if (method == "HEAD") return
-
-            sock.soTimeout = 0
-            contentResolver.openInputStream(docUri)?.use { inp ->
-                if (partial && start > 0) skipFully(inp, start)
-                val buf = ByteArray(16384)
-                if (partial) {
-                    var rem = end - start + 1
-                    while (running && rem > 0) {
-                        val r = inp.read(buf, 0, minOf(buf.size.toLong(), rem).toInt())
-                        if (r < 0) break
-                        out.write(buf, 0, r)
-                        rem -= r
-                    }
-                } else {
-                    while (running) {
-                        val r = inp.read(buf)
-                        if (r < 0) break
-                        out.write(buf, 0, r)
-                    }
-                }
-                out.flush()
-            }
-        }
-
-        private fun route(sock: Socket, method: String, path: String, headers: Map<String, String>, body: String, out: OutputStream) {
+        private fun route(method: String, path: String, headers: Map<String, String>, body: String, out: OutputStream) {
             when {
                 path == "/desc.xml" -> reply(out, method, 200, xmlType, descXml())
                 path == "/cds.xml" -> reply(out, method, 200, xmlType, cdsScpd())
@@ -1721,8 +1473,29 @@ class MainActivity : AppCompatActivity() {
                         reply(out, method, 200, "audio/x-mpegurl", "#EXTM3U\r\n#EXTINF:-1,${st.name}\r\n${st.url}\r\n")
                     }
                 }
-                path.startsWith("/media/") -> streamMediaFile(sock, method, path, headers, out)
+                path.startsWith("/m3u/") -> serveM3uFile(method, path.removePrefix("/m3u/"), out)
                 else -> reply(out, method, 404, "text/plain", "Not found")
+            }
+        }
+
+        private fun serveM3uFile(method: String, id: String, out: OutputStream) {
+            val file = listM3uMediaFiles().firstOrNull { it.id == id }
+            if (file == null) {
+                reply(out, method, 404, "text/plain", "Playlist not found")
+                return
+            }
+            try {
+                val bytes = contentResolver.openInputStream(file.uri)?.use { it.readBytes() }
+                    ?: throw IllegalStateException("Súbor sa nedá otvoriť")
+                val header = "HTTP/1.1 200 OK\r\n" +
+                    "CONTENT-TYPE: audio/x-mpegurl; charset=utf-8\r\n" +
+                    "CONTENT-LENGTH: ${bytes.size}\r\n" +
+                    "SERVER: $serverHeader\r\nConnection: close\r\n\r\n"
+                out.write(header.toByteArray(Charsets.US_ASCII))
+                if (method != "HEAD") out.write(bytes)
+                out.flush()
+            } catch (_: Exception) {
+                reply(out, method, 404, "text/plain", "Playlist unavailable")
             }
         }
 
@@ -1735,7 +1508,7 @@ class MainActivity : AppCompatActivity() {
             "<dlna:X_DLNADOC>DMS-1.50</dlna:X_DLNADOC>" +
             "<deviceType>urn:schemas-upnp-org:device:MediaServer:1</deviceType>" +
             "<friendlyName>Pioneer Remote Radio</friendlyName>" +
-            "<manufacturer>Pioneer Remote</manufacturer><modelName>Radio &amp; Media Server</modelName>" +
+            "<manufacturer>Pioneer Remote</manufacturer><modelName>Radio Server</modelName>" +
             "<UDN>$usn</UDN><serviceList>" +
             "<service><serviceType>urn:schemas-upnp-org:service:ContentDirectory:1</serviceType>" +
             "<serviceId>urn:upnp-org:serviceId:ContentDirectory</serviceId><SCPDURL>/cds.xml</SCPDURL>" +
@@ -1845,122 +1618,60 @@ class MainActivity : AppCompatActivity() {
                 "xmlns:dc=\"http://purl.org/dc/elements/1.1/\" " +
                 "xmlns:upnp=\"urn:schemas-upnp-org:metadata-1-0/upnp/\">$inner</DIDL-Lite>"
 
-        private fun containerXml(id: String, parentId: String, title: String, childCount: Int? = null): String {
-            val cntAttr = if (childCount != null) " childCount=\"$childCount\"" else ""
-            return "<container id=\"$id\" parentID=\"$parentId\" restricted=\"1\"$cntAttr>" +
-                "<dc:title>${xmlEsc(title)}</dc:title>" +
-                "<upnp:class>object.container.storageFolder</upnp:class></container>"
-        }
+        private fun itemXml(id: String, title: String, cls: String, proto: String, url: String): String =
+            "<item id=\"$id\" parentID=\"0\" restricted=\"1\"><dc:title>${xmlEsc(title)}</dc:title>" +
+                "<upnp:class>$cls</upnp:class><res protocolInfo=\"$proto\">${xmlEsc(url)}</res></item>"
 
-        private fun itemXml(id: String, parentId: String, title: String, cls: String, proto: String, url: String, size: Long = -1L): String {
-            val sizeAttr = if (size > 0) " size=\"$size\"" else ""
-            return "<item id=\"$id\" parentID=\"$parentId\" restricted=\"1\"><dc:title>${xmlEsc(title)}</dc:title>" +
-                "<upnp:class>$cls</upnp:class><res protocolInfo=\"$proto\"$sizeAttr>${xmlEsc(url)}</res></item>"
-        }
-
-        private fun radioItems(parentId: String): List<Pair<String, String>> {
+        // Každá stanica sa ponúka dvakrát: ako m3u súbor a ako priamy stream
+        private fun allItems(): List<Pair<String, String>> {
             val list = mutableListOf<Pair<String, String>>()
             radioStations.forEach { st ->
                 val mime = if (st.url.lowercase().contains("aac")) "audio/aac" else "audio/mpeg"
-                list.add("m${st.id}" to itemXml("m${st.id}", parentId, st.name, "object.item.audioItem",
+                list.add("m${st.id}" to itemXml("m${st.id}", st.name, "object.item.audioItem",
                     "http-get:*:audio/x-mpegurl:*", "http://$ip:$port/radio/${st.id}.m3u"))
-                list.add("d${st.id}" to itemXml("d${st.id}", parentId, "${st.name} (priamy stream)",
+                list.add("d${st.id}" to itemXml("d${st.id}", "${st.name} (priamy stream)",
                     "object.item.audioItem.audioBroadcast", "http-get:*:$mime:*", st.url))
+            }
+            listM3uMediaFiles().forEach { file ->
+                val objectId = "f${file.id}"
+                list.add(objectId to itemXml(objectId, file.name, "object.item.audioItem",
+                    "http-get:*:audio/x-mpegurl:*", "http://$ip:$port/m3u/${file.id}"))
             }
             return list
         }
 
-        private fun mediaEntryXml(e: LocalDocEntry, parentId: String): Pair<String, String> {
-            val token = b64Enc(e.docId)
-            return if (e.isDir) {
-                val oid = "dir_$token"
-                oid to containerXml(oid, parentId, e.name)
-            } else {
-                val oid = "file_$token"
-                val ext = e.name.substringAfterLast('.', "mp3").lowercase().filter { it.isLetterOrDigit() }.ifEmpty { "mp3" }
-                val url = "http://$ip:$port/media/$token.$ext"
-                oid to itemXml(oid, parentId, e.name, "object.item.audioItem.musicTrack", dlnaProtocolInfo(e.mime), url, e.size)
-            }
-        }
-
-        private fun mediaChildren(treeUri: Uri, parentDocId: String, parentObjId: String): List<Pair<String, String>> =
-            listMediaDirChildren(treeUri, parentDocId).map { mediaEntryXml(it, parentObjId) }
-
         private fun soapCds(out: OutputStream, headers: Map<String, String>, body: String) {
             val action = soapActionOf(headers)
-            val upd = dlnaUpdateId
             when (action) {
                 "Browse" -> {
                     val objectId = tag(body, "ObjectID")
                     val flag = tag(body, "BrowseFlag")
                     val start = tag(body, "StartingIndex").toIntOrNull() ?: 0
                     val req = tag(body, "RequestedCount").toIntOrNull() ?: 0
-                    val treeUri = mediaDirUri
-
+                    val items = allItems()
                     if (flag == "BrowseMetadata") {
-                        val frag: String? = when {
-                            objectId == "0" -> {
-                                val cnt = if (treeUri != null) 2 else radioStations.size * 2
-                                containerXml("0", "-1", "Pioneer Remote", cnt)
-                            }
-                            objectId == "radios" -> containerXml("radios", "0", "Rádiá", radioStations.size * 2)
-                            objectId == "media_root" && treeUri != null ->
-                                containerXml("media_root", "0", "Médiá: $mediaDirName")
-                            objectId.startsWith("dir_") && treeUri != null -> {
-                                val docId = b64Dec(objectId.removePrefix("dir_"))
-                                val meta = if (docId != null) queryMediaDoc(treeUri, docId) else null
-                                if (meta != null && meta.isDir) containerXml(objectId, "media_root", meta.name) else null
-                            }
-                            objectId.startsWith("file_") && treeUri != null -> {
-                                val docId = b64Dec(objectId.removePrefix("file_"))
-                                val meta = if (docId != null) queryMediaDoc(treeUri, docId) else null
-                                if (meta != null && !meta.isDir) mediaEntryXml(meta, "media_root").second else null
-                            }
-                            else -> radioItems(if (treeUri != null) "radios" else "0")
-                                .firstOrNull { it.first == objectId }?.second
-                        }
+                        val frag = if (objectId == "0")
+                            "<container id=\"0\" parentID=\"-1\" restricted=\"1\" childCount=\"${items.size}\">" +
+                                "<dc:title>Radia</dc:title><upnp:class>object.container</upnp:class></container>"
+                        else items.firstOrNull { it.first == objectId }?.second
                         if (frag == null) {
                             fault(out, 701, "No such object")
                         } else {
                             reply(out, "POST", 200, xmlType, envelope("ContentDirectory", action,
                                 "<Result>${xmlEsc(didl(frag))}</Result><NumberReturned>1</NumberReturned>" +
-                                    "<TotalMatches>1</TotalMatches><UpdateID>$upd</UpdateID>"))
+                                    "<TotalMatches>1</TotalMatches><UpdateID>1</UpdateID>"))
                         }
+                    } else if (objectId != "0") {
+                        fault(out, 701, "No such object")
                     } else {
-                        val children: List<Pair<String, String>>? = when {
-                            objectId == "0" -> {
-                                if (treeUri != null) {
-                                    listOf(
-                                        "radios" to containerXml("radios", "0", "Rádiá", radioStations.size * 2),
-                                        "media_root" to containerXml("media_root", "0", "Médiá: $mediaDirName")
-                                    )
-                                } else {
-                                    radioItems("0")
-                                }
-                            }
-                            objectId == "radios" -> radioItems("radios")
-                            objectId == "media_root" && treeUri != null -> {
-                                val rootDocId = DocumentsContract.getTreeDocumentId(treeUri)
-                                mediaChildren(treeUri, rootDocId, "media_root")
-                            }
-                            objectId.startsWith("dir_") && treeUri != null -> {
-                                val docId = b64Dec(objectId.removePrefix("dir_"))
-                                if (docId != null) mediaChildren(treeUri, docId, objectId) else null
-                            }
-                            else -> null
-                        }
-                        if (children == null) {
-                            fault(out, 701, "No such object")
-                        } else {
-                            val total = children.size
-                            val from = start.coerceIn(0, total)
-                            val to = if (req <= 0) total else (from + req).coerceAtMost(total)
-                            val slice = children.subList(from, to)
-                            reply(out, "POST", 200, xmlType, envelope("ContentDirectory", action,
-                                "<Result>${xmlEsc(didl(slice.joinToString("") { it.second }))}</Result>" +
-                                    "<NumberReturned>${slice.size}</NumberReturned><TotalMatches>$total</TotalMatches>" +
-                                    "<UpdateID>$upd</UpdateID>"))
-                        }
+                        val total = items.size
+                        val from = start.coerceIn(0, total)
+                        val to = if (req <= 0) total else (from + req).coerceAtMost(total)
+                        val slice = items.subList(from, to)
+                        reply(out, "POST", 200, xmlType, envelope("ContentDirectory", action,
+                            "<Result>${xmlEsc(didl(slice.joinToString("") { it.second }))}</Result>" +
+                                "<NumberReturned>${slice.size}</NumberReturned><TotalMatches>$total</TotalMatches>" +
+                                "<UpdateID>1</UpdateID>"))
                     }
                 }
                 "GetSearchCapabilities" -> reply(out, "POST", 200, xmlType,
@@ -1968,7 +1679,7 @@ class MainActivity : AppCompatActivity() {
                 "GetSortCapabilities" -> reply(out, "POST", 200, xmlType,
                     envelope("ContentDirectory", action, "<SortCaps></SortCaps>"))
                 "GetSystemUpdateID" -> reply(out, "POST", 200, xmlType,
-                    envelope("ContentDirectory", action, "<Id>$upd</Id>"))
+                    envelope("ContentDirectory", action, "<Id>1</Id>"))
                 else -> fault(out, 401, "Invalid Action")
             }
         }
@@ -1976,7 +1687,7 @@ class MainActivity : AppCompatActivity() {
         private fun soapCm(out: OutputStream, headers: Map<String, String>) {
             val action = soapActionOf(headers)
             val inner = when (action) {
-                "GetProtocolInfo" -> "<Source>http-get:*:audio/x-mpegurl:*,http-get:*:audio/mpeg:*,http-get:*:audio/flac:*,http-get:*:audio/wav:*,http-get:*:audio/mp4:*,http-get:*:audio/aac:*,http-get:*:audio/x-ms-wma:*,http-get:*:audio/ogg:*</Source><Sink></Sink>"
+                "GetProtocolInfo" -> "<Source>http-get:*:audio/x-mpegurl:*,http-get:*:audio/mpeg:*,http-get:*:audio/aac:*</Source><Sink></Sink>"
                 "GetCurrentConnectionIDs" -> "<ConnectionIDs>0</ConnectionIDs>"
                 "GetCurrentConnectionInfo" -> "<RcsID>-1</RcsID><AVTransportID>-1</AVTransportID>" +
                     "<ProtocolInfo></ProtocolInfo><PeerConnectionManager></PeerConnectionManager>" +
@@ -2109,6 +1820,8 @@ class MainActivity : AppCompatActivity() {
         root.setBackgroundColor(C_BG)
         root.setPadding(pad, dp(8), pad, 0)
 
+        // Horná časť (hlavička, IP, displej, karty, hlasitosť) je v jednom paneli.
+        // Na výšku je nad obsahom kariet, na šírku vľavo od neho.
         val topPanel = LinearLayout(this)
         topPanel.orientation = LinearLayout.VERTICAL
 
@@ -2180,11 +1893,13 @@ class MainActivity : AppCompatActivity() {
             ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
         topPanel.addView(top)
 
+        // Kompaktný displej: hore väčším písmom čo hrá / vstup, pod tým riadky s ďalšími údajmi
         val card = LinearLayout(this)
         card.orientation = LinearLayout.VERTICAL
         card.setPadding(dp(10), dp(6), dp(10), dp(6))
         card.background = roundedBg(C_CARD, 14, C_CYAN_D)
 
+        // 1. riadok: vstup / čo práve hrá (väčšie písmo)
         mainStationBig = TextView(this)
         mainStationBig.text = "📻  —"
         mainStationBig.textSize = 18f
@@ -2194,6 +1909,7 @@ class MainActivity : AppCompatActivity() {
         mainStationBig.maxLines = 2
         mainStationBig.ellipsize = TextUtils.TruncateAt.END
 
+        // 2. riadok: relácia / skladba · bitrate
         mainShowBitrate = TextView(this)
         mainShowBitrate.text = "Relácia / Skladba: —   ·   Bitrate: —"
         mainShowBitrate.textSize = 11f
@@ -2203,6 +1919,7 @@ class MainActivity : AppCompatActivity() {
         mainShowBitrate.ellipsize = TextUtils.TruncateAt.END
         mainShowBitrate.setPadding(0, dp(1), 0, dp(1))
 
+        // 3. riadok: vstup · režim
         infoLine = TextView(this)
         infoLine.text = "Vstup: —   ·   Režim: —"
         infoLine.textSize = 11f
@@ -2211,6 +1928,7 @@ class MainActivity : AppCompatActivity() {
         infoLine.maxLines = 1
         infoLine.ellipsize = TextUtils.TruncateAt.END
 
+        // 4. riadok: pripojenie (vľavo) a hlásenia (vpravo)
         val connRow = LinearLayout(this)
         connRow.orientation = LinearLayout.HORIZONTAL
         connRow.gravity = Gravity.CENTER_VERTICAL
@@ -2235,6 +1953,7 @@ class MainActivity : AppCompatActivity() {
         connRow.addView(connLine, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         connRow.addView(statusText, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
 
+        // 5. riadok: hlasitosť
         val volBox = LinearLayout(this)
         volBox.orientation = LinearLayout.HORIZONTAL
         volBox.gravity = Gravity.CENTER_VERTICAL
@@ -2271,6 +1990,7 @@ class MainActivity : AppCompatActivity() {
         cardLp.topMargin = dp(4)
         topPanel.addView(card, cardLp)
 
+        // Úzke informačné štítky kariet (prepínanie je swipeom; klik funguje tiež)
         val tabDefs = listOf("🎚 OVLÁDANIE", "📻 RÁDIO", "💽 MÉDIÁ")
         val tabBtns = tabDefs.map { t -> pillBtn(t, C_BTN, C_SLATE) { } }
         val tabs = LinearLayout(this)
@@ -2287,9 +2007,11 @@ class MainActivity : AppCompatActivity() {
         tabsLp.topMargin = dp(4)
         topPanel.addView(tabs, tabsLp)
 
+        // Globálne ovládanie hlasitosti v jednom riadku pod prepínačmi kariet
         muteBtn = flatBtn("🔇 MUTE") { toggleMute() }
         val volMinus = flatBtn("VOL −") { send("VD"); sendSilent("?V") }
         val volPlus = flatBtn("VOL +") { send("VU"); sendSilent("?V") }
+        // Veľké tlačidlá (rovnaká výška a písmo ako PLAY / STOP), aby sa dobre ovládali
         listOf(muteBtn, volMinus, volPlus).forEach {
             it.textSize = 14f
             it.setPadding(dp(8), dp(12), dp(8), dp(12))
@@ -2332,6 +2054,7 @@ class MainActivity : AppCompatActivity() {
         }
         styleTab(tabBtns[0], true)
 
+        // Zloženie: panel s displejom (v ScrollView pre malé obrazovky) + obsah kariet (ViewPager2)
         val scroll = ScrollView(this)
         scroll.isVerticalScrollBarEnabled = false
         scroll.addView(topPanel, ViewGroup.LayoutParams(
@@ -2345,6 +2068,8 @@ class MainActivity : AppCompatActivity() {
         setContentView(root)
     }
 
+    // Na výšku: displej hore, obsah kariet dole. Na šírku: displej a hlasitosť vľavo,
+    // obsah kariet (swipe) vpravo, aby sa dalo ovládať palcami z oboch strán.
     private fun applyOrientationLayout() {
         if (!::rootLayout.isInitialized) return
         val landscape = resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE
@@ -2366,6 +2091,8 @@ class MainActivity : AppCompatActivity() {
         rootLayout.requestLayout()
     }
 
+    // Funguje, ak je v AndroidManifest.xml pri aktivite nastavené android:configChanges (stav sa zachová).
+    // Bez toho sa aktivita pri otočení vytvorí znova a rozloženie sa nastaví v buildUI().
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
         applyOrientationLayout()
@@ -2661,13 +2388,13 @@ class MainActivity : AppCompatActivity() {
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
         switchLp.bottomMargin = dp(6)
         page.addView(switchRow, switchLp)
-
         // =================================================================
         // KONTAJNER 1: 🔌 USB KĽÚČ
         // =================================================================
         usbContainer = LinearLayout(this)
         usbContainer.orientation = LinearLayout.VERTICAL
 
+        // Dve tlačidlá s rozbaľovacou ponukou (šetria miesto na obrazovke)
         val playlistMenuBtn = flatBtn("📂 Playlist ▾") { }
         val dbMenuBtn = flatBtn("🗄 Databáza ▾") { }
         playlistMenuBtn.setOnClickListener { showPlaylistMenu(it) }
@@ -2678,6 +2405,7 @@ class MainActivity : AppCompatActivity() {
         dbMenuBtn.background = roundedBg(C_CARD2, 12, C_ORANGE)
         usbContainer.addView(rowOf(listOf(playlistMenuBtn, dbMenuBtn)))
 
+        // Tlačidlá ▶ PLAY a ⏹ STOP (umiestnené v pevnej dolnej lište, pozri nižšie)
         usbPlayBtn = flatBtn("▶ PLAY") { onMediaPlayPressed() }
         usbPlayBtn.background = roundedBg(C_GREEN, 12, C_GREEN)
         usbPlayBtn.setTextColor(C_ON_ACCENT)
@@ -2692,6 +2420,7 @@ class MainActivity : AppCompatActivity() {
         usbStopBtn.textSize = 14f
         usbStopBtn.setPadding(dp(8), dp(12), dp(8), dp(12))
 
+        // Riadok nástrojov: 🔄 Načítať USB | ✖ Zrušiť označenie
         usbScanAllBtn = flatBtn("🔄 Načítať USB") {
             onUsbScanButton()
         }
@@ -2788,6 +2517,8 @@ class MainActivity : AppCompatActivity() {
 
         page.addView(hint("← swipe na rádio →"))
 
+        // Pevná horná lišta (nescrolluje sa so zoznamom): ▶ PLAY a ⏹ STOP pre USB aj DLNA.
+        // Pod ňou je posúvaná časť: prepínač USB KĽÚČ / DLNA SERVER a ďalšie tlačidlá.
         usbTransportBar = rowOf(listOf(usbPlayBtn, usbStopBtn))
         val barLp = LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
@@ -2803,6 +2534,7 @@ class MainActivity : AppCompatActivity() {
         return mediaRoot
     }
 
+    // PLAY / STOP pracujú podľa zvoleného režimu (USB kľúč alebo DLNA server)
     private fun onMediaPlayPressed() {
         if (isUsbMediaMode) onUsbPlayPressed() else onDlnaPlayPressed()
     }
@@ -2964,6 +2696,8 @@ class MainActivity : AppCompatActivity() {
         return ok
     }
 
+    // Vyberie položku č. absIndex v aktuálnom zozname receivera.
+    // Podľa logu je číslo pri GHP absolútny index položky (nie riadok okna).
     private suspend fun usbSelectItem(absIndex: Int, expectedTitle: String? = null): Boolean {
         val folderBefore = nwScreenName
 
@@ -3005,6 +2739,7 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
+        // Záloha (aj pre adresáre nad 99 položiek): kurzor na položku a potom Enter
         sendSilent(String.format("%05dGGP", absIndex))
         delay(220)
         for (enterCmd in listOf("17IP", "30NW")) {
@@ -3404,8 +3139,10 @@ class MainActivity : AppCompatActivity() {
             "📂 [$activePlaylistName] '${node.title}' — $n položiek."
     }
 
+    // Viacnásobný výber iba pre adresáre; súbor môže byť označený vždy len jeden
     private fun toggleUsbSelection(node: UsbNode) {
         if (node.isFolder) {
+            // Odstránime z výberu prípadné označené súbory, aby zostali len adresáre
             usbSelectedPathKeys.removeAll { key -> findUsbNodeByKey(key)?.isFolder == false }
             if (usbSelectedPathKeys.contains(node.pathKey)) {
                 usbSelectedPathKeys.remove(node.pathKey)
@@ -3413,6 +3150,7 @@ class MainActivity : AppCompatActivity() {
                 usbSelectedPathKeys.add(node.pathKey)
             }
         } else {
+            // Súbor: povolený je vždy len 1 označený súbor
             val wasAlreadySelected = usbSelectedPathKeys.size == 1 && usbSelectedPathKeys.contains(node.pathKey)
             usbSelectedPathKeys.clear()
             if (!wasAlreadySelected) {
@@ -3430,6 +3168,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    // Označené položky v poradí, v akom ich používateľ označoval
     private fun getSelectedNodesInOrder(): List<UsbNode> {
         return usbSelectedPathKeys.toList().mapNotNull { findUsbNodeByKey(it) }
     }
@@ -3450,6 +3189,8 @@ class MainActivity : AppCompatActivity() {
         return null
     }
 
+    // Rozbalí označenú položku na jednotky prehrávania: súbor = 1 jednotka;
+    // adresár so skladbami = 1 jednotka; podadresáre sa pridajú v poradí za ním.
     private fun collectPlayUnits(node: UsbNode, out: MutableList<UsbNode>, depth: Int = 0) {
         if (!node.isFolder) {
             out.add(node)
@@ -3482,6 +3223,7 @@ class MainActivity : AppCompatActivity() {
         startUsbSelection(queue[0])
     }
 
+    // Prechod na ďalšiu položku fronty. Volá sa aj z IO vlákna, preto všetko UI ide cez ui { }.
     private fun playNextInUsbQueue() {
         usbPlayQueueIndex++
         val idx = usbPlayQueueIndex
@@ -3501,6 +3243,7 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    // Musí sa volať z UI vlákna (používa ui { } pri volaní z IO).
     private fun startUsbSelection(sel: UsbNode) {
         val target = firstPlayableFile(sel)
         if (target == null) {
@@ -3554,6 +3297,10 @@ class MainActivity : AppCompatActivity() {
             sendSilent("?GAH")
             sendSilent("?FL")
 
+            // Sledovanie konca adresára pre prechod na ďalšiu položku fronty:
+            //  a) obrazovka prehrávania sa vrátila na zoznam, alebo
+            //  b) čas prehrávania je zamrznutý (iba ak je vo fronte ďalší adresár a čas sa
+            //     predtým aspoň 2x zmenil, teda údaj je spoľahlivý)
             val hasNext = usbPlayQueueIndex + 1 < usbPlayQueue.size
             var wasPlayingScreen = false
             var lastTime = playTimeText
@@ -3565,6 +3312,7 @@ class MainActivity : AppCompatActivity() {
                 sendSilent("?GAP")
                 delay(400)
 
+                // Receiver je na inom vstupe (rádio, DLNA, diaľkový ovládač) -> prestať sledovať USB
                 val inp = activeInput
                 if (inp != null && inp != "IPOD/USB" && inp != "17FN") {
                     usbState = UsbState.STOPPED
@@ -3597,6 +3345,9 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    // Používateľ opustil USB (iný vstup, rádio, DLNA, vypnutie): zastaví sledovanie USB fronty a sken.
+    // Bez toho by staré sledovanie fronty po zmene obrazovky receivera zastavilo rádio
+    // a prepínalo vstup späť na USB (príkazy 20NW a 06FN/17FN).
     private fun abandonUsbPlayback() {
         if (usbState == UsbState.STOPPED && !usbBusy && !usbScanning) return
         usbState = UsbState.STOPPED
@@ -3822,4 +3573,862 @@ class MainActivity : AppCompatActivity() {
     private fun probe(ip: String): Boolean {
         return try {
             Socket().use { s ->
-                s.soTimeout =
+                s.soTimeout = 1000
+                s.connect(InetSocketAddress(ip, port), 450)
+                val w = OutputStreamWriter(s.getOutputStream(), Charsets.US_ASCII)
+                w.write("?P\r\n?V\r\n")
+                w.flush()
+                val r = BufferedReader(InputStreamReader(s.getInputStream(), Charsets.US_ASCII))
+                val line = r.readLine() ?: return false
+                line.startsWith("VOL") || line.startsWith("PWR") || line.startsWith("FN") ||
+                    line.startsWith("MUT") || line.startsWith("LM") || line.startsWith("SR") ||
+                    line.startsWith("FL")
+            }
+        } catch (_: Exception) { false }
+    }
+
+    private fun discoverReceivers(autoConnectFirst: Boolean) {
+        ui { statusText.text = "🔍 Hľadám Pioneer receiver v Wi-Fi sieti (port $port)…" }
+        scope.launch(Dispatchers.IO) {
+            val myIp = phoneIp()
+            if (myIp == null) {
+                ui {
+                    connLine.text = "○ Odpojené (Wi-Fi nedostupná)"
+                    connLine.setTextColor(C_RED)
+                    statusText.text = "Nepodarilo sa zistiť IP telefónu — skontroluj pripojenie na Wi-Fi."
+                }
+                return@launch
+            }
+            val prefix = myIp.substringBeforeLast(".")
+            val found = Collections.synchronizedList(mutableListOf<String>())
+            withTimeoutOrNull(18000) {
+                coroutineScope {
+                    (1..254).forEach { i ->
+                        launch {
+                            val ip = "$prefix.$i"
+                            if (probe(ip)) found.add(ip)
+                        }
+                    }
+                }
+            }
+            val sorted = found.toList().sorted()
+            ui {
+                if (sorted.isEmpty()) {
+                    connLine.text = "○ Odpojené ($host)"
+                    connLine.setTextColor(C_RED)
+                    statusText.text = "V sieti $prefix.0/24 sa nenašiel receiver. Skontroluj napájanie / Network Standby."
+                } else if (autoConnectFirst || sorted.size == 1) {
+                    val chosenIp = sorted.first()
+                    saveHostIp(chosenIp)
+                    statusText.text = "✓ Nájdený receiver na $chosenIp — pripájam…"
+                    connect(silentFail = false)
+                } else {
+                    statusText.text = ""
+                    pickReceiver(sorted)
+                }
+            }
+        }
+    }
+
+    private fun pickReceiver(found: List<String>) {
+        if (found.isEmpty()) return
+        AlertDialog.Builder(this)
+            .setTitle("Nájdené prijímače")
+            .setItems(found.toTypedArray()) { _, i ->
+                saveHostIp(found[i])
+                avtControlUrl = null
+                connect(silentFail = false)
+            }
+            .setNegativeButton("Zrušiť", null)
+            .show()
+    }
+
+    // =====================================================================
+    // DLNA SERVERY
+    // =====================================================================
+
+    private fun scanMediaServers() {
+        ui { mediaStatusText.text = "Hľadám DLNA servery…" }
+        scope.launch(Dispatchers.IO) {
+            val found = ssdpFindAll("urn:schemas-upnp-org:device:MediaServer:1")
+            if (found.isEmpty()) {
+                ui { mediaStatusText.text = "Nenašiel som žiadny DLNA server v sieti." }
+                return@launch
+            }
+            val names = found.map { loc ->
+                val xml = httpGet(loc)
+                Triple(
+                    loc,
+                    Regex("(?is)<friendlyName>(.*?)</friendlyName>")
+                        .find(xml ?: "")?.groupValues?.get(1) ?: loc,
+                    xml)
+            }
+            ui {
+                AlertDialog.Builder(this@MainActivity)
+                    .setTitle("Vyber DLNA server")
+                    .setItems(names.map { it.second }.toTypedArray()) { _, i ->
+                        mediaServerDesc = names[i].first
+                        mediaServerName = names[i].second
+                        prefs().edit()
+                            .putString("dlnaServer", mediaServerDesc)
+                            .putString("dlnaName", mediaServerName)
+                            .apply()
+                        initMediaServer(mediaServerDesc!!)
+                    }
+                    .setNegativeButton("Zrušiť", null)
+                    .show()
+            }
+        }
+    }
+
+    private fun initMediaServer(descUrl: String) {
+        scope.launch(Dispatchers.IO) {
+            val control = readServiceControlUrl(descUrl,
+                "urn:schemas-upnp-org:service:ContentDirectory")
+            if (control == null) {
+                ui { mediaStatusText.text = "Server neponúka ContentDirectory." }
+                return@launch
+            }
+            cdsControlUrl = control
+            ui {
+                mediaServerText.text = "Server: $mediaServerName"
+                dlnaSelectedContainers.clear()
+                dlnaSelectedFile = null
+            }
+            browseStack.clear()
+            browseFolder("0", "Knižnica")
+        }
+    }
+
+    private fun browseBack() {
+        if (browseStack.size > 1) {
+            browseStack.removeAt(browseStack.size - 1)
+            val parent = browseStack[browseStack.size - 1]
+            browseFolder(parent.first, parent.second, pushStack = false)
+        }
+    }
+
+    // Zablokujúce volanie (iba z IO vlákna): vráti priamych potomkov objektu
+    private fun browseChildren(control: String, objectId: String): List<MediaEntry> {
+        val body = "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n" +
+            "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" " +
+            "s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">" +
+            "<s:Body><u:Browse xmlns:u=\"urn:schemas-upnp-org:service:ContentDirectory:1\">" +
+            "<ObjectID>" + objectId + "</ObjectID>" +
+            "<BrowseFlag>BrowseDirectChildren</BrowseFlag>" +
+            "<Filter>*</Filter><StartingIndex>0</StartingIndex>" +
+            "<RequestedCount>0</RequestedCount><SortCriteria></SortCriteria>" +
+            "</u:Browse></s:Body></s:Envelope>"
+        val response = soapRequest(control, "Browse",
+            "urn:schemas-upnp-org:service:ContentDirectory:1#Browse", body) ?: ""
+        val result = Regex("(?is)<Result>(.*?)</Result>")
+            .find(response)?.groupValues?.get(1) ?: ""
+        return parseDidl(result)
+    }
+
+    private fun browseFolder(objectId: String, title: String, pushStack: Boolean = true) {
+        val control = cdsControlUrl ?: return
+        if (pushStack) browseStack.add(objectId to title)
+        scope.launch(Dispatchers.IO) {
+            val entries = browseChildren(control, objectId)
+            currentListing = entries
+            ui {
+                mediaPathText.text = "📚 " + browseStack.joinToString(" / ") { it.second }
+                renderMediaList(entries)
+            }
+        }
+    }
+
+    private fun parseDidl(xml: String): List<MediaEntry> {
+        val decoded = xml
+            .replace("&lt;", "<").replace("&gt;", ">")
+            .replace("&quot;", "\"").replace("&amp;", "&")
+        val containers = Regex("(?is)<container[^>]*?id=\"([^\"]+)\"[^>]*>(.*?)</container>")
+            .findAll(decoded).map { c ->
+                val title = Regex("(?i)<dc:title>(.*?)</dc:title>")
+                    .find(c.groupValues[2])?.groupValues?.get(1) ?: "(priečinok)"
+                MediaEntry(c.groupValues[1], title.trim(), true, null)
+            }.toList()
+        val items = Regex("(?is)<item[^>]*?id=\"([^\"]+)\"[^>]*>(.*?)</item>")
+            .findAll(decoded).map { i ->
+                val title = Regex("(?i)<dc:title>(.*?)</dc:title>")
+                    .find(i.groupValues[2])?.groupValues?.get(1) ?: "(skladba)"
+                val res = Regex("(?is)<res[^>]*>(.*?)</res>")
+                    .find(i.groupValues[2])?.groupValues?.get(1)?.trim()
+                MediaEntry(i.groupValues[1], title.trim(), false, res)
+            }.toList()
+        return containers + items
+    }
+
+    private fun renderMediaList(entries: List<MediaEntry>) {
+        mediaList.removeAllViews()
+        dlnaNodeButtons.clear()
+        dlnaCheckButtons.clear()
+        entries.forEach { e ->
+            val row = LinearLayout(this)
+            row.orientation = LinearLayout.HORIZONTAL
+
+            val chk = flatBtn("☐") { toggleDlnaSelection(e) }
+            chk.textSize = 18f
+            // Adresár (album) sa otvorí klikom, súbor sa klikom označí
+            val btn = flatBtn((if (e.isContainer) "📁 " else "🎵 ") + e.title) {
+                if (e.isContainer) browseFolder(e.id, e.title) else toggleDlnaSelection(e)
+            }
+            btn.gravity = Gravity.START or Gravity.CENTER_VERTICAL
+            btn.textSize = 13f
+            btn.setPadding(dp(14), dp(10), dp(14), dp(10))
+
+            dlnaCheckButtons[e.id] = chk
+            dlnaNodeButtons[e.id] = btn
+            row.addView(chk, LinearLayout.LayoutParams(dp(56), ViewGroup.LayoutParams.MATCH_PARENT))
+            val lpB = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            lpB.leftMargin = dp(4)
+            row.addView(btn, lpB)
+
+            val lp = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+            lp.topMargin = dp(3)
+            mediaList.addView(row, lp)
+        }
+        if (entries.isEmpty()) {
+            val t = TextView(this)
+            t.text = "(prázdne)"
+            t.setTextColor(C_DIM)
+            mediaList.addView(t)
+        }
+        updateDlnaSelectionStyles()
+    }
+
+    // Viacnásobný výber iba pre albumy (adresáre); súbor môže byť označený vždy len jeden
+    private fun toggleDlnaSelection(e: MediaEntry) {
+        if (e.isContainer) {
+            dlnaSelectedFile = null
+            if (dlnaSelectedContainers.containsKey(e.id)) {
+                dlnaSelectedContainers.remove(e.id)
+            } else {
+                dlnaSelectedContainers[e.id] = e
+            }
+        } else {
+            dlnaSelectedContainers.clear()
+            if (dlnaSelectedFile?.id == e.id) {
+                dlnaSelectedFile = null
+            } else {
+                dlnaSelectedFile = e
+                // Súbory aktuálneho adresára v poradí: po označenom súbore pokračuje prehrávanie až do konca
+                dlnaFileSiblings = currentListing.filter { !it.isContainer && it.url != null }
+            }
+        }
+        updateDlnaSelectionStyles()
+    }
+
+    private fun updateDlnaSelectionStyles() {
+        if (::mediaSelectedText.isInitialized) {
+            val file = dlnaSelectedFile
+            mediaSelectedText.text = when {
+                file != null -> "✓ Označený súbor: ${file.title} — stlač PLAY (prehrá aj ďalšie v adresári)"
+                dlnaSelectedContainers.size == 1 ->
+                    "✓ Označený album: ${dlnaSelectedContainers.values.first().title} — stlač PLAY"
+                dlnaSelectedContainers.size > 1 ->
+                    "✓ Označených albumov: ${dlnaSelectedContainers.size} — stlač PLAY"
+                else -> "✓ Označené: (nič) — ☐ označí albumy (viac) alebo 1 súbor"
+            }
+        }
+        currentListing.forEach { e ->
+            val isSel = dlnaSelectedContainers.containsKey(e.id) || dlnaSelectedFile?.id == e.id
+            dlnaCheckButtons[e.id]?.let { c ->
+                c.text = if (isSel) "☑" else "☐"
+                highlightBtn(c, isSel, C_ORANGE)
+            }
+            dlnaNodeButtons[e.id]?.let { b ->
+                if (isSel) {
+                    highlightBtn(b, true, C_ORANGE)
+                } else {
+                    b.background = roundedBg(
+                        if (e.isContainer) C_BTN else C_CARD2, 12,
+                        if (e.isContainer) C_CYAN_D else C_STROKE
+                    )
+                    b.setTextColor(C_WHITE)
+                    b.typeface = Typeface.DEFAULT
+                }
+            }
+        }
+    }
+
+    // Skladby albumu (a jeho podadresárov) v poradí – volá sa z IO vlákna
+    private fun collectDlnaTracks(control: String, objectId: String, out: MutableList<MediaEntry>, depth: Int) {
+        val entries = browseChildren(control, objectId)
+        entries.filter { !it.isContainer && it.url != null }.forEach { out.add(it) }
+        if (depth < 4) {
+            entries.filter { it.isContainer }.forEach { collectDlnaTracks(control, it.id, out, depth + 1) }
+        }
+    }
+
+    // ▶ PLAY pre DLNA: označený súbor (pokračuje až do konca adresára) alebo jeden / viac albumov
+    private fun onDlnaPlayPressed() {
+        val file = dlnaSelectedFile
+        if (file != null) {
+            val idx = dlnaFileSiblings.indexOfFirst { it.id == file.id }.coerceAtLeast(0)
+            mediaStatusText.text = "⏳ Spúšťam '${file.title}' (a ďalšie skladby v adresári)…"
+            playQueue(dlnaFileSiblings, idx)
+            return
+        }
+        if (dlnaSelectedContainers.isEmpty()) {
+            mediaStatusText.text = "⚠️ Najprv označ album alebo súbor (☐)."
+            return
+        }
+        val control = cdsControlUrl
+        if (control == null) {
+            mediaStatusText.text = "⚠️ Najprv vyber DLNA server (🔍 SERVERY)."
+            return
+        }
+        val containers = dlnaSelectedContainers.values.toList()
+        mediaStatusText.text = "⏳ Zisťujem skladby označených albumov…"
+        scope.launch(Dispatchers.IO) {
+            val tracks = mutableListOf<MediaEntry>()
+            for (c in containers) {
+                collectDlnaTracks(control, c.id, tracks, 0)
+            }
+            if (tracks.isEmpty()) {
+                ui { mediaStatusText.text = "⚠️ V označených albumoch som nenašiel žiadne skladby." }
+            } else {
+                playQueue(tracks, 0)
+            }
+        }
+    }
+
+    private fun playCurrentFolder() {
+        val tracks = currentListing.filter { !it.isContainer && it.url != null }
+        if (tracks.isEmpty()) {
+            ui { mediaStatusText.text = "V tomto priečinku nie sú skladby." }
+            return
+        }
+        playQueue(tracks, 0)
+    }
+
+    // ⏹ STOP pre DLNA: zruší frontu skladieb a pošle receiveru UPnP Stop.
+    // Najprv sa počká na ukončenie fronty, aby po Stop nebola ešte odoslaná ďalšia skladba.
+    private fun stopDlnaPlayback() {
+        val job = queueJob
+        job?.cancel()
+        mediaStatusText.text = "⏳ Zastavujem prehrávanie…"
+        scope.launch(Dispatchers.IO) {
+            job?.cancelAndJoin()
+            val control = avtControlUrl
+            if (control == null) {
+                ui { mediaStatusText.text = "Nič nehrá." }
+                return@launch
+            }
+            runCatching { soapStop(control) }
+            ui { mediaStatusText.text = "⏹ Prehrávanie zastavené." }
+        }
+    }
+
+    private fun playQueue(tracks: List<MediaEntry>, startIndex: Int) {
+        abandonUsbPlayback()
+        queueJob?.cancel()
+        playQueue = tracks
+        queueIdx = startIndex
+        queueJob = scope.launch(Dispatchers.IO) {
+            try {
+                if (activeInput != "MEDIA SRV" && activeInput != "44FN" && activeInput != "47FN") {
+                    sendSilent("44FN")
+                    delay(1000)
+                }
+                while (isActive && queueIdx < playQueue.size) {
+                    val track = playQueue[queueIdx]
+                    val control = ensureAvtControl() ?: run {
+                        ui { mediaStatusText.text = "UPnP: receiver nedostupný." }
+                        return@launch
+                    }
+                    ui {
+                        mediaStatusText.text = "▶ " + track.title +
+                            "  (" + (queueIdx + 1) + "/" + playQueue.size + ")"
+                    }
+                    runCatching { soapStop(control) }
+                    delay(250)
+                    soapSetUri(control, track.url!!, track.title, isBroadcast = false)
+                    delay(250)
+                    soapPlay(control)
+
+                    var started = false
+                    var stoppedCount = 0
+                    var noStart = 0
+                    var trackFinished = false
+                    while (isActive && !trackFinished) {
+                        delay(2500)
+                        val st = transportState(control)
+                        when {
+                            st == "PLAYING" -> { started = true; stoppedCount = 0 }
+                            st == "TRANSITIONING" -> { started = true }
+                            started && (st == "STOPPED" || st == "NO_MEDIA_PRESENT") -> {
+                                stoppedCount++
+                                if (stoppedCount >= 2) trackFinished = true
+                            }
+                            !started -> {
+                                noStart++
+                                if (noStart > 8) trackFinished = true
+                            }
+                        }
+                    }
+                    queueIdx++
+                }
+                ui { mediaStatusText.text = "✓ Prehrávanie dokončené" }
+            } catch (_: Exception) { }
+        }
+    }
+
+    // =====================================================================
+    // UPnP NÍZKOÚROVŇOVÉ VOLANIA
+    // =====================================================================
+
+    private fun ssdpFindAll(st: String, timeoutMs: Int = 3500): List<String> {
+        val result = linkedSetOf<String>()
+        val msearch = "M-SEARCH * HTTP/1.1\r\n" +
+            "HOST: 239.255.255.250:1900\r\n" +
+            "MAN: \"ssdp:discover\"\r\n" +
+            "MX: 2\r\n" +
+            "ST: " + st + "\r\n\r\n"
+        runCatching {
+            MulticastSocket().use { sock ->
+                sock.soTimeout = timeoutMs
+                val addr = InetAddress.getByName("239.255.255.250")
+                val pktOut = DatagramPacket(msearch.toByteArray(), msearch.length, addr, 1900)
+                sock.send(pktOut)
+                sock.send(pktOut)
+                val buf = ByteArray(4096)
+                val deadline = System.currentTimeMillis() + timeoutMs
+                while (System.currentTimeMillis() < deadline) {
+                    val pkt = DatagramPacket(buf, buf.size)
+                    try { sock.receive(pkt) } catch (_: Exception) { break }
+                    val resp = String(pkt.data, 0, pkt.length, Charsets.US_ASCII)
+                    Regex("(?i)LOCATION:\\s*(\\S+)").find(resp)?.groupValues?.get(1)
+                        ?.let { result.add(it) }
+                }
+            }
+        }
+        return result.toList()
+    }
+
+    private fun ensureAvtControl(): String? {
+        avtControlUrl?.let { return it }
+
+        val allRenderers = ssdpFindAll("urn:schemas-upnp-org:device:MediaRenderer:1", 2500)
+        val matched = allRenderers.firstOrNull { it.contains(host) }
+        if (matched != null) {
+            readServiceControlUrl(matched, "urn:schemas-upnp-org:service:AVTransport")
+                ?.let { avtControlUrl = it; return it }
+        }
+
+        val fallbackLocations = listOf(
+            "http://$host:49152/description.xml",
+            "http://$host:49153/description.xml",
+            "http://$host:49154/description.xml",
+            "http://$host:8080/description.xml",
+            "http://$host:60006/upnp/desc/aios_device/aios_device.xml"
+        )
+        for (loc in fallbackLocations) {
+            val ctrl = readServiceControlUrl(loc, "urn:schemas-upnp-org:service:AVTransport")
+            if (ctrl != null) {
+                avtControlUrl = ctrl
+                return ctrl
+            }
+        }
+        return null
+    }
+
+    private fun readServiceControlUrl(descUrl: String, serviceUrn: String): String? {
+        val xml = httpGet(descUrl) ?: return null
+        val shortName = serviceUrn.substringAfterLast(':')
+        val serviceBlock = Regex("(?is)<service>.*?" + shortName + ".*?</service>")
+            .find(xml)?.value ?: return null
+        val controlPath = Regex("(?is)<controlURL>(.*?)</controlURL>")
+            .find(serviceBlock)?.groupValues?.get(1)?.trim() ?: return null
+        if (controlPath.startsWith("http://", ignoreCase = true) ||
+            controlPath.startsWith("https://", ignoreCase = true)) {
+            return controlPath
+        }
+        val base = Regex("(?is)<URLBase>(.*?)</URLBase>")
+            .find(xml)?.groupValues?.get(1)?.trim()?.takeIf { it.isNotEmpty() }
+            ?: URL(descUrl).let {
+                val p = if (it.port != -1) ":${it.port}" else ""
+                "${it.protocol}://${it.host}$p"
+            }
+        return base.trimEnd('/') + "/" + controlPath.trimStart('/')
+    }
+
+    private fun httpGet(urlStr: String): String? = runCatching {
+        val conn = URL(urlStr).openConnection() as HttpURLConnection
+        conn.connectTimeout = 3500; conn.readTimeout = 3500
+        BufferedReader(InputStreamReader(conn.inputStream)).use { it.readText() }
+    }.getOrNull()
+
+    private fun soapRequest(controlUrl: String, action: String,
+                            soapAction: String, body: String): String? {
+        val conn = URL(controlUrl).openConnection() as HttpURLConnection
+        conn.requestMethod = "POST"
+        conn.doOutput = true
+        conn.connectTimeout = 5000; conn.readTimeout = 8000
+        conn.setRequestProperty("Content-Type", "text/xml; charset=\"utf-8\"")
+        conn.setRequestProperty("SOAPACTION", "\"$soapAction\"")
+        OutputStreamWriter(conn.outputStream, Charsets.UTF_8).use {
+            it.write(body); it.flush()
+        }
+        val code = conn.responseCode
+        val stream = if (code in 200..299) conn.inputStream else conn.errorStream
+        return BufferedReader(InputStreamReader(stream ?: return null)).use { it.readText() }
+    }
+
+    private fun soap(controlUrl: String, action: String, body: String): String? {
+        return soapRequest(controlUrl, action,
+            "urn:schemas-upnp-org:service:AVTransport:1#" + action, body)
+    }
+
+    private fun transportState(controlUrl: String): String {
+        val resp = soapRequest(controlUrl, "GetTransportInfo",
+            "urn:schemas-upnp-org:service:AVTransport:1#GetTransportInfo",
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n" +
+            "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" " +
+            "s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">" +
+            "<s:Body><u:GetTransportInfo xmlns:u=\"urn:schemas-upnp-org:service:AVTransport:1\">" +
+            "<InstanceID>0</InstanceID>" +
+            "</u:GetTransportInfo></s:Body></s:Envelope>") ?: return ""
+        return Regex("(?i)<CurrentTransportState>(.*?)</CurrentTransportState>")
+            .find(resp)?.groupValues?.get(1) ?: ""
+    }
+
+    private fun soapSetUri(controlUrl: String, streamUrl: String,
+                           title: String = "Media",
+                           isBroadcast: Boolean = false): String? {
+        val escUrl = streamUrl.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        val escTitle = title.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+        val lower = streamUrl.lowercase()
+        val mime = when {
+            lower.endsWith(".aac") || lower.contains("aac") -> "audio/aac"
+            lower.endsWith(".flac") -> "audio/flac"
+            lower.endsWith(".wav") -> "audio/wav"
+            else -> "audio/mpeg"
+        }
+        val dlnaPn = if (mime == "audio/aac") "AAC_ISO" else "MP3"
+        val upnpClass = if (isBroadcast)
+            "object.item.audioItem.audioBroadcast"
+        else
+            "object.item.audioItem.musicTrack"
+        val dlnaOp = if (isBroadcast) "00" else "01"
+        val dlnaFlags = if (isBroadcast)
+            "01700000000000000000000000000000"
+        else
+            "01500000000000000000000000000000"
+
+        val didl = "<DIDL-Lite xmlns=\"urn:schemas-upnp-org:metadata-1-0/DIDL-Lite/\" " +
+            "xmlns:dc=\"http://purl.org/dc/elements/1.1/\" " +
+            "xmlns:upnp=\"urn:schemas-upnp-org:metadata-1-0/upnp/\">" +
+            "<item id=\"0\" parentID=\"-1\" restricted=\"1\">" +
+            "<dc:title>$escTitle</dc:title>" +
+            "<upnp:class>$upnpClass</upnp:class>" +
+            "<res protocolInfo=\"http-get:*:$mime:DLNA.ORG_PN=$dlnaPn;DLNA.ORG_OP=$dlnaOp;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=$dlnaFlags\">$escUrl</res>" +
+            "</item></DIDL-Lite>"
+
+        val escDidl = didl.replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace("\"", "&quot;")
+
+        return soap(controlUrl, "SetAVTransportURI",
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n" +
+            "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" " +
+            "s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">" +
+            "<s:Body><u:SetAVTransportURI xmlns:u=\"urn:schemas-upnp-org:service:AVTransport:1\">" +
+            "<InstanceID>0</InstanceID><CurrentURI>" + escUrl + "</CurrentURI>" +
+            "<CurrentURIMetaData>" + escDidl + "</CurrentURIMetaData>" +
+            "</u:SetAVTransportURI></s:Body></s:Envelope>")
+    }
+
+    private fun soapPlay(controlUrl: String): String? {
+        return soap(controlUrl, "Play",
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n" +
+            "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" " +
+            "s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">" +
+            "<s:Body><u:Play xmlns:u=\"urn:schemas-upnp-org:service:AVTransport:1\">" +
+            "<InstanceID>0</InstanceID><Speed>1</Speed>" +
+            "</u:Play></s:Body></s:Envelope>")
+    }
+
+    private fun soapStop(controlUrl: String): String? {
+        return soap(controlUrl, "Stop",
+            "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n" +
+            "<s:Envelope xmlns:s=\"http://schemas.xmlsoap.org/soap/envelope/\" " +
+            "s:encodingStyle=\"http://schemas.xmlsoap.org/soap/encoding/\">" +
+            "<s:Body><u:Stop xmlns:u=\"urn:schemas-upnp-org:service:AVTransport:1\">" +
+            "<InstanceID>0</InstanceID>" +
+            "</u:Stop></s:Body></s:Envelope>")
+    }
+
+    // =====================================================================
+    // PRIPOJENIE A SPRÁVA PRÍKAZOV (SYNCHRÓNNE PARSOVANIE DÁT NA IO VLÁKNE)
+    // =====================================================================
+
+    private fun connect(silentFail: Boolean = false) {
+        // Platí len posledný pokus o pripojenie; staršie (aj rozbehnuté) sa zahodia
+        val gen = connectGen.incrementAndGet()
+        runCatching { socketRef.get()?.close() }
+        queueJob?.cancel()
+        scope.launch(Dispatchers.IO) {
+            try {
+                val sock = Socket()
+                sock.connect(InetSocketAddress(host, port), 3000)
+                if (gen != connectGen.get()) {
+                    runCatching { sock.close() }
+                    return@launch
+                }
+                sock.keepAlive = true
+                outWriter = OutputStreamWriter(sock.getOutputStream(), Charsets.US_ASCII)
+                socketRef.set(sock)
+                saveHostIp(host)
+                ui {
+                    connLine.text = "●  Pripojené: $host:$port"
+                    connLine.setTextColor(C_GREEN)
+                    statusText.text = ""
+                }
+                sendSilent("?P")
+                sendSilent("?V")
+                sendSilent("?F")
+                sendSilent("?M")
+                sendSilent("?S")
+                sendSilent("?L")
+                sendSilent("?FL")
+                sendSilent("?GAP")
+                listen(sock)
+            } catch (e: Exception) {
+                if (gen != connectGen.get()) return@launch
+                if (!silentFail) {
+                    ui {
+                        connLine.text = "○  Odpojené ($host)"
+                        connLine.setTextColor(C_RED)
+                        statusText.text = "Chyba pripojenia: ${e.message ?: "neznáma"} — klikni 🔍 pre vyhľadanie."
+                    }
+                }
+            }
+        }
+    }
+
+    private fun listen(sock: Socket) {
+        scope.launch(Dispatchers.IO) {
+            try {
+                val reader =
+                    BufferedReader(InputStreamReader(sock.getInputStream(), Charsets.UTF_8))
+                while (isActive && sock.isConnected) {
+                    val line = reader.readLine() ?: break
+                    handleResponse(line.trim())
+                }
+            } catch (e: Exception) {
+                // Socket zatvorený zámerne (onStop, nové pripojenie) -> nehlásime chybu
+                if (socketRef.get() !== sock) return@launch
+                ui {
+                    connLine.text = "○  Odpojené ($host)"
+                    connLine.setTextColor(C_RED)
+                    statusText.text = "Spojenie prerušené (${e.message ?: "odpojené"})"
+                }
+            }
+        }
+    }
+
+    private fun handleResponse(line: String) {
+        when {
+            line.startsWith("E0") -> {
+                lastErrAt = System.currentTimeMillis()
+                val errDesc = when (line) {
+                    "E02" -> "Príkaz teraz nie je dostupný (E02)"
+                    "E03" -> "Neplatný príkaz (E03)"
+                    "E04" -> "Chyba príkazu (E04)"
+                    "E06" -> "Neplatný parameter (E06)"
+                    else -> "Odpoveď receivera: $line"
+                }
+                ui { statusText.text = errDesc }
+            }
+            line.startsWith("GBP") -> {
+                rxGbp = line.substring(3).trim().toIntOrNull() ?: 0
+            }
+            line.startsWith("GCH") || line.startsWith("GCP") -> {
+                if (line.length >= 5) {
+                    nwScreenType = line.substring(3, 5)
+                }
+                val newName = line.substringAfter("\"", "").substringBeforeLast("\"", "")
+                if (newName != nwScreenName) {
+                    synchronized(pageLock) {
+                        rawPageLines.clear()
+                    }
+                }
+                nwScreenName = newName
+                rxScreenAt = System.currentTimeMillis()
+                val usbCtx = activeInput == "IPOD/USB" || usbBusy || usbState != UsbState.STOPPED
+                if (usbCtx) {
+                    if (nwScreenType == "01" || nwScreenType == "00") {
+                        listScreenReady = true
+                        isPlayingFavorite = false
+                        isUsbPlayingNow = false
+                    } else {
+                        listScreenReady = false
+                        isUsbPlayingNow = true
+                    }
+                } else if (nwScreenType == "01" || nwScreenType == "02" || nwScreenType == "00") {
+                    listScreenReady = true
+                    isPlayingFavorite = false
+                    isUsbPlayingNow = false
+                } else if (nwScreenType == "04" || nwScreenType == "05") {
+                    listScreenReady = false
+                    if (activeInput == "FAVORITES") isPlayingFavorite = true
+                }
+            }
+            line.startsWith("GDH") || line.startsWith("GDP") -> {
+                listScreenReady = true
+                if (line.length >= 18) {
+                    val newStart = line.substring(3, 8).toIntOrNull() ?: 1
+                    val newEnd = line.substring(8, 13).toIntOrNull() ?: 0
+                    val newTotal = line.substring(13, 18).toIntOrNull() ?: 0
+                    if (newStart != rawRangeStart) {
+                        synchronized(pageLock) {
+                            rawPageLines.clear()
+                        }
+                    }
+                    rawRangeStart = newStart
+                    rawRangeEnd = newEnd
+                    rawTotalItems = newTotal
+                    rawGdhUpdatedAt = System.currentTimeMillis()
+                    rawPageUpdatedAt = rawGdhUpdatedAt
+                }
+            }
+            line.startsWith("GEH") || line.startsWith("GEP") -> {
+                val idx = line.substring(3, 5).toIntOrNull()
+                val title = line.substringAfter("\"", "").substringBeforeLast("\"", "")
+                val typeCode = if (line.length >= 8) line.substring(6, 8) else "01"
+                val typeNum = typeCode.toIntOrNull() ?: 1
+
+                if (idx != null) {
+                    val isPlayScreen = nwScreenType == "04" || nwScreenType == "05" || isUsbPlayingNow || isPlayingFavorite
+                    val isMetadataLine = typeNum >= 10 || isPlayScreen
+
+                    if (isMetadataLine) {
+                        if (title.isNotEmpty()) {
+                            playMetaLines[idx] = typeCode to title
+                        } else {
+                            playMetaLines.remove(idx)
+                        }
+                        ui { updateMainDisplayHeader() }
+                    } else {
+                        listScreenReady = true
+                        synchronized(pageLock) {
+                            if (title.isNotEmpty()) {
+                                rawPageLines[idx] = typeCode to title
+                            } else {
+                                rawPageLines.remove(idx)
+                            }
+                        }
+                        rawPageUpdatedAt = System.currentTimeMillis()
+
+                        if (isSyncingFavorites || (activeInput == "FAVORITES" && favStations.size < 8)) {
+                            if (title.isNotEmpty() && !title.startsWith("[") && !looksLikeMetadata(title)) {
+                                ui {
+                                    favStations[idx] = title
+                                    saveCachedFavorites()
+                                    renderFavoriteTable()
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            else -> {
+                ui {
+                    when {
+                        line.startsWith("VOL") -> {
+                            val v = line.substring(3).trim().toIntOrNull() ?: return@ui
+                            currentVol = v
+                            updateVolumeCard()
+                        }
+                        line.startsWith("MUT") -> {
+                            isMuted = line.startsWith("MUT0")
+                            updateVolumeCard()
+                            updateMuteButton()
+                        }
+                        line.startsWith("FN") && line.length == 4 -> {
+                            val code = line.substring(2) + "FN"
+                            activeInput = inputs.entries.firstOrNull { it.value == code }?.key
+                                ?: when (code) {
+                                    "19FN" -> "HDMI 1"
+                                    "20FN" -> "HDMI 2"
+                                    "21FN" -> "HDMI 3"
+                                    "22FN" -> "HDMI 4"
+                                    "23FN" -> "HDMI 5"
+                                    "24FN" -> "HDMI 6"
+                                    "47FN" -> "DMR"
+                                    "26FN" -> "NETWORK"
+                                    else -> code
+                                }
+                            updateInfoLine()
+                            styleInputButtons()
+                            updateMainDisplayHeader()
+                        }
+                        line.startsWith("SR") && line.length >= 6 -> {
+                            val code = line.substring(2, 6) + "SR"
+                            val m = modes.entries.firstOrNull { it.value == code }
+                            if (m != null) {
+                                activeMode = m.key
+                                updateInfoLine()
+                                styleModeButtons()
+                            }
+                        }
+                        line.startsWith("LM") && line.length >= 6 -> {
+                            val lmHex = line.substring(2).trim()
+                            val matched = when {
+                                lmHex.endsWith("01") -> "STEREO"
+                                lmHex.endsWith("05") -> "AUTO SURR."
+                                lmHex.endsWith("06") || lmHex.endsWith("07") -> "DIRECT"
+                                lmHex.endsWith("51") -> "ALC / PURE"
+                                lmHex.contains("13") || lmHex.contains("02") -> "PLII MOVIE"
+                                lmHex.contains("14") || lmHex.contains("03") -> "PLII MUSIC"
+                                else -> activeMode
+                            }
+                            if (matched != null) {
+                                activeMode = matched
+                                updateInfoLine()
+                                styleModeButtons()
+                            }
+                        }
+                        line == "PWR0" -> { isOn = true; updatePowerButton() }
+                        line == "PWR2" || line == "PWR1" -> { isOn = false; updatePowerButton() }
+                        line.startsWith("FL") && line.length >= 6 -> {
+                            val txt = decodeFlHex(line.substring(4))
+                            if (txt.isNotEmpty()) {
+                                lastFlText = txt
+                                updateMainDisplayHeader()
+                            }
+                        }
+                        line.startsWith("GHH") || line.startsWith("GHP") || line.startsWith("GIH") || line.startsWith("GIP") -> {
+                            val raw = line.substring(3).trim()
+                            if (raw.length >= 4) {
+                                playTimeText = raw
+                                updateMainDisplayHeader()
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private fun send(cmd: String) = sendSilent(cmd)
+
+    private fun sendSilent(cmd: String) {
+        scope.launch(sendDispatcher) {
+            try {
+                outWriter?.let { it.write(cmd + "\r\n"); it.flush() }
+                Thread.sleep(60)
+            } catch (e: Exception) {
+                ui { statusText.text = "Chyba odosielania: " + e.message }
+            }
+        }
+    }
+
+    private fun ui(block: () -> Unit) = runOnUiThread { block() }
+}
