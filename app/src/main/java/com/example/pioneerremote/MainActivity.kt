@@ -4991,7 +4991,7 @@ class MainActivity : AppCompatActivity() {
             }
         }
     }
-
+ 
     private fun send(cmd: String) = sendSilent(cmd)
 
     private fun sendSilent(cmd: String) {
