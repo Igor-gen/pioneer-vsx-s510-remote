@@ -3968,8 +3968,8 @@ class MainActivity : AppCompatActivity() {
     private fun extractBufferText(text: String): String? {
         val t = text.trim()
         if (t.isEmpty()) return null
-        Regex("(?i)buffer\s*[:=]?\s*(\d{1,3}\s*%)").find(t)?.groupValues?.get(1)?.let { return it.replace(" ", "") }
-        Regex("^(\d{1,3}\s*%)$").find(t)?.groupValues?.get(1)?.let { return it.replace(" ", "") }
+        Regex("(?i)buffer\\s*[:=]?\\s*(\\d{1,3}\\s*%)").find(t)?.groupValues?.get(1)?.let { return it.replace(" ", "") }
+        Regex("^(\\d{1,3}\\s*%)$").find(t)?.groupValues?.get(1)?.let { return it.replace(" ", "") }
         if (t.contains("buffer", ignoreCase = true)) return t
         return null
     }
