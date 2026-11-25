@@ -1,10 +1,27 @@
 // ============================================================================
-// Pioneer VSX-S510 Remote — verzia 34
-// Opravy oproti v33:
-// 1. Karta Rádio: DLNA server ponúka M3U/M3U8 súbory z vybraného adresára.
-// 2. Výber adresára používa Android SAF a trvalé oprávnenie; voľba ostáva uložená po vypnutí servera.
-// 3. Pri ďalšom zapnutí sa výber neopakuje; adresár možno zmeniť tlačidlom Vybrať adresár M3U.
-// Predchádzajúce opravy verzie 33 ostávajú zachované.
+// Pioneer VSX-S510 Remote — verzia 37
+// Novinky v37 (oproti v36):
+// - Ukladanie predvolieb FAVORITES priamo do lokálnej SQLite databázy (pioneer_usb.db, tabuľka favorite),
+//   spoločne s USB kľúčmi a vlastnými rádiostanicami (vrátane automatickej migrácie a zálohy DB).
+// - Po kliknutí na tlačidlo FAVORITES sa okamžite vysunie zoznam predvolieb načítaný
+//   z lokálnej databázy bez čakania a bez prerušenia prehrávania.
+// - Úplne navrchu vysunutého zoznamu Favorites je tlačidlo "🔄 Obnoviť zoznam", ktoré
+//   stiahne čerstvý zoznam všetkých predvolieb z receivera a automaticky ho zapíše do lokálnej DB.
+// Novinky v36 (oproti v35):
+// - Po prepnutí na kartu RÁDIO sa aplikácia automaticky pripojí k receiveru, ak nie je pripojená.
+// - Kliknutie na FAVORITES: ak ešte nehrá stream z Favorites, načíta predvoľby z receivera
+//   a otvorí rozbaľovacie menu. Ak už stream hrá, menu len rozbalí/zbalí bez prerušenia prehrávania.
+// - Výber iného streamu z rozbaľovacieho menu ho spustí a menu zasunie; stream hrá,
+//   kým sa nevyberie iný stream z predvolieb alebo iný vstup.
+// - Zobrazenie Buffera napravo vedľa Režim na informačnom riadku displeja.
+// Novinky v35 (oproti v33):
+// - Karta RÁDIO / DLNA server: možnosť vybrať a trvalo si zapamätať adresár
+//   so súbormi typu .m3u / .m3u8 (SAF + trvalé oprávnenie čítania).
+// - Pri zapnutí servera (Server: VYP -> ZAP) ponúkne výber adresára, ak ešte
+//   nie je zvolený. Ak už zvolený je, použije sa automaticky bez pýtania.
+// - Zvolený adresár zostáva uložený aj po vypnutí DLNA servera a reštarte appky.
+// - Vstavaný DLNA server sprístupňuje .m3u / .m3u8 súbory (vrátane podadresárov)
+//   s MIME typom audio/x-mpegurl a UPnP triedou object.item.audioItem.
 // Opravy oproti v32:
 // 1. Pád pri prechode na ďalší označený adresár: úpravy UI sa už nerobia
 //    z IO vlákna (playNextInUsbQueue / stopUsbPlayback idú cez ui { }).
@@ -30,12 +47,12 @@ import android.content.res.Configuration
 import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
 import android.net.Uri
-import android.provider.DocumentsContract
-import android.util.Base64
 import android.graphics.Typeface
 import android.graphics.drawable.GradientDrawable
 import android.net.wifi.WifiManager
 import android.os.Bundle
+import android.provider.DocumentsContract
+import android.util.Base64
 import android.text.InputType
 import android.text.TextUtils
 import android.view.Gravity
@@ -58,7 +75,6 @@ import kotlinx.coroutines.*
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.BufferedInputStream
-import java.io.ByteArrayOutputStream
 import java.io.BufferedReader
 import java.io.File
 import java.io.FileInputStream
@@ -175,6 +191,7 @@ class MainActivity : AppCompatActivity() {
 
     // ===== KARTA RÁDIO =====
     private lateinit var favToggleBtn: Button
+    private lateinit var favRefreshBtn: Button
     private lateinit var favDrawerCard: LinearLayout
     private lateinit var favDrawerStatus: TextView
     private lateinit var favTableContainer: LinearLayout
@@ -188,6 +205,7 @@ class MainActivity : AppCompatActivity() {
     @Volatile private var nwScreenName: String = ""
     @Volatile private var listScreenReady: Boolean = false
     @Volatile private var playTimeText: String = ""
+    @Volatile private var bufferText: String = ""
     private var lastFlText: String = ""
 
     // ===== KARTA MÉDIÁ: PREPÍNAČ USB KĽÚČ / DLNA SERVER =====
@@ -282,12 +300,13 @@ class MainActivity : AppCompatActivity() {
         const val DB_NAME = "pioneer_usb.db"
         const val REQ_EXPORT_DB = 4101
         const val REQ_IMPORT_DB = 4102
+        const val REQ_PICK_MEDIA_DIR = 4103
     }
 
     private lateinit var usbDb: UsbDatabase
 
     private class UsbDatabase(context: Context) :
-        SQLiteOpenHelper(context, MainActivity.DB_NAME, null, 2) {
+        SQLiteOpenHelper(context, MainActivity.DB_NAME, null, 3) {
 
         override fun onConfigure(db: SQLiteDatabase) {
             super.onConfigure(db)
@@ -303,12 +322,44 @@ class MainActivity : AppCompatActivity() {
             db.execSQL("CREATE INDEX node_parent ON node (usb_id, parent_key, idx)")
             db.execSQL("CREATE TABLE IF NOT EXISTS station (id INTEGER PRIMARY KEY AUTOINCREMENT, " +
                 "name TEXT NOT NULL, url TEXT NOT NULL)")
+            db.execSQL("CREATE TABLE IF NOT EXISTS favorite (idx INTEGER PRIMARY KEY, " +
+                "name TEXT NOT NULL)")
         }
 
         override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
             if (oldVersion < 2) {
                 db.execSQL("CREATE TABLE IF NOT EXISTS station (id INTEGER PRIMARY KEY AUTOINCREMENT, " +
                     "name TEXT NOT NULL, url TEXT NOT NULL)")
+            }
+            if (oldVersion < 3) {
+                db.execSQL("CREATE TABLE IF NOT EXISTS favorite (idx INTEGER PRIMARY KEY, " +
+                    "name TEXT NOT NULL)")
+            }
+        }
+
+        fun listFavorites(): LinkedHashMap<Int, String> {
+            val out = linkedMapOf<Int, String>()
+            readableDatabase.rawQuery("SELECT idx, name FROM favorite ORDER BY idx", null).use { c ->
+                while (c.moveToNext()) out[c.getInt(0)] = c.getString(1)
+            }
+            return out
+        }
+
+        fun replaceAllFavorites(items: Map<Int, String>) {
+            val db = writableDatabase
+            db.beginTransaction()
+            try {
+                db.delete("favorite", null, null)
+                val stmt = db.compileStatement("INSERT OR REPLACE INTO favorite (idx, name) VALUES (?, ?)")
+                items.toSortedMap().forEach { (idx, name) ->
+                    stmt.clearBindings()
+                    stmt.bindLong(1, idx.toLong())
+                    stmt.bindString(2, name)
+                    stmt.executeInsert()
+                }
+                db.setTransactionSuccessful()
+            } finally {
+                db.endTransaction()
             }
         }
 
@@ -434,6 +485,7 @@ class MainActivity : AppCompatActivity() {
         isUsbMediaMode = p.getBoolean("isUsbMediaMode", true)
         usbDb = UsbDatabase(applicationContext)
         refreshRadioStations()
+        loadSavedMediaDir()
         loadCachedFavorites()
         loadPlaylistsMetadata()
         buildUI()
@@ -511,15 +563,35 @@ class MainActivity : AppCompatActivity() {
 
     private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
 
+    private fun migrateLegacyFavoritesToDb() {
+        if (prefs().getBoolean("favorites_migrated_to_db", false)) return
+        val raw = prefs().getString("favStationsJson", null)
+        if (!raw.isNullOrBlank()) {
+            runCatching {
+                val arr = JSONArray(raw)
+                val migrated = linkedMapOf<Int, String>()
+                for (i in 0 until arr.length()) {
+                    val obj = arr.getJSONObject(i)
+                    val idx = obj.getInt("idx")
+                    val name = obj.getString("name")
+                    if (!looksLikeMetadata(name)) {
+                        migrated[idx] = name
+                    }
+                }
+                if (migrated.isNotEmpty() && usbDb.listFavorites().isEmpty()) {
+                    usbDb.replaceAllFavorites(migrated)
+                }
+            }
+        }
+        prefs().edit().putBoolean("favorites_migrated_to_db", true).apply()
+    }
+
     private fun loadCachedFavorites() {
-        val raw = prefs().getString("favStationsJson", null) ?: return
+        migrateLegacyFavoritesToDb()
         runCatching {
-            val arr = JSONArray(raw)
+            val fromDb = usbDb.listFavorites()
             favStations.clear()
-            for (i in 0 until arr.length()) {
-                val obj = arr.getJSONObject(i)
-                val idx = obj.getInt("idx")
-                val name = obj.getString("name")
+            fromDb.forEach { (idx, name) ->
                 if (!looksLikeMetadata(name)) {
                     favStations[idx] = name
                 }
@@ -529,14 +601,7 @@ class MainActivity : AppCompatActivity() {
 
     private fun saveCachedFavorites() {
         runCatching {
-            val arr = JSONArray()
-            favStations.forEach { (idx, name) ->
-                val obj = JSONObject()
-                obj.put("idx", idx)
-                obj.put("name", name)
-                arr.put(obj)
-            }
-            prefs().edit().putString("favStationsJson", arr.toString()).apply()
+            usbDb.replaceAllFavorites(favStations)
         }
     }
 
@@ -660,13 +725,55 @@ class MainActivity : AppCompatActivity() {
         startActivityForResult(i, MainActivity.REQ_IMPORT_DB)
     }
 
+    private fun startPickMediaDir() {
+        val i = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
+            addFlags(
+                Intent.FLAG_GRANT_READ_URI_PERMISSION or
+                    Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION
+            )
+            if (android.os.Build.VERSION.SDK_INT >= 21) {
+                addFlags(Intent.FLAG_GRANT_PREFIX_URI_PERMISSION)
+            }
+        }
+        @Suppress("DEPRECATION")
+        startActivityForResult(i, MainActivity.REQ_PICK_MEDIA_DIR)
+    }
+
     @Suppress("DEPRECATION", "OVERRIDE_DEPRECATION")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
-        if (requestCode == requestM3uFolder) {
-            handleM3uFolderResult(resultCode, data)
+        if (requestCode == MainActivity.REQ_PICK_MEDIA_DIR) {
+            val shouldStart = pendingStartRadioServerAfterDirPick
+            pendingStartRadioServerAfterDirPick = false
+            if (resultCode == RESULT_OK && data?.data != null) {
+                val uri = data.data!!
+                val takeFlags = data.flags and Intent.FLAG_GRANT_READ_URI_PERMISSION
+                runCatching {
+                    contentResolver.takePersistableUriPermission(
+                        uri,
+                        if (takeFlags != 0) takeFlags else Intent.FLAG_GRANT_READ_URI_PERMISSION
+                    )
+                }
+                val name = resolveTreeDisplayName(uri)
+                mediaDirUri = uri
+                mediaDirName = name
+                dlnaUpdateId++
+                prefs().edit()
+                    .putString("dlna_media_dir_uri", uri.toString())
+                    .putString("dlna_media_dir_name", name)
+                    .apply()
+                updateRadioServerUi()
+                if (shouldStart) {
+                    startRadioServerNow()
+                }
+            } else if (shouldStart) {
+                if (::radioServerStatus.isInitialized) {
+                    radioServerStatus.text = "Výber adresára zrušený. Server ostal vypnutý."
+                }
+            }
             return
         }
+
         if (resultCode != RESULT_OK || data == null) return
         val uri = data.data ?: return
         if (requestCode == MainActivity.REQ_EXPORT_DB || requestCode == MainActivity.REQ_IMPORT_DB) {
@@ -748,6 +855,8 @@ class MainActivity : AppCompatActivity() {
                     refreshPlaylistList()
                     refreshRadioStations()
                     renderRadioStations()
+                    loadCachedFavorites()
+                    renderFavoriteTable()
                     val activeName = prefs().getString("active_playlist_name", null)
                     val pl = savedPlaylists.find { it.second == activeName }
                     if (pl != null) loadPlaylist(pl.first, pl.second)
@@ -959,21 +1068,30 @@ class MainActivity : AppCompatActivity() {
     }
 
     // =====================================================================
-    // VLASTNÝ DLNA SERVER S RÁDIOSTANICAMI (na pridanie staníc do Favorites na receiveri)
+    // VLASTNÝ DLNA SERVER (RÁDIOSTANICE + ZVOLENÝ ADRESÁR S .M3U SÚBORMI)
     // =====================================================================
 
     private data class RadioStation(val id: Long, val name: String, val url: String)
+    private data class LocalDocEntry(
+        val docId: String,
+        val name: String,
+        val mime: String,
+        val size: Long,
+        val isDir: Boolean
+    )
 
     @Volatile private var radioStations = listOf<RadioStation>()
     @Volatile private var radioServer: RadioDlnaServer? = null
-    private lateinit var radioServerBtn: Button
-    private lateinit var radioServerStatus: TextView
-    private lateinit var radioFolderStatus: TextView
-    private lateinit var radioListLayout: LinearLayout
-    private var pendingRadioServerStart = false
-    private val requestM3uFolder = 3401
+    @Volatile private var mediaDirUri: Uri? = null
+    @Volatile private var mediaDirName: String = ""
+    @Volatile private var dlnaUpdateId: Int = 1
+    private var pendingStartRadioServerAfterDirPick = false
 
-    private data class M3uMediaFile(val id: String, val name: String, val uri: Uri)
+    private lateinit var radioServerBtn: Button
+    private lateinit var radioMediaDirBtn: Button
+    private lateinit var radioMediaDirText: TextView
+    private lateinit var radioServerStatus: TextView
+    private lateinit var radioListLayout: LinearLayout
 
     // IP adresa telefónu vo Wi-Fi / Ethernet sieti (mobilné dáta sa neberú, ak je Wi-Fi k dispozícii)
     private fun wifiIp(): String? {
@@ -995,33 +1113,162 @@ class MainActivity : AppCompatActivity() {
 
     private fun refreshRadioStations() {
         radioStations = try { usbDb.listStations() } catch (_: Exception) { emptyList() }
+        dlnaUpdateId++
+    }
+
+    private fun resolveTreeDisplayName(treeUri: Uri): String {
+        val docId = runCatching { DocumentsContract.getTreeDocumentId(treeUri) }.getOrNull()
+        if (docId != null) {
+            val docUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, docId)
+            val queried = runCatching {
+                contentResolver.query(
+                    docUri,
+                    arrayOf(DocumentsContract.Document.COLUMN_DISPLAY_NAME),
+                    null,
+                    null,
+                    null
+                )?.use { c ->
+                    if (c.moveToFirst()) c.getString(0) else null
+                }
+            }.getOrNull()
+            if (!queried.isNullOrBlank()) return queried
+            val fallback = docId.substringAfterLast(':').substringAfterLast('/')
+            if (fallback.isNotBlank()) return fallback
+        }
+        return "M3U"
+    }
+
+    private fun loadSavedMediaDir() {
+        val uriStr = prefs().getString("dlna_media_dir_uri", null) ?: return
+        val uri = runCatching { Uri.parse(uriStr) }.getOrNull() ?: return
+        val hasPerm = contentResolver.persistedUriPermissions.any {
+            it.uri == uri && it.isReadPermission
+        }
+        if (hasPerm) {
+            mediaDirUri = uri
+            mediaDirName = prefs().getString("dlna_media_dir_name", null)
+                ?.takeIf { it.isNotBlank() }
+                ?: resolveTreeDisplayName(uri)
+        } else {
+            mediaDirUri = null
+            mediaDirName = ""
+            prefs().edit().remove("dlna_media_dir_uri").remove("dlna_media_dir_name").apply()
+        }
+    }
+
+    private fun clearSavedMediaDir() {
+        val old = mediaDirUri
+        mediaDirUri = null
+        mediaDirName = ""
+        dlnaUpdateId++
+        prefs().edit().remove("dlna_media_dir_uri").remove("dlna_media_dir_name").apply()
+        if (old != null) {
+            runCatching {
+                contentResolver.releasePersistableUriPermission(old, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+        }
+        updateRadioServerUi()
+    }
+
+    private fun onMediaDirButtonClicked() {
+        if (mediaDirUri == null) {
+            pendingStartRadioServerAfterDirPick = false
+            startPickMediaDir()
+            return
+        }
+        AlertDialog.Builder(this)
+            .setTitle("Adresár s .m3u súbormi")
+            .setMessage("Aktuálne zapamätaný adresár: $mediaDirName")
+            .setPositiveButton("Zmeniť adresár") { _, _ ->
+                pendingStartRadioServerAfterDirPick = false
+                startPickMediaDir()
+            }
+            .setNeutralButton("Odobrať adresár") { _, _ ->
+                clearSavedMediaDir()
+            }
+            .setNegativeButton("Zrušiť", null)
+            .show()
+    }
+
+    // Zobrazí iba podadresáre a súbory typu .m3u / .m3u8
+    private fun isSupportedDlnaAudio(name: String, mime: String): Boolean {
+        val l = name.lowercase()
+        if (l.endsWith(".m3u") || l.endsWith(".m3u8")) return true
+        return mime.equals("audio/x-mpegurl", ignoreCase = true) ||
+            mime.equals("application/vnd.apple.mpegurl", ignoreCase = true)
+    }
+
+    private fun resolveAudioMime(name: String, mime: String): String {
+        val l = name.lowercase()
+        return when {
+            l.endsWith(".m3u") || l.endsWith(".m3u8") -> "audio/x-mpegurl"
+            mime.equals("audio/x-mpegurl", ignoreCase = true) -> "audio/x-mpegurl"
+            else -> "audio/x-mpegurl"
+        }
+    }
+
+    private fun listMediaDirChildren(treeUri: Uri, parentDocId: String): List<LocalDocEntry> {
+        val out = mutableListOf<LocalDocEntry>()
+        val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(treeUri, parentDocId)
+        val cols = arrayOf(
+            DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+            DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+            DocumentsContract.Document.COLUMN_MIME_TYPE,
+            DocumentsContract.Document.COLUMN_SIZE
+        )
+        runCatching {
+            contentResolver.query(childrenUri, cols, null, null, null)?.use { c ->
+                val iId = c.getColumnIndex(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
+                val iName = c.getColumnIndex(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+                val iMime = c.getColumnIndex(DocumentsContract.Document.COLUMN_MIME_TYPE)
+                val iSize = c.getColumnIndex(DocumentsContract.Document.COLUMN_SIZE)
+                while (c.moveToNext()) {
+                    val docId = if (iId >= 0) c.getString(iId) else continue
+                    val name = if (iName >= 0) (c.getString(iName) ?: "") else ""
+                    if (name.isEmpty() || name.startsWith(".")) continue
+                    val mime = if (iMime >= 0) (c.getString(iMime) ?: "") else ""
+                    val size = if (iSize >= 0 && !c.isNull(iSize)) c.getLong(iSize) else -1L
+                    val isDir = mime == DocumentsContract.Document.MIME_TYPE_DIR
+                    if (isDir || isSupportedDlnaAudio(name, mime)) {
+                        out.add(LocalDocEntry(docId, name, resolveAudioMime(name, mime), size, isDir))
+                    }
+                }
+            }
+        }
+        return out.sortedWith(compareBy<LocalDocEntry> { !it.isDir }.thenBy { it.name.lowercase() })
+    }
+
+    private fun queryMediaDoc(treeUri: Uri, docId: String): LocalDocEntry? {
+        val docUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, docId)
+        val cols = arrayOf(
+            DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+            DocumentsContract.Document.COLUMN_MIME_TYPE,
+            DocumentsContract.Document.COLUMN_SIZE
+        )
+        return runCatching {
+            contentResolver.query(docUri, cols, null, null, null)?.use { c ->
+                if (!c.moveToFirst()) return@use null
+                val name = c.getString(0) ?: docId.substringAfterLast('/')
+                val mime = c.getString(1) ?: ""
+                val size = if (!c.isNull(2)) c.getLong(2) else -1L
+                val isDir = mime == DocumentsContract.Document.MIME_TYPE_DIR
+                LocalDocEntry(docId, name, resolveAudioMime(name, mime), size, isDir)
+            }
+        }.getOrNull()
     }
 
     private fun buildRadioServerSection(page: LinearLayout) {
-        page.addView(sectionLabel("VLASTNÉ STANICE (DLNA SERVER)"))
+        page.addView(sectionLabel("VLASTNÉ STANICE A M3U (DLNA SERVER)"))
 
         radioServerBtn = flatBtn("📡 Server: VYP") { toggleRadioServer() }
         val addBtn = flatBtn("➕ Pridať stanicu") { showStationDialog(null) }
         radioServerBtn.textSize = 13f
         addBtn.textSize = 13f
-        val folderBtn = flatBtn("📁 Vybrať adresár M3U") { chooseM3uFolder() }
-        folderBtn.textSize = 12f
         page.addView(rowOf(listOf(radioServerBtn, addBtn)))
-        page.addView(rowOf(listOf(folderBtn)))
 
-        radioFolderStatus = TextView(this)
-        radioFolderStatus.textSize = 11f
-        radioFolderStatus.setTextColor(C_SLATE)
-        radioFolderStatus.setPadding(dp(4), dp(2), dp(4), dp(4))
-        page.addView(radioFolderStatus)
-
-        radioServerStatus = TextView(this)
-        radioServerStatus.textSize = 11f
-        radioServerStatus.setTextColor(C_SLATE)
-        radioServerStatus.setPadding(dp(4), dp(4), dp(4), dp(4))
-        page.addView(radioServerStatus)
-
-        val toMediaBtn = flatBtn("↪ Prepnúť receiver na MEDIA SERVER") {
+        radioMediaDirBtn = flatBtn("📁 Adresár M3U") { onMediaDirButtonClicked() }
+        radioMediaDirBtn.textSize = 12f
+        val toMediaBtn = flatBtn("↪ Prepnúť na MEDIA SRV") {
             abandonUsbPlayback()
             send("44FN")
             sendSilent("?F")
@@ -1031,100 +1278,51 @@ class MainActivity : AppCompatActivity() {
             updateMainDisplayHeader()
         }
         toMediaBtn.textSize = 12f
-        page.addView(rowOf(listOf(toMediaBtn)))
+        page.addView(rowOf(listOf(radioMediaDirBtn, toMediaBtn)))
+
+        radioMediaDirText = TextView(this)
+        radioMediaDirText.textSize = 11f
+        radioMediaDirText.setTextColor(C_CYAN)
+        radioMediaDirText.setPadding(dp(4), dp(4), dp(4), dp(2))
+        page.addView(radioMediaDirText)
+
+        radioServerStatus = TextView(this)
+        radioServerStatus.textSize = 11f
+        radioServerStatus.setTextColor(C_SLATE)
+        radioServerStatus.setPadding(dp(4), dp(2), dp(4), dp(4))
+        page.addView(radioServerStatus)
 
         radioListLayout = LinearLayout(this)
         radioListLayout.orientation = LinearLayout.VERTICAL
         page.addView(radioListLayout)
 
-        updateRadioFolderUi()
         updateRadioServerUi()
         renderRadioStations()
-    }
-
-    private fun savedM3uTreeUri(): Uri? =
-        prefs().getString("radio_m3u_tree_uri", null)?.let { runCatching { Uri.parse(it) }.getOrNull() }
-
-    private fun updateRadioFolderUi() {
-        if (!::radioFolderStatus.isInitialized) return
-        val uri = savedM3uTreeUri()
-        radioFolderStatus.text = if (uri == null) {
-            "Adresár M3U: nevybraný (voliteľný)"
-        } else {
-            val name = runCatching {
-                val documentId = DocumentsContract.getTreeDocumentId(uri)
-                val documentUri = DocumentsContract.buildDocumentUriUsingTree(uri, documentId)
-                contentResolver.query(documentUri, arrayOf(DocumentsContract.Document.COLUMN_DISPLAY_NAME),
-                    null, null, null)?.use { c -> if (c.moveToFirst()) c.getString(0) else null }
-            }.getOrNull()
-            "Adresár M3U: ${name ?: uri.lastPathSegment ?: "vybraný"}"
-        }
-    }
-
-    private fun chooseM3uFolder() {
-        val intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
-            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or
-                Intent.FLAG_GRANT_WRITE_URI_PERMISSION or
-                Intent.FLAG_GRANT_PERSISTABLE_URI_PERMISSION)
-        }
-        startActivityForResult(intent, requestM3uFolder)
-    }
-
-    private fun handleM3uFolderResult(resultCode: Int, data: Intent?) {
-        if (resultCode != RESULT_OK) {
-            pendingRadioServerStart = false
-            return
-        }
-        val uri = data?.data ?: run { pendingRadioServerStart = false; return }
-        val flags = data.flags and (Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
-        try {
-            val readFlag = flags and Intent.FLAG_GRANT_READ_URI_PERMISSION
-            if (readFlag != 0) contentResolver.takePersistableUriPermission(uri, readFlag)
-        } catch (_: Exception) {
-            // Ak poskytovateľ nepodporuje trvalé oprávnenie, po reštarte bude treba adresár vybrať znova.
-        }
-        prefs().edit().putString("radio_m3u_tree_uri", uri.toString()).apply()
-        updateRadioFolderUi()
-        updateRadioServerUi()
-        val startAfterPick = pendingRadioServerStart
-        pendingRadioServerStart = false
-        if (startAfterPick) startRadioServerNow()
-    }
-
-    private fun listM3uMediaFiles(): List<M3uMediaFile> {
-        val tree = savedM3uTreeUri() ?: return emptyList()
-        return runCatching {
-            val treeId = DocumentsContract.getTreeDocumentId(tree)
-            val children = DocumentsContract.buildChildDocumentsUriUsingTree(tree, treeId)
-            val projection = arrayOf(DocumentsContract.Document.COLUMN_DOCUMENT_ID,
-                DocumentsContract.Document.COLUMN_DISPLAY_NAME)
-            val result = mutableListOf<M3uMediaFile>()
-            contentResolver.query(children, projection, null, null, null)?.use { c ->
-                val idCol = c.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DOCUMENT_ID)
-                val nameCol = c.getColumnIndexOrThrow(DocumentsContract.Document.COLUMN_DISPLAY_NAME)
-                while (c.moveToNext()) {
-                    val docId = c.getString(idCol) ?: continue
-                    val name = c.getString(nameCol) ?: continue
-                    if (!name.endsWith(".m3u", true) && !name.endsWith(".m3u8", true)) continue
-                    val docUri = DocumentsContract.buildDocumentUriUsingTree(tree, docId)
-                    val key = Base64.encodeToString(docId.toByteArray(Charsets.UTF_8),
-                        Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING)
-                    result.add(M3uMediaFile(key, name, docUri))
-                }
-            }
-            result.sortedBy { it.name.lowercase() }
-        }.getOrElse { emptyList() }
     }
 
     private fun updateRadioServerUi() {
         if (!::radioServerBtn.isInitialized) return
         val srv = radioServer
+        val hasDir = mediaDirUri != null
         radioServerBtn.text = if (srv != null) "📡 Server: ZAP" else "📡 Server: VYP"
         highlightBtn(radioServerBtn, srv != null, C_GREEN)
-        radioServerStatus.text = if (srv != null)
-            "Server beží (${srv.ip}:${srv.port}). Ponúka ${radioStations.size} vlastných staníc a ${listM3uMediaFiles().size} playlistov M3U. Na receiveri otvor MEDIA SERVER → Pioneer Remote Radio."
-        else
-            "Server je vypnutý. Vybraný adresár M3U zostáva zapamätaný aj po vypnutí servera."
+
+        if (::radioMediaDirBtn.isInitialized) {
+            radioMediaDirBtn.text = if (hasDir) "📁 M3U: $mediaDirName" else "📁 Vybrať adresár M3U"
+            highlightBtn(radioMediaDirBtn, hasDir, C_CYAN)
+        }
+        if (::radioMediaDirText.isInitialized) {
+            radioMediaDirText.text = if (hasDir)
+                "📁 Zapamätaný adresár M3U: $mediaDirName"
+            else
+                "📁 Adresár M3U: (nevybraný)"
+        }
+        radioServerStatus.text = if (srv != null) {
+            val extra = if (hasDir) " + adresár „$mediaDirName“" else ""
+            "Server beží (${srv.ip}:${srv.port})$extra. Na receiveri: vstup MEDIA SERVER → „Pioneer Remote Radio“. Apku nechaj otvorenú."
+        } else {
+            "Server je vypnutý. Zapni ho — na receiveri (MEDIA SERVER) sa zobrazia stanice aj zvolený adresár s .m3u súbormi."
+        }
     }
 
     private fun renderRadioStations() {
@@ -1221,17 +1419,28 @@ class MainActivity : AppCompatActivity() {
             updateRadioServerUi()
             return
         }
-        // Pri prvom zapnutí ponúkni výber adresára. Po jeho uložení sa už
-        // pri ďalších štartoch nepýta; voľba ostáva uložená aj po vypnutí servera.
-        if (savedM3uTreeUri() == null) {
-            pendingRadioServerStart = true
-            chooseM3uFolder()
-        } else {
-            startRadioServerNow()
+        // Ak ešte nie je vybraný adresár s .m3u súbormi, ponúkneme jeho výber.
+        // Ak už vybraný je, zapamätaný adresár sa použije automaticky bez pýtania.
+        if (mediaDirUri == null) {
+            AlertDialog.Builder(this)
+                .setTitle("Adresár s .m3u súbormi pre DLNA server")
+                .setMessage("Chceš vybrať adresár s .m3u súbormi, ktorý sa sprístupní cez DLNA server? Aplikácia si ho zapamätá aj po vypnutí servera a nabudúce sa už pýtať nebude.")
+                .setPositiveButton("Vybrať adresár") { _, _ ->
+                    pendingStartRadioServerAfterDirPick = true
+                    startPickMediaDir()
+                }
+                .setNeutralButton("Len rádiá") { _, _ ->
+                    startRadioServerNow()
+                }
+                .setNegativeButton("Zrušiť", null)
+                .show()
+            return
         }
+        startRadioServerNow()
     }
 
     private fun startRadioServerNow() {
+        if (radioServer != null) return
         val ip = wifiIp()
         if (ip == null) {
             radioServerStatus.text = "⚠️ Telefón nie je pripojený do Wi-Fi siete."
@@ -1255,8 +1464,8 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // Minimálny DLNA MediaServer: SSDP + popis zariadenia + ContentDirectory + ConnectionManager.
-    // Ponúka stanice dvojako: ako m3u súbor (overený spôsob) a ako priamy stream.
+    // DLNA MediaServer: SSDP + popis zariadenia + ContentDirectory + ConnectionManager.
+    // Ponúka vlastné rádiostanice (m3u + priamy stream) a zvolený lokálny adresár s .m3u súbormi.
     private inner class RadioDlnaServer(val ip: String, uuid: String) {
         private val usn = "uuid:$uuid"
         private val pool = Executors.newCachedThreadPool()
@@ -1280,6 +1489,20 @@ class MainActivity : AppCompatActivity() {
         private fun usnFor(nt: String) = if (nt == usn) usn else "$usn::$nt"
         private fun location() = "http://$ip:$port/desc.xml"
 
+        private fun b64Enc(s: String): String =
+            Base64.encodeToString(s.toByteArray(Charsets.UTF_8), Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING)
+
+        private fun b64Dec(s: String): String? = runCatching {
+            String(Base64.decode(s, Base64.URL_SAFE or Base64.NO_WRAP), Charsets.UTF_8)
+        }.getOrNull()
+
+        private fun dlnaProtocolInfo(mime: String): String = when (mime) {
+            "audio/x-mpegurl" -> "http-get:*:audio/x-mpegurl:*"
+            "audio/mpeg" -> "http-get:*:audio/mpeg:DLNA.ORG_PN=MP3;DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01500000000000000000000000000000"
+            "audio/aac" -> "http-get:*:audio/aac:DLNA.ORG_PN=AAC_ISO;DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01500000000000000000000000000000"
+            else -> "http-get:*:$mime:*"
+        }
+
         @Suppress("DEPRECATION")
         fun start() {
             val ss = ServerSocket(0)
@@ -1296,7 +1519,7 @@ class MainActivity : AppCompatActivity() {
                 recvSock = rs
                 pool.execute { ssdpListen(rs) }
             } catch (_: Exception) {
-                recvSock = null   // bez odpovedí na M-SEARCH; stále posielame NOTIFY
+                recvSock = null
             }
             try {
                 val ms = MulticastSocket()
@@ -1422,7 +1645,7 @@ class MainActivity : AppCompatActivity() {
                         }
                         body = String(bytes, 0, off, Charsets.UTF_8)
                     }
-                    route(method, path, headers, body, out)
+                    route(s, method, path, headers, body, out)
                 } catch (_: Exception) {}
             }
         }
@@ -1433,6 +1656,7 @@ class MainActivity : AppCompatActivity() {
             val status = when (code) {
                 200 -> "OK"
                 404 -> "Not Found"
+                416 -> "Range Not Satisfiable"
                 500 -> "Internal Server Error"
                 else -> "OK"
             }
@@ -1449,7 +1673,115 @@ class MainActivity : AppCompatActivity() {
             out.flush()
         }
 
-        private fun route(method: String, path: String, headers: Map<String, String>, body: String, out: OutputStream) {
+        private fun skipFully(inp: InputStream, bytesToSkip: Long) {
+            var rem = bytesToSkip
+            val buf = ByteArray(8192)
+            while (rem > 0) {
+                val skipped = inp.skip(rem)
+                if (skipped > 0) {
+                    rem -= skipped
+                } else {
+                    val r = inp.read(buf, 0, minOf(buf.size.toLong(), rem).toInt())
+                    if (r < 0) break
+                    rem -= r
+                }
+            }
+        }
+
+        private fun streamMediaFile(sock: Socket, method: String, path: String, headers: Map<String, String>, out: OutputStream) {
+            val treeUri = mediaDirUri
+            if (treeUri == null) {
+                reply(out, method, 404, "text/plain", "No media directory")
+                return
+            }
+            val token = path.removePrefix("/media/").substringBeforeLast('.')
+            val docId = b64Dec(token)
+            if (docId == null) {
+                reply(out, method, 404, "text/plain", "Invalid id")
+                return
+            }
+            val meta = queryMediaDoc(treeUri, docId)
+            if (meta == null || meta.isDir) {
+                reply(out, method, 404, "text/plain", "File not found")
+                return
+            }
+            val docUri = DocumentsContract.buildDocumentUriUsingTree(treeUri, docId)
+            val fileSize = if (meta.size > 0) meta.size else runCatching {
+                contentResolver.openAssetFileDescriptor(docUri, "r")?.use { it.length } ?: -1L
+            }.getOrDefault(-1L)
+
+            var start = 0L
+            var end = if (fileSize > 0) fileSize - 1 else -1L
+            var partial = false
+
+            val rangeHdr = headers["range"]
+            if (fileSize > 0 && rangeHdr != null && rangeHdr.startsWith("bytes=", ignoreCase = true)) {
+                val spec = rangeHdr.substring(6).substringBefore(',').trim()
+                val dash = spec.indexOf('-')
+                if (dash >= 0) {
+                    val sStr = spec.substring(0, dash).trim()
+                    val eStr = spec.substring(dash + 1).trim()
+                    val parsedStart = sStr.toLongOrNull()
+                    val parsedEnd = eStr.toLongOrNull()
+                    if (parsedStart != null) {
+                        start = parsedStart
+                        end = if (parsedEnd != null) parsedEnd.coerceAtMost(fileSize - 1) else fileSize - 1
+                        if (start >= fileSize || start > end) {
+                            reply(out, method, 416, "text/plain", "",
+                                mapOf("Content-Range" to "bytes */$fileSize"))
+                            return
+                        }
+                        partial = true
+                    }
+                }
+            }
+
+            val sb = StringBuilder()
+            if (partial) {
+                val contentLen = end - start + 1
+                sb.append("HTTP/1.1 206 Partial Content\r\n")
+                sb.append("Content-Range: bytes $start-$end/$fileSize\r\n")
+                sb.append("Content-Length: $contentLen\r\n")
+                sb.append("Accept-Ranges: bytes\r\n")
+            } else {
+                sb.append("HTTP/1.1 200 OK\r\n")
+                if (fileSize > 0) {
+                    sb.append("Content-Length: $fileSize\r\n")
+                    sb.append("Accept-Ranges: bytes\r\n")
+                }
+            }
+            sb.append("Content-Type: ${meta.mime}\r\n")
+            sb.append("SERVER: $serverHeader\r\n")
+            sb.append("Connection: close\r\n\r\n")
+            out.write(sb.toString().toByteArray(Charsets.UTF_8))
+            out.flush()
+
+            if (method == "HEAD") return
+
+            sock.soTimeout = 0
+            contentResolver.openInputStream(docUri)?.use { inp ->
+                if (partial && start > 0) skipFully(inp, start)
+                val buf = ByteArray(16384)
+                if (partial) {
+                    var rem = end - start + 1
+                    while (running && rem > 0) {
+                        val r = inp.read(buf, 0, minOf(buf.size.toLong(), rem).toInt())
+                        if (r < 0) break
+                        out.write(buf, 0, r)
+                        rem -= r
+                    }
+                } else {
+                    while (running) {
+                        val r = inp.read(buf)
+                        if (r < 0) break
+                        out.write(buf, 0, r)
+                    }
+                }
+                out.flush()
+            }
+        }
+
+        private fun route(sock: Socket, method: String, path: String, headers: Map<String, String>, body: String, out: OutputStream) {
             when {
                 path == "/desc.xml" -> reply(out, method, 200, xmlType, descXml())
                 path == "/cds.xml" -> reply(out, method, 200, xmlType, cdsScpd())
@@ -1473,29 +1805,8 @@ class MainActivity : AppCompatActivity() {
                         reply(out, method, 200, "audio/x-mpegurl", "#EXTM3U\r\n#EXTINF:-1,${st.name}\r\n${st.url}\r\n")
                     }
                 }
-                path.startsWith("/m3u/") -> serveM3uFile(method, path.removePrefix("/m3u/"), out)
+                path.startsWith("/media/") -> streamMediaFile(sock, method, path, headers, out)
                 else -> reply(out, method, 404, "text/plain", "Not found")
-            }
-        }
-
-        private fun serveM3uFile(method: String, id: String, out: OutputStream) {
-            val file = listM3uMediaFiles().firstOrNull { it.id == id }
-            if (file == null) {
-                reply(out, method, 404, "text/plain", "Playlist not found")
-                return
-            }
-            try {
-                val bytes = contentResolver.openInputStream(file.uri)?.use { it.readBytes() }
-                    ?: throw IllegalStateException("Súbor sa nedá otvoriť")
-                val header = "HTTP/1.1 200 OK\r\n" +
-                    "CONTENT-TYPE: audio/x-mpegurl; charset=utf-8\r\n" +
-                    "CONTENT-LENGTH: ${bytes.size}\r\n" +
-                    "SERVER: $serverHeader\r\nConnection: close\r\n\r\n"
-                out.write(header.toByteArray(Charsets.US_ASCII))
-                if (method != "HEAD") out.write(bytes)
-                out.flush()
-            } catch (_: Exception) {
-                reply(out, method, 404, "text/plain", "Playlist unavailable")
             }
         }
 
@@ -1508,7 +1819,7 @@ class MainActivity : AppCompatActivity() {
             "<dlna:X_DLNADOC>DMS-1.50</dlna:X_DLNADOC>" +
             "<deviceType>urn:schemas-upnp-org:device:MediaServer:1</deviceType>" +
             "<friendlyName>Pioneer Remote Radio</friendlyName>" +
-            "<manufacturer>Pioneer Remote</manufacturer><modelName>Radio Server</modelName>" +
+            "<manufacturer>Pioneer Remote</manufacturer><modelName>Radio &amp; M3U Server</modelName>" +
             "<UDN>$usn</UDN><serviceList>" +
             "<service><serviceType>urn:schemas-upnp-org:service:ContentDirectory:1</serviceType>" +
             "<serviceId>urn:upnp-org:serviceId:ContentDirectory</serviceId><SCPDURL>/cds.xml</SCPDURL>" +
@@ -1618,60 +1929,125 @@ class MainActivity : AppCompatActivity() {
                 "xmlns:dc=\"http://purl.org/dc/elements/1.1/\" " +
                 "xmlns:upnp=\"urn:schemas-upnp-org:metadata-1-0/upnp/\">$inner</DIDL-Lite>"
 
-        private fun itemXml(id: String, title: String, cls: String, proto: String, url: String): String =
-            "<item id=\"$id\" parentID=\"0\" restricted=\"1\"><dc:title>${xmlEsc(title)}</dc:title>" +
-                "<upnp:class>$cls</upnp:class><res protocolInfo=\"$proto\">${xmlEsc(url)}</res></item>"
+        private fun containerXml(id: String, parentId: String, title: String, childCount: Int? = null): String {
+            val cntAttr = if (childCount != null) " childCount=\"$childCount\"" else ""
+            return "<container id=\"$id\" parentID=\"$parentId\" restricted=\"1\"$cntAttr>" +
+                "<dc:title>${xmlEsc(title)}</dc:title>" +
+                "<upnp:class>object.container.storageFolder</upnp:class></container>"
+        }
 
-        // Každá stanica sa ponúka dvakrát: ako m3u súbor a ako priamy stream
-        private fun allItems(): List<Pair<String, String>> {
+        private fun itemXml(id: String, parentId: String, title: String, cls: String, proto: String, url: String, size: Long = -1L): String {
+            val sizeAttr = if (size > 0) " size=\"$size\"" else ""
+            return "<item id=\"$id\" parentID=\"$parentId\" restricted=\"1\"><dc:title>${xmlEsc(title)}</dc:title>" +
+                "<upnp:class>$cls</upnp:class><res protocolInfo=\"$proto\"$sizeAttr>${xmlEsc(url)}</res></item>"
+        }
+
+        private fun radioItems(parentId: String): List<Pair<String, String>> {
             val list = mutableListOf<Pair<String, String>>()
             radioStations.forEach { st ->
                 val mime = if (st.url.lowercase().contains("aac")) "audio/aac" else "audio/mpeg"
-                list.add("m${st.id}" to itemXml("m${st.id}", st.name, "object.item.audioItem",
+                list.add("m${st.id}" to itemXml("m${st.id}", parentId, st.name, "object.item.audioItem",
                     "http-get:*:audio/x-mpegurl:*", "http://$ip:$port/radio/${st.id}.m3u"))
-                list.add("d${st.id}" to itemXml("d${st.id}", "${st.name} (priamy stream)",
+                list.add("d${st.id}" to itemXml("d${st.id}", parentId, "${st.name} (priamy stream)",
                     "object.item.audioItem.audioBroadcast", "http-get:*:$mime:*", st.url))
-            }
-            listM3uMediaFiles().forEach { file ->
-                val objectId = "f${file.id}"
-                list.add(objectId to itemXml(objectId, file.name, "object.item.audioItem",
-                    "http-get:*:audio/x-mpegurl:*", "http://$ip:$port/m3u/${file.id}"))
             }
             return list
         }
 
+        private fun mediaEntryXml(e: LocalDocEntry, parentId: String): Pair<String, String> {
+            val token = b64Enc(e.docId)
+            return if (e.isDir) {
+                val oid = "dir_$token"
+                oid to containerXml(oid, parentId, e.name)
+            } else {
+                val oid = "file_$token"
+                val isM3u = e.name.lowercase().endsWith(".m3u") || e.name.lowercase().endsWith(".m3u8")
+                val ext = if (isM3u) "m3u" else e.name.substringAfterLast('.', "mp3").lowercase().filter { it.isLetterOrDigit() }.ifEmpty { "mp3" }
+                val upnpClass = if (isM3u) "object.item.audioItem" else "object.item.audioItem.musicTrack"
+                val displayTitle = if (isM3u) e.name.substringBeforeLast('.') else e.name
+                val url = "http://$ip:$port/media/$token.$ext"
+                oid to itemXml(oid, parentId, displayTitle, upnpClass, dlnaProtocolInfo(e.mime), url, e.size)
+            }
+        }
+
+        private fun mediaChildren(treeUri: Uri, parentDocId: String, parentObjId: String): List<Pair<String, String>> =
+            listMediaDirChildren(treeUri, parentDocId).map { mediaEntryXml(it, parentObjId) }
+
         private fun soapCds(out: OutputStream, headers: Map<String, String>, body: String) {
             val action = soapActionOf(headers)
+            val upd = dlnaUpdateId
             when (action) {
                 "Browse" -> {
                     val objectId = tag(body, "ObjectID")
                     val flag = tag(body, "BrowseFlag")
                     val start = tag(body, "StartingIndex").toIntOrNull() ?: 0
                     val req = tag(body, "RequestedCount").toIntOrNull() ?: 0
-                    val items = allItems()
+                    val treeUri = mediaDirUri
+
                     if (flag == "BrowseMetadata") {
-                        val frag = if (objectId == "0")
-                            "<container id=\"0\" parentID=\"-1\" restricted=\"1\" childCount=\"${items.size}\">" +
-                                "<dc:title>Radia</dc:title><upnp:class>object.container</upnp:class></container>"
-                        else items.firstOrNull { it.first == objectId }?.second
+                        val frag: String? = when {
+                            objectId == "0" -> {
+                                val cnt = if (treeUri != null) 2 else radioStations.size * 2
+                                containerXml("0", "-1", "Pioneer Remote", cnt)
+                            }
+                            objectId == "radios" -> containerXml("radios", "0", "Rádiá", radioStations.size * 2)
+                            objectId == "media_root" && treeUri != null ->
+                                containerXml("media_root", "0", "M3U: $mediaDirName")
+                            objectId.startsWith("dir_") && treeUri != null -> {
+                                val docId = b64Dec(objectId.removePrefix("dir_"))
+                                val meta = if (docId != null) queryMediaDoc(treeUri, docId) else null
+                                if (meta != null && meta.isDir) containerXml(objectId, "media_root", meta.name) else null
+                            }
+                            objectId.startsWith("file_") && treeUri != null -> {
+                                val docId = b64Dec(objectId.removePrefix("file_"))
+                                val meta = if (docId != null) queryMediaDoc(treeUri, docId) else null
+                                if (meta != null && !meta.isDir) mediaEntryXml(meta, "media_root").second else null
+                            }
+                            else -> radioItems(if (treeUri != null) "radios" else "0")
+                                .firstOrNull { it.first == objectId }?.second
+                        }
                         if (frag == null) {
                             fault(out, 701, "No such object")
                         } else {
                             reply(out, "POST", 200, xmlType, envelope("ContentDirectory", action,
                                 "<Result>${xmlEsc(didl(frag))}</Result><NumberReturned>1</NumberReturned>" +
-                                    "<TotalMatches>1</TotalMatches><UpdateID>1</UpdateID>"))
+                                    "<TotalMatches>1</TotalMatches><UpdateID>$upd</UpdateID>"))
                         }
-                    } else if (objectId != "0") {
-                        fault(out, 701, "No such object")
                     } else {
-                        val total = items.size
-                        val from = start.coerceIn(0, total)
-                        val to = if (req <= 0) total else (from + req).coerceAtMost(total)
-                        val slice = items.subList(from, to)
-                        reply(out, "POST", 200, xmlType, envelope("ContentDirectory", action,
-                            "<Result>${xmlEsc(didl(slice.joinToString("") { it.second }))}</Result>" +
-                                "<NumberReturned>${slice.size}</NumberReturned><TotalMatches>$total</TotalMatches>" +
-                                "<UpdateID>1</UpdateID>"))
+                        val children: List<Pair<String, String>>? = when {
+                            objectId == "0" -> {
+                                if (treeUri != null) {
+                                    listOf(
+                                        "radios" to containerXml("radios", "0", "Rádiá", radioStations.size * 2),
+                                        "media_root" to containerXml("media_root", "0", "M3U: $mediaDirName")
+                                    )
+                                } else {
+                                    radioItems("0")
+                                }
+                            }
+                            objectId == "radios" -> radioItems("radios")
+                            objectId == "media_root" && treeUri != null -> {
+                                val rootDocId = DocumentsContract.getTreeDocumentId(treeUri)
+                                mediaChildren(treeUri, rootDocId, "media_root")
+                            }
+                            objectId.startsWith("dir_") && treeUri != null -> {
+                                val docId = b64Dec(objectId.removePrefix("dir_"))
+                                if (docId != null) mediaChildren(treeUri, docId, objectId) else null
+                            }
+                            else -> null
+                        }
+                        if (children == null) {
+                            fault(out, 701, "No such object")
+                        } else {
+                            val total = children.size
+                            val from = start.coerceIn(0, total)
+                            val to = if (req <= 0) total else (from + req).coerceAtMost(total)
+                            val slice = children.subList(from, to)
+                            reply(out, "POST", 200, xmlType, envelope("ContentDirectory", action,
+                                "<Result>${xmlEsc(didl(slice.joinToString("") { it.second }))}</Result>" +
+                                    "<NumberReturned>${slice.size}</NumberReturned><TotalMatches>$total</TotalMatches>" +
+                                    "<UpdateID>$upd</UpdateID>"))
+                        }
                     }
                 }
                 "GetSearchCapabilities" -> reply(out, "POST", 200, xmlType,
@@ -1679,7 +2055,7 @@ class MainActivity : AppCompatActivity() {
                 "GetSortCapabilities" -> reply(out, "POST", 200, xmlType,
                     envelope("ContentDirectory", action, "<SortCaps></SortCaps>"))
                 "GetSystemUpdateID" -> reply(out, "POST", 200, xmlType,
-                    envelope("ContentDirectory", action, "<Id>1</Id>"))
+                    envelope("ContentDirectory", action, "<Id>$upd</Id>"))
                 else -> fault(out, 401, "Invalid Action")
             }
         }
@@ -2044,6 +2420,13 @@ class MainActivity : AppCompatActivity() {
         pager.registerOnPageChangeCallback(object : ViewPager2.OnPageChangeCallback() {
             override fun onPageSelected(position: Int) {
                 tabBtns.forEachIndexed { i, b -> styleTab(b, i == position) }
+                if (position == 1) {
+                    val s = socketRef.get()
+                    if (s == null || s.isClosed || !s.isConnected) {
+                        autoReconnectAllowed = true
+                        connect(silentFail = false)
+                    }
+                }
                 if (position == 2 && isUsbMediaMode) {
                     renderUsbCachedFolder()
                 }
@@ -2131,7 +2514,11 @@ class MainActivity : AppCompatActivity() {
         val ib = mutableListOf<Button>()
         inputs.forEach { (name, code) ->
             val b = flatBtn(name) {
-                if (code != "45FN") isPlayingFavorite = false
+                if (code != "45FN") {
+                    isPlayingFavorite = false
+                    activeFavIndex = -1
+                    bufferText = ""
+                }
                 if (code != "17FN") abandonUsbPlayback()
                 send(code)
                 sendSilent("?F")
@@ -2207,8 +2594,22 @@ class MainActivity : AppCompatActivity() {
         favDrawerCard.layoutParams = drawerLp
         favDrawerCard.visibility = View.GONE
 
+        // Úplne navrchu vysunutého zoznamu: tlačidlo na vynútené obnovenie z receivera do lokálnej DB
+        favRefreshBtn = flatBtn("🔄 Obnoviť zoznam") {
+            refreshFavoritesFromReceiver()
+        }
+        favRefreshBtn.background = roundedBg(C_CARD2, 10, C_ORANGE)
+        favRefreshBtn.setTextColor(C_WHITE)
+        favRefreshBtn.typeface = Typeface.DEFAULT_BOLD
+        favRefreshBtn.textSize = 13f
+        favRefreshBtn.setPadding(dp(12), dp(10), dp(12), dp(10))
+        val refreshLp = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+        refreshLp.bottomMargin = dp(6)
+        favDrawerCard.addView(favRefreshBtn, refreshLp)
+
         favDrawerStatus = TextView(this)
-        favDrawerStatus.text = "Vyber predvoľbu zo zoznamu receivera:"
+        favDrawerStatus.text = "Vyber predvoľbu z lokálnej databázy:"
         favDrawerStatus.textSize = 12f
         favDrawerStatus.setTextColor(C_CYAN)
         favDrawerStatus.setPadding(dp(4), 0, dp(4), dp(6))
@@ -2271,17 +2672,56 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun onFavoritesButtonClicked() {
+        if (isFavListExpanded) {
+            setFavDrawerExpanded(false)
+            return
+        }
+
+        // Načítame zoznam z lokálnej databázy a okamžite ho zobrazíme bez prerušenia prehrávania
+        loadCachedFavorites()
+        setFavDrawerExpanded(true)
+        renderFavoriteTable()
+
+        if (favStations.isNotEmpty()) {
+            favDrawerStatus.text = "💾 Načítané z databázy (${favStations.size} predvolieb). Vyber stanicu:"
+        } else {
+            favDrawerStatus.text = "ℹ️ Lokálna databáza je zatiaľ prázdna — sťahujem zoznam z receivera…"
+            refreshFavoritesFromReceiver()
+        }
+    }
+
+    private fun refreshFavoritesFromReceiver() {
         abandonUsbPlayback()
         favJob?.cancel()
         setFavDrawerExpanded(true)
-        favDrawerStatus.text = "⏳ Prepínam NETRADIO → FAVORITES a načítavam predvoľby z receivera…"
+        if (::favRefreshBtn.isInitialized) {
+            favRefreshBtn.isEnabled = false
+            favRefreshBtn.text = "⏳ Obnovujem zoznam z receivera…"
+        }
+        favDrawerStatus.text = "⏳ Prepínam NETRADIO → FAVORITES a sťahujem čerstvý zoznam z receivera…"
         renderFavoriteTable()
 
         favJob = scope.launch(Dispatchers.IO) {
             try {
+                val s = socketRef.get()
+                if (s == null || s.isClosed || !s.isConnected) {
+                    autoReconnectAllowed = true
+                    connect(silentFail = false)
+                    delay(1200)
+                }
+                val connectedSock = socketRef.get()
+                if (connectedSock == null || connectedSock.isClosed || !connectedSock.isConnected) {
+                    ui {
+                        favDrawerStatus.text = "⚠️ Receiver nie je pripojený — zobrazujem uložený zoznam z databázy:"
+                    }
+                    return@launch
+                }
+
                 isSyncingFavorites = true
                 isPlayingFavorite = false
                 listScreenReady = false
+                rawTotalItems = 0
+                rawRangeStart = 1
 
                 if (!isOn) {
                     sendSilent("PO")
@@ -2291,6 +2731,7 @@ class MainActivity : AppCompatActivity() {
                 sendSilent("38FN")
                 ui {
                     activeInput = "NETRADIO"
+                    bufferText = ""
                     updateInfoLine()
                     styleInputButtons()
                 }
@@ -2300,6 +2741,7 @@ class MainActivity : AppCompatActivity() {
                 sendSilent("?F")
                 ui {
                     activeInput = "FAVORITES"
+                    bufferText = ""
                     updateInfoLine()
                     styleInputButtons()
                 }
@@ -2320,17 +2762,91 @@ class MainActivity : AppCompatActivity() {
                 sendSilent("?GAP")
                 delay(400)
 
-                ui {
-                    favDrawerStatus.text = "Vyber predvoľbu (po kliknutí sa zoznam zasunie a stanica začne hrať):"
-                    renderFavoriteTable()
+                val fetched = linkedMapOf<Int, String>()
+                val total = rawTotalItems
+                if (total > 0) {
+                    var pageStart = 1
+                    while (pageStart <= total) {
+                        currentCoroutineContext().ensureActive()
+                        if (pageStart > 1) {
+                            val expectedCountOnPage = (total - pageStart + 1).coerceIn(1, 8)
+                            synchronized(pageLock) { rawPageLines.clear() }
+                            val t0 = System.currentTimeMillis()
+                            sendSilent(String.format("%05dGGP", pageStart))
+                            var w = 0
+                            while (w < 1600) {
+                                val count = synchronized(pageLock) { rawPageLines.size }
+                                if (rawGdhUpdatedAt >= t0 && rawRangeStart == pageStart && count >= expectedCountOnPage) {
+                                    break
+                                }
+                                delay(40)
+                                w += 40
+                            }
+                            delay(80)
+                        }
+                        val start = if (rawRangeStart > 0) rawRangeStart else pageStart
+                        val snapshot = synchronized(pageLock) { LinkedHashMap(rawPageLines) }
+                        for (lineIdx in 1..8) {
+                            val pair = snapshot[lineIdx] ?: continue
+                            val absIdx = start + lineIdx - 1
+                            if (absIdx > total) break
+                            val title = pair.second.trim()
+                            if (title.isNotEmpty() && !title.startsWith("[") && !looksLikeMetadata(title)) {
+                                fetched[absIdx] = title
+                            }
+                        }
+                        pageStart += 8
+                    }
+                } else {
+                    val snapshot = synchronized(pageLock) { LinkedHashMap(rawPageLines) }
+                    for (lineIdx in 1..8) {
+                        val pair = snapshot[lineIdx] ?: continue
+                        val title = pair.second.trim()
+                        if (title.isNotEmpty() && !title.startsWith("[") && !looksLikeMetadata(title)) {
+                            fetched[lineIdx] = title
+                        }
+                    }
+                }
+
+                if (fetched.isNotEmpty()) {
+                    val sortedFetched = linkedMapOf<Int, String>()
+                    fetched.keys.sorted().forEach { k -> sortedFetched[k] = fetched[k]!! }
+                    try {
+                        usbDb.replaceAllFavorites(sortedFetched)
+                    } catch (_: Exception) {}
+                    ui {
+                        favStations.clear()
+                        favStations.putAll(sortedFetched)
+                        renderFavoriteTable()
+                        favDrawerStatus.text = "✓ Zoznam obnovený z receivera a uložený do lokálnej DB (${favStations.size} predvolieb):"
+                    }
+                    backupDbNow(showStatus = false)
+                } else {
+                    ui {
+                        favDrawerStatus.text = "⚠️ Nepodarilo sa načítať predvoľby z receivera — ostal pôvodný zoznam z DB:"
+                        renderFavoriteTable()
+                    }
                 }
             } finally {
                 isSyncingFavorites = false
+                ui {
+                    if (::favRefreshBtn.isInitialized) {
+                        favRefreshBtn.isEnabled = true
+                        favRefreshBtn.text = "🔄 Obnoviť zoznam"
+                    }
+                }
             }
         }
     }
 
     private fun onFavoritePresetSelected(index: Int, name: String) {
+        // Ak už hrá presne táto predvoľba, len zasunieme rozbaľovacie menu bez prerušenia
+        if (isPlayingFavorite && activeFavIndex == index && activeInput == "FAVORITES") {
+            setFavDrawerExpanded(false)
+            return
+        }
+
+        val wasAlreadyPlayingFav = isPlayingFavorite || activeInput != "FAVORITES" || !listScreenReady
         abandonUsbPlayback()
         favJob?.cancel()
         activeFavIndex = index
@@ -2341,11 +2857,37 @@ class MainActivity : AppCompatActivity() {
 
         playMetaLines.clear()
         playTimeText = ""
+        bufferText = ""
+        updateInfoLine()
         updateMainDisplayHeader()
 
         favJob = scope.launch(Dispatchers.IO) {
             isSyncingFavorites = false
             isPlayingFavorite = true
+
+            if (!isOn) {
+                sendSilent("PO")
+                delay(2500)
+            }
+
+            // Ak už hral iný stream (alebo sme na inom vstupe), vrátime sa najprv do koreňa FAVORITES
+            if (wasAlreadyPlayingFav) {
+                listScreenReady = false
+                sendSilent("38FN")
+                delay(600)
+                sendSilent("45FN")
+                sendSilent("?F")
+                ui {
+                    activeInput = "FAVORITES"
+                    updateInfoLine()
+                    styleInputButtons()
+                }
+                for (step in 0 until 10) {
+                    delay(180)
+                    if (step == 3 || step == 6) sendSilent("?GAP")
+                    if (listScreenReady) break
+                }
+            }
 
             val ghpCmd = String.format("%02dGHP", index)
             sendSilent(ghpCmd)
@@ -3423,10 +3965,25 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun extractBufferText(text: String): String? {
+        val t = text.trim()
+        if (t.isEmpty()) return null
+        Regex("(?i)buffer\s*[:=]?\s*(\d{1,3}\s*%)").find(t)?.groupValues?.get(1)?.let { return it.replace(" ", "") }
+        Regex("^(\d{1,3}\s*%)$").find(t)?.groupValues?.get(1)?.let { return it.replace(" ", "") }
+        if (t.contains("buffer", ignoreCase = true)) return t
+        return null
+    }
+
     private fun updateInfoLine() {
         val i = if (activeInput == "IPOD/USB") "USB: $activePlaylistName" else (activeInput ?: "—")
         val m = activeMode ?: "—"
-        infoLine.text = "Vstup: $i   ·   Režim: $m"
+        val buf = bufferText
+        val isNet = activeInput == "FAVORITES" || activeInput == "NETRADIO" || activeInput == "MEDIA SRV"
+        infoLine.text = if (buf.isNotEmpty() && isNet) {
+            "Vstup: $i   ·   Režim: $m   ·   Buffer: $buf"
+        } else {
+            "Vstup: $i   ·   Režim: $m"
+        }
     }
 
     private fun updateMainDisplayHeader() {
@@ -4309,6 +4866,11 @@ class MainActivity : AppCompatActivity() {
                     val isMetadataLine = typeNum >= 10 || isPlayScreen
 
                     if (isMetadataLine) {
+                        val bufVal = extractBufferText(title)
+                        if (bufVal != null) {
+                            bufferText = bufVal
+                            ui { updateInfoLine() }
+                        }
                         if (title.isNotEmpty()) {
                             playMetaLines[idx] = typeCode to title
                         } else {
@@ -4326,10 +4888,11 @@ class MainActivity : AppCompatActivity() {
                         }
                         rawPageUpdatedAt = System.currentTimeMillis()
 
-                        if (isSyncingFavorites || (activeInput == "FAVORITES" && favStations.size < 8)) {
+                        if (!isSyncingFavorites && activeInput == "FAVORITES" && favStations.isEmpty()) {
                             if (title.isNotEmpty() && !title.startsWith("[") && !looksLikeMetadata(title)) {
+                                val absIdx = (if (rawRangeStart > 0) rawRangeStart else 1) + idx - 1
                                 ui {
-                                    favStations[idx] = title
+                                    favStations[absIdx] = title
                                     saveCachedFavorites()
                                     renderFavoriteTable()
                                 }
@@ -4365,6 +4928,13 @@ class MainActivity : AppCompatActivity() {
                                     "26FN" -> "NETWORK"
                                     else -> code
                                 }
+                            if (activeInput != "FAVORITES") {
+                                isPlayingFavorite = false
+                                activeFavIndex = -1
+                            }
+                            if (activeInput != "FAVORITES" && activeInput != "NETRADIO" && activeInput != "MEDIA SRV") {
+                                bufferText = ""
+                            }
                             updateInfoLine()
                             styleInputButtons()
                             updateMainDisplayHeader()
@@ -4401,6 +4971,11 @@ class MainActivity : AppCompatActivity() {
                             val txt = decodeFlHex(line.substring(4))
                             if (txt.isNotEmpty()) {
                                 lastFlText = txt
+                                val bufVal = extractBufferText(txt)
+                                if (bufVal != null) {
+                                    bufferText = bufVal
+                                    updateInfoLine()
+                                }
                                 updateMainDisplayHeader()
                             }
                         }
